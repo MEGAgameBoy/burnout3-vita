@@ -12,6 +12,40 @@ the order of work. Nothing has been built yet; every number below that is not
 quoted from the repository is an estimate, said so, and is to be replaced by a
 measurement on the hardware.
 
+## Decisions (2026-10-15, with the user)
+
+* **Renderer: raw GXM**, not vitaGL - a fragment program can read the pixel
+  it replaces, so the GS's blending, FBMSK, DATE and AFAIL can be exact.
+* **Shaders: Cg compiled on the Vita at first start with `libshacccg`**, kept
+  as GXP in `ux0:data/burnout3/shaders/`; players install libshacccg once.
+* **The game's code is generated here** from the player's own executable
+  (SLUS_210.50), never committed; the VPK built from it is the player's.
+* **Repositories**: `MEGAgameBoy/burnout3-vita` (branch `vita`), the engine
+  in a fork of ps2-port-engine (branch `vita`).
+* **Input and sound native** (`sceCtrl`, `sceTouch`, `sceAudioOut`), not SDL2.
+
+## Status
+
+**M0 - done (2026-10-15).** The engine's platform layer (`engine/platform`:
+Windows as before, Linux, the Vita), its SSE paths on ARMv7 through
+`ps2rt/sse_on_neon.h` (NEON for integers, VFP for the floats, FPSCR for the
+rounding), VitaSDK 15.2 built from source in the workspace, the host's tests
+as a VPK and code-size probes. On x86-64 and on ARMv7 under qemu every host
+test passes and the arithmetic hashes are identical (EE FPU, macro mode, MMI,
+the VU corpus run interpreted and compiled). On the Vita: test VPKs handed
+over, results pending (`ps2host_tests.vpk`; `ps2plat_probe32/64/96.vpk`, 34,
+67 and 101 MB of code with the linker's veneers).
+
+Found on the way: VitaSDK's build scripts build GCC unoptimised (empty
+`CFLAGS`); its compile of the VU corpus took 11.5 min at `-O1` against 6.7
+at `-O3` for Ubuntu's GCC 13, and 32 min at the toolchain's default `-O3`.
+The compiler is being rebuilt with `-O2` (VITA.md, "VitaSDK's compiler").
+
+**M1 - under way.** `--no-draw`, a status screen, the Vita's controls,
+`run.args`, the LiveArea art; the game's code lifted from the player's
+executable (9,277 of 9,279 functions, as on the PC). Next: the VPK, and the
+first boot on the hardware.
+
 ## How it will be measured
 
 * **Exactness, without a renderer** - a per-frame checksum of everything the
@@ -342,7 +376,7 @@ thread. Audio mixing (short, frequent, high priority) and disc read-ahead (low
 priority, mostly waiting) share them; where they go is decided by the
 timeline, not now.
 
-### The renderer: raw GXM (decision needed)
+### The renderer: raw GXM (decided)
 
 Recommended over vitaGL:
 

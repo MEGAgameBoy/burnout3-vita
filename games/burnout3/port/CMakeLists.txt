@@ -1,8 +1,12 @@
 # Burnout 3: Takedown, native. Build with engine/tools/port.py, which generates
-# the dispatch table and drives this file.
+# the dispatch table and drives this file (--target vita: the PlayStation
+# Vita's VPK, with VitaSDK).
 
 cmake_minimum_required(VERSION 3.20)
-project(burnout3_port LANGUAGES CXX RC)     # RC: the icon
+project(burnout3_port LANGUAGES CXX)
+if(WIN32)
+    enable_language(RC)                     # the icon
+endif()
 
 set(PS2_GENERATED_DIR "" CACHE PATH "dispatch.cpp, from engine/tools/port.py")
 
@@ -19,13 +23,23 @@ endif()
 
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../../engine/host ${CMAKE_BINARY_DIR}/ps2host)
 
+set(port_sources
+    ${CMAKE_CURRENT_LIST_DIR}/overrides.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/iop_servers.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/widescreen.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/mouse.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/prompts.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/controls.cpp)
+
 ps2_add_port(burnout3
     GAME ${CMAKE_CURRENT_LIST_DIR}/..
     GENERATED ${PS2_GENERATED_DIR}
     TRANSLATED ${CMAKE_CURRENT_LIST_DIR}/../src/lifted
-    SOURCES ${CMAKE_CURRENT_LIST_DIR}/overrides.cpp
-            ${CMAKE_CURRENT_LIST_DIR}/iop_servers.cpp
-            ${CMAKE_CURRENT_LIST_DIR}/widescreen.cpp
-            ${CMAKE_CURRENT_LIST_DIR}/mouse.cpp
-            ${CMAKE_CURRENT_LIST_DIR}/prompts.cpp
-            ${CMAKE_CURRENT_LIST_DIR}/controls.cpp)
+    SOURCES ${port_sources}
+    # The Vita (port/vita/): its bubble and LiveArea, original art
+    # (port/vita/tools/make_livearea.py); main memory's 365 MB budget.
+    VITA_TITLE "Burnout 3 Takedown"
+    VITA_TITLE_ID BRNT00003
+    VITA_SCE_SYS ${CMAKE_CURRENT_LIST_DIR}/vita/sce_sys
+    VITA_HEAP_MB 224
+    VITA_EXTENDED_MEMORY)
