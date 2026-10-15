@@ -153,6 +153,8 @@ def build(sources, work_dir: str, parallel: int = 8) -> str:
 
 
 def _build(sources, work_dir: str, parallel: int) -> str:
+    if cppcheck.toolchain() == "gcc":
+        return _build_gcc(sources, work_dir, parallel)
     vcvars = cppcheck.find_vcvars()
     # Absolute: the build script changes into it, and a relative path (from a
     # relative --game) would then name a directory inside itself.
@@ -191,6 +193,27 @@ def _build(sources, work_dir: str, parallel: int) -> str:
         errors = [line for line in log.splitlines() if " error " in line]
         raise cppcheck.CompileError("\n".join(errors) or log[-2000:])
     return dll
+
+
+def _build_gcc(sources, work_dir: str, parallel: int) -> str:
+    """_build with GCC: the same harness, a shared library."""
+    work_dir = os.path.abspath(work_dir)
+    os.makedirs(work_dir, exist_ok=True)
+    names = []
+    for path in sources:
+        with open(path, encoding="utf-8") as handle:
+            names += [match.group(1) for match in DEFINITION.finditer(handle.read())]
+    harness = os.path.join(work_dir, "lift_harness.cpp")
+    with open(harness, "w", encoding="utf-8") as handle:
+        handle.write(cppcheck.gcc_text(harness_source(names)))
+    runtime = os.path.join(cppcheck.RUNTIME, "src")
+    all_sources = [os.path.abspath(p) for p in sources] + [
+        harness, os.path.join(runtime, "eefpu.cpp"), os.path.join(runtime, "lifted_support.cpp"),
+        os.path.join(runtime, "vu0.cpp")]
+    cppcheck._BUILDS += 1
+    library = os.path.join(work_dir, "lifted_%d_%d.so" % (os.getpid(), cppcheck._BUILDS))
+    return cppcheck.build_gcc(all_sources, [os.path.join(cppcheck.RUNTIME, "include")], library, work_dir,
+                              parallel=parallel, log_name="lift_build.log")
 
 
 def machine_state(machine) -> tuple:

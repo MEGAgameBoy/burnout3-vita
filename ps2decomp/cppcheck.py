@@ -77,6 +77,70 @@ class CompileError(Exception):
     pass
 
 
+def toolchain() -> str:
+    """The compiler the checks build with: "msvc" on Windows (Visual Studio's,
+    found through vswhere), "gcc" elsewhere (g++, or $CXX). The generated code
+    is compiled by both - the PC port with MSVC, the Vita's with GCC - and a
+    check with either finds what the C++ means to it."""
+    if os.name == "nt":
+        find_vcvars()
+        return "msvc"
+    import shutil
+    if shutil.which(os.environ.get("CXX", "g++")):
+        return "gcc"
+    raise CompilerUnavailable("no C++ compiler: g++ (or $CXX) is not on the path")
+
+
+# The flags GCC compiles checked code with: as the ports build it
+# (engine/host/CMakeLists.txt) - no strict aliasing, wrapping signed
+# arithmetic, no contracted floats - and position-independent, for a library.
+GCC_FLAGS = ["-std=c++17", "-fPIC", "-fno-strict-aliasing", "-fwrapv", "-ffp-contract=off", "-w"]
+
+
+def gcc_text(text: str) -> str:
+    """A harness written for MSVC, as GCC takes it: its unoptimised pragma
+    and its exports in GCC's terms."""
+    text = text.replace('#pragma optimize("", off)', '#pragma GCC optimize("O0")')
+    return text.replace('extern "C" __declspec(dllexport)', 'extern "C" __attribute__((visibility("default")))')
+
+
+def build_gcc(sources, include_dirs, library: str, work_dir: str, parallel: int = 0,
+              optimise: str = "-O2", log_name: str = "build.log") -> str:
+    """The sources compiled with g++ (in parallel, `parallel` at once; all the
+    cores when 0) and linked into a shared library at `library`; its path.
+    CompileError with the compiler's errors otherwise."""
+    from concurrent.futures import ThreadPoolExecutor
+    compiler = os.environ.get("CXX", "g++")
+    includes = ["-I" + os.path.abspath(d) for d in include_dirs]
+    objects = []
+    for index, source in enumerate(sources):
+        objects.append(os.path.join(work_dir, "%s.%d.o" % (os.path.basename(library), index)))
+
+    def compile_one(pair):
+        source, obj = pair
+        return subprocess.run([compiler] + GCC_FLAGS + [optimise] + includes + ["-c", source, "-o", obj],
+                              capture_output=True, text=True)
+
+    workers = parallel or os.cpu_count() or 2
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(compile_one, zip(sources, objects)))
+    log = "".join(r.stdout + r.stderr for r in results)
+    failed = any(r.returncode for r in results)
+    if not failed:
+        linked = subprocess.run([compiler, "-shared", "-o", library] + objects, capture_output=True, text=True)
+        log += linked.stdout + linked.stderr
+        failed = linked.returncode != 0
+    with open(os.path.join(work_dir, log_name), "w", encoding="utf-8") as handle:
+        handle.write(log)
+    for obj in objects:
+        if os.path.exists(obj):
+            os.remove(obj)
+    if failed:
+        errors = [line for line in log.splitlines() if " error: " in line or "fatal error" in line]
+        raise CompileError("\n".join(errors) or log[-2000:])
+    return library
+
+
 def find_vcvars() -> str:
     if not os.path.exists(VSWHERE):
         raise CompilerUnavailable("vswhere not found; no Visual Studio installed")
@@ -211,6 +275,8 @@ def harness_source(functions, typed: bool, externs=()) -> str:
 
 def build(generated_path: str, runtime_sources, include_dir: str, work_dir: str) -> tuple:
     """Compile the generated file into a DLL; returns (dll path, functions)."""
+    if toolchain() == "gcc":
+        return _build_gcc(generated_path, runtime_sources, include_dir, work_dir)
     vcvars = find_vcvars()
     # Absolute: the build script changes into work_dir before compiling, so a
     # relative path (a relative --game) would name a file that is not there.
@@ -255,6 +321,26 @@ def build(generated_path: str, runtime_sources, include_dir: str, work_dir: str)
         # Every error, not a sample: the caller drops each function named here.
         raise CompileError("\n".join(errors) or log[-2000:])
     return dll, functions
+
+
+def _build_gcc(generated_path: str, runtime_sources, include_dir: str, work_dir: str) -> tuple:
+    """build() with GCC: the same harness, a shared library."""
+    work_dir = os.path.abspath(work_dir)
+    os.makedirs(work_dir, exist_ok=True)
+    with open(generated_path, encoding="utf-8") as handle:
+        text = handle.read()
+    functions = functions_in(text)
+    generated_dir = os.path.dirname(os.path.abspath(generated_path))
+    typed = os.path.exists(os.path.join(generated_dir, "types.h"))
+    harness = os.path.join(work_dir, "harness.cpp")
+    with open(harness, "w", encoding="utf-8") as handle:
+        handle.write(gcc_text(harness_source(functions, typed, externs_in(text))))
+    global _BUILDS
+    _BUILDS += 1
+    library = os.path.join(work_dir, "generated_check_%d_%d.so" % (os.getpid(), _BUILDS))
+    sources = [os.path.abspath(generated_path), harness] + [os.path.abspath(p) for p in runtime_sources]
+    build_gcc(sources, [include_dir, generated_dir], library, work_dir)
+    return library, functions
 
 
 class CompiledFunctions:

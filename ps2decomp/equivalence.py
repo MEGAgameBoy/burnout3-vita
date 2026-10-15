@@ -247,6 +247,10 @@ def _build(paths, work: str) -> str:
     all_sources = list(paths) + [os.path.join(runtime, name) for name in
                                  ("eefpu.cpp", "eeint.cpp", "lifted_support.cpp", "vu0.cpp")]
     cppcheck._BUILDS += 1
+    if cppcheck.toolchain() == "gcc":
+        library = os.path.join(work, "equivalence_%d_%d.so" % (os.getpid(), cppcheck._BUILDS))
+        return cppcheck.build_gcc([os.path.abspath(p) for p in all_sources],
+                                  [os.path.join(cppcheck.RUNTIME, "include")], library, work, parallel=4)
     dll = os.path.join(work, "equivalence_%d_%d.dll" % (os.getpid(), cppcheck._BUILDS))
     # The sources go in a response file: a hundred and more paths are longer than
     # the 8,191 characters a cmd command line may be.

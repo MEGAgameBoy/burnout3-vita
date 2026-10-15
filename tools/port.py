@@ -162,8 +162,55 @@ def _visual_studio_tool(*parts) -> str:
     return os.path.join(root, "Common7", "IDE", "CommonExtensions", "Microsoft", "CMake", *parts)
 
 
-def build(game, generated: str) -> str:
+def _tool(name: str) -> str:
+    import shutil
+    path = shutil.which(name)
+    if not path:
+        raise SystemExit("%s is not on the path" % name)
+    return path
+
+
+def build_with_cmake(game, generated: str, target_system: str) -> str:
+    """The port built with the CMake and Ninja on the path - on Linux for
+    Linux ("pc"), or for the Vita with VitaSDK ($VITASDK) - in
+    build/port/<cmake or vita>; returns the executable's (or VPK's) path."""
+    source = game.path("port")
+    vita = target_system == "vita"
+    binary = game.path(os.path.join(game.build, "port", "vita" if vita else "cmake"))
+    os.makedirs(binary, exist_ok=True)
+    configure = [_tool("cmake"), "-S", source, "-B", binary, "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
+                 "-DCMAKE_MAKE_PROGRAM=" + _tool("ninja"), "-DPS2_GENERATED_DIR=" + generated.replace("\\", "/"),
+                 "-Wno-dev"]
+    if vita:
+        sdk = os.environ.get("VITASDK")
+        if not sdk:
+            raise SystemExit("VITASDK is not set: the VitaSDK's directory (engine/docs/PORTING.md, \"Other systems\")")
+        configure.append("-DCMAKE_TOOLCHAIN_FILE=" + os.path.join(sdk, "share", "vita.toolchain.cmake"))
+    for command in (configure, [_tool("cmake"), "--build", binary]):
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode:
+            output = result.stdout + result.stderr
+            errors = [line for line in output.splitlines() if "error" in line.lower()]
+            raise SystemExit("port build failed:\n" + "\n".join(errors[:40] or output[-4000:].splitlines()))
+    target = os.path.basename(os.path.normpath(game.directory))
+    if vita:
+        built = os.path.join(binary, target + ".vpk")
+        print("built %s" % built)
+        return built
+    tests = os.path.join(binary, "ps2host", "ps2host_tests")
+    result = subprocess.run([tests], capture_output=True, text=True)
+    print(result.stdout.strip())
+    if result.returncode:
+        raise SystemExit("the host's own tests failed")
+    executable = os.path.join(binary, target)
+    print("built %s" % executable)
+    return executable
+
+
+def build(game, generated: str, target_system: str = "pc") -> str:
     """Configure and build the port; returns the executable's path."""
+    if target_system == "vita" or os.name != "nt":
+        return build_with_cmake(game, generated, target_system)
     source = game.path("port")
     binary = game.path(os.path.join(game.build, "port", "cmake"))
     os.makedirs(binary, exist_ok=True)
@@ -238,17 +285,23 @@ def main(argv=None) -> int:
     parser.add_argument("action", nargs="?", default="all", choices=("all", "build", "run"))
     parser.add_argument("--rounds", type=int, default=60,
                         help="build-and-run rounds to translate code found at run time")
+    parser.add_argument("--target", choices=("pc", "vita"), default="pc",
+                        help="what to build for: this computer (Windows: Visual Studio; Linux: the CMake "
+                             "and Ninja on the path), or the PlayStation Vita (VitaSDK, $VITASDK): a VPK")
     parser.add_argument("extra", nargs=argparse.REMAINDER,
                         help="options for the port itself, after --")
     args = parser.parse_args(argv)
     game = game_config.from_args(args)
     extra = [a for a in args.extra if a != "--"]
     if args.action == "run":
+        if args.target == "vita":
+            raise SystemExit("a Vita build runs on the Vita: install the VPK (engine/docs/PORTING.md, \"Other systems\")")
         target = os.path.basename(os.path.normpath(game.directory))
-        executable = game.path(os.path.join(game.build, "port", "cmake", target + ".exe"))
+        executable = game.path(os.path.join(game.build, "port", "cmake",
+                                            target + (".exe" if os.name == "nt" else "")))
         return run(game, executable, extra)
-    if args.action == "build":
-        build(game, generate(game))
+    if args.action == "build" or args.target == "vita":
+        build(game, generate(game), args.target)
         return 0
     # Build and run until a run finds no more code copied at run time.
     for _round in range(args.rounds):
