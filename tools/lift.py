@@ -180,7 +180,11 @@ def verify_texts(texts: dict, work: str, game, seeds, jobs, cache, abi=False,
     if missing:
         dll, built = build(missing, work)
         if jobs > 1 and len(built) > 50:
-            fresh = verify_parallel(sorted(built), game, seeds, dll, jobs, abi)
+            def remember(results):
+                for address, outcome in results:
+                    cache.put(missing[address], abi, outcome)
+                cache.save()
+            fresh = verify_parallel(sorted(built), game, seeds, dll, jobs, abi, remember)
         else:
             library = liftcheck.LiftedFunctions(dll, machine, testplan.VERIFY_BUDGET)
             fresh = {address: verify(functions[address], machine, library, abi)
@@ -420,15 +424,28 @@ def _verify_share(task):
     return results
 
 
-def verify_parallel(addresses, game, seeds, dll, jobs, abi=False) -> dict:
+# Verdicts are handed back, and remembered, a batch at a time: a run cut
+# short (a machine restarted) loses the batches in flight, not the stage.
+BATCH = 200
+
+
+def verify_parallel(addresses, game, seeds, dll, jobs, abi=False, on_batch=None) -> dict:
+    """Each of `jobs` shares (addresses[k::jobs]) verified in batches of BATCH,
+    one process a batch (its pages never leak into another's: the outcome
+    depends on the batches, which are fixed, not on scheduling); `on_batch`
+    hears each batch's results as they come, in order."""
     from concurrent.futures import ProcessPoolExecutor
 
     shares = [addresses[k::jobs] for k in range(jobs)]
-    tasks = [(game.directory, seeds, dll, share, abi) for share in shares if share]
+    tasks = [(game.directory, seeds, dll, share[i:i + BATCH], abi)
+             for share in shares for i in range(0, len(share), BATCH)]
     outcomes = {}
-    with ProcessPoolExecutor(max_workers=len(tasks), max_tasks_per_child=1) as pool:
-        for results in pool.map(_verify_share, tasks):
+    with ProcessPoolExecutor(max_workers=max(1, min(jobs, len(tasks))), max_tasks_per_child=1) as pool:
+        for done, results in enumerate(pool.map(_verify_share, tasks), 1):
             outcomes.update(results)
+            if on_batch:
+                on_batch(results)
+            print("    %d of %d batches verified" % (done, len(tasks)), flush=True)
     return outcomes
 
 
