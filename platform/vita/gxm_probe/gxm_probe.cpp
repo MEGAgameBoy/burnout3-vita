@@ -17,7 +17,7 @@
  *      the expected bytes.
  *   4. Integer arithmetic in a fragment program (GS memory's swizzle).
  *
- * Results on the screen and in ux0:data/ps2plat_gxm_probe2/result.txt.
+ * Results on the screen and in ux0:data/ps2plat_gxm_probe3/result.txt.
  */
 
 #include <psp2/ctrl.h>
@@ -398,77 +398,66 @@ const char kVertex[] =
 const char kConstant[] = "float4 main() : COLOR { return float4(0.8f, 0.4f, 0.2f, 1.0f); }\n";
 const char kUniformConstant[] = "float4 main(uniform float4 uColour) : COLOR { return uColour; }\n";
 
-// How the compiler spells an 8-bit vector (compiled only).
-struct Spelling {
-    const char* name;
-    const char* source;
-};
-const Spelling kSpellings[] = {
-    {"uniform uchar4", "float4 main(uniform uchar4 u) : COLOR { return float4(u) / 255.0f; }\n"},
-    {"uniform unsigned char4", "float4 main(uniform unsigned char4 u) : COLOR { return float4(u) / 255.0f; }\n"},
-    {"uniform __regformat float4", "float4 main(uniform __regformat float4 u) : COLOR { return u; }\n"},
-    {"out __regformat uchar4 : COLOR",
-     "void main(out __regformat uchar4 col : COLOR) { col = uchar4(1, 2, 3, 4); }\n"},
-    {"out __regformat unsigned char4 : COLOR",
-     "void main(out __regformat unsigned char4 col : COLOR) { col = unsigned char4(1, 2, 3, 4); }\n"},
+// What a compiled program says of itself: GXP's program flags (offset 0x14;
+// Vita3K's gxm/types.h names the bits), FRAGCOLOR_USED (bit 7) above all -
+// whether the compiler made a read of the destination.
+std::uint32_t Flags(const SceGxmProgram* program) {
+    std::uint32_t flags = 0;
+    std::memcpy(&flags, reinterpret_cast<const std::uint8_t*>(program) + 0x14, 4);
+    return flags;
+}
+
+std::string Describe(const SceGxmProgram* program) {
+    const std::uint32_t flags = Flags(program);
+    char text[256];
+    std::snprintf(text, sizeof text, "flags %08X%s%s, uniforms %u bytes", unsigned(flags),
+                  (flags & 0x80) ? " FRAGCOLOR_USED" : "", (flags & 0x40) ? " NATIVECOLOR_USED" : "",
+                  sceGxmProgramGetDefaultUniformBufferSize(program));
+    std::string out = text;
+    for (unsigned i = 0; i < sceGxmProgramGetParameterCount(program); ++i) {
+        const SceGxmProgramParameter* p = sceGxmProgramGetParameter(program, i);
+        std::snprintf(text, sizeof text, "; %s (category %d, semantic %d)", sceGxmProgramParameterGetName(p),
+                      int(sceGxmProgramParameterGetCategory(p)), int(sceGxmProgramParameterGetSemantic(p)));
+        out += text;
+    }
+    return out;
+}
+
+// Semantics a fragment program's input might read the destination by,
+// each tried on a varying and on a uniform (compiled; flags if it does).
+const char* const kSemantics[] = {
+    "FRAGCOLOR", "FRAGCOLOR0", "COLOR", "COLOR0", "COLOR1", "LASTFRAGCOLOR", "LASTFRAGDATA", "FRAGDATA",
+    "FBCOLOR", "DSTCOLOR", "NATIVECOLOR", "BLENDCOLOR", "TARGETCOLOR", "BOGUSSEMANTIC",
 };
 
-// The destination read: r halved, g + 0.25 (64), b inverted, a one - from
-// (204, 102, 51, 255) that is (102, 166, 204, 255).
-struct Variant {
-    const char* name;
-    const char* source;
-    int tolerance;
-};
-const Variant kVariants[] = {
-    {"in __regformat uchar4 : FRAGCOLOR, out uchar4",
-     "void main(__regformat uchar4 dst : FRAGCOLOR, out __regformat uchar4 col : COLOR) {\n"
-     "    col = uchar4(dst.r >> 1, dst.g + 64, 255 - dst.b, 255);\n"
-     "}\n", 0},
-    {"in __regformat unsigned char4 : FRAGCOLOR, out",
-     "void main(__regformat unsigned char4 dst : FRAGCOLOR, out __regformat unsigned char4 col : COLOR) {\n"
-     "    col = unsigned char4(dst.r >> 1, dst.g + 64, 255 - dst.b, 255);\n"
-     "}\n", 0},
-    {"in __regformat uchar4 : FRAGCOLOR, float4 out",
-     "float4 main(__regformat uchar4 dst : FRAGCOLOR) : COLOR {\n"
-     "    float4 d = float4(dst) / 255.0f;\n"
-     "    return float4(d.r * 0.5f, d.g + 0.25f, 1.0f - d.b, 1.0f);\n"
-     "}\n", 2},
-    {"in __regformat unsigned char4 : FRAGCOLOR, float4",
-     "float4 main(__regformat unsigned char4 dst : FRAGCOLOR) : COLOR {\n"
-     "    float4 d = float4(dst) / 255.0f;\n"
-     "    return float4(d.r * 0.5f, d.g + 0.25f, 1.0f - d.b, 1.0f);\n"
-     "}\n", 2},
-    {"uniform __regformat uchar4 : FRAGCOLOR",
-     "void main(uniform __regformat uchar4 dst : FRAGCOLOR, out __regformat uchar4 col : COLOR) {\n"
-     "    col = uchar4(dst.r >> 1, dst.g + 64, 255 - dst.b, 255);\n"
-     "}\n", 0},
-    {"uniform float4 : FRAGCOLOR",
-     "float4 main(uniform float4 dst : FRAGCOLOR) : COLOR {\n"
-     "    return float4(dst.r * 0.5f, dst.g + 0.25f, 1.0f - dst.b, 1.0f);\n"
-     "}\n", 2},
-    {"in __regformat float4 : FRAGCOLOR",
-     "float4 main(__regformat float4 dst : FRAGCOLOR) : COLOR {\n"
-     "    return float4(dst.r * 0.5f, dst.g + 0.25f, 1.0f - dst.b, 1.0f);\n"
-     "}\n", 2},
-    {"in __regformat half4 : FRAGCOLOR",
-     "half4 main(__regformat half4 dst : FRAGCOLOR) : COLOR {\n"
-     "    return half4(dst.r * 0.5h, dst.g + 0.25h, 1.0h - dst.b, 1.0h);\n"
-     "}\n", 2},
-    {"out __nativecolor __regformat uchar4 : COLOR",
-     "void main(__regformat uchar4 dst : FRAGCOLOR, out __nativecolor __regformat uchar4 col : COLOR) {\n"
-     "    col = uchar4(dst.r >> 1, dst.g + 64, 255 - dst.b, 255);\n"
-     "}\n", 0},
-    {"inout float4 : COLOR",
-     "void main(inout float4 col : COLOR) {\n"
-     "    col = float4(col.r * 0.5f, col.g + 0.25f, 1.0f - col.b, 1.0f);\n"
-     "}\n", 2},
+// __regformat and __nativecolor in other spellings and places (compiled).
+const char* const kQualified[] = {
+    "float4 main(unsigned char4 dst : FRAGCOLOR) : COLOR { return float4(dst) / 255.0f; }\n",
+    "float4 main(uniform unsigned char4 dst : FRAGCOLOR) : COLOR { return float4(dst) / 255.0f; }\n",
+    "float4 main(__regformat unsigned char4 dst : FRAGCOLOR) : COLOR { return float4(dst) / 255.0f; }\n",
+    "float4 main(unsigned char4 __regformat dst : FRAGCOLOR) : COLOR { return float4(dst) / 255.0f; }\n",
+    "float4 main(regformat unsigned char4 dst : FRAGCOLOR) : COLOR { return float4(dst) / 255.0f; }\n",
+    "float4 main(__regformat__ unsigned char4 dst : FRAGCOLOR) : COLOR { return float4(dst) / 255.0f; }\n",
+    "float4 main(uniform __regformat unsigned char4 dst : FRAGCOLOR) : COLOR { return float4(dst) / 255.0f; }\n",
+    "__nativecolor float4 main() : COLOR { return float4(1.0f, 0.0f, 0.0f, 1.0f); }\n",
+    "float4 main() : COLOR __nativecolor { return float4(1.0f, 0.0f, 0.0f, 1.0f); }\n",
+    "void main(out __nativecolor float4 col : COLOR) { col = float4(1.0f, 0.0f, 0.0f, 1.0f); }\n",
 };
 
-// Integers in a fragment program: at pixel (5, 9), ((x ^ y) & 31) << 3 = 96.
+// The destination read by `uniform float4 : FRAGCOLOR`, which compiles
+// (probe 2): r halved, g + 0.25, b inverted - from (204, 102, 51, 255),
+// (102, 166, 204, 255); from 0.5 in a plain uniform, (64, 191, 128, 255).
+const char kUniformFragcolor[] =
+    "float4 main(uniform float4 dst : FRAGCOLOR) : COLOR {\n"
+    "    return float4(dst.r * 0.5f, dst.g + 0.25f, 1.0f - dst.b, 1.0f);\n"
+    "}\n";
+
+// Integers in a fragment program: (int) rounds there (probe 2: WPOS 5.5
+// became 6), so floor first. At pixel (5, 9): ((x ^ y) & 31) << 3 = 96, x * 3
+// = 15, y >> 1 = 4.
 const char kIntegers[] =
     "float4 main(float2 pos : WPOS) : COLOR {\n"
-    "    int x = (int)pos.x, y = (int)pos.y;\n"
+    "    int x = (int)floor(pos.x), y = (int)floor(pos.y);\n"
     "    int v = ((x ^ y) & 31) << 3;\n"
     "    return float4((float)v / 255.0f, (float)(x * 3) / 255.0f, (float)(y >> 1) / 255.0f, 1.0f);\n"
     "}\n";
@@ -478,11 +467,11 @@ const char kIntegers[] =
 int main() {
     // Its own data directory (and bubble, CMakeLists.txt): the first version's
     // result.txt left behind cannot be taken for this one's.
-    ps2plat::SetAppName("ps2plat_gxm_probe2");
+    ps2plat::SetAppName("ps2plat_gxm_probe3");
     ps2plat::StartUp();
     vita::ConsoleShow();
     g_out = std::fopen(ps2plat::JoinPath(ps2plat::DataDirectory(), "result.txt").c_str(), "w");
-    Say("GXM probe (2): the Vita's GPU for the GS renderer\n\n", vita::kYellow);
+    Say("GXM probe (3): the Vita's GPU for the GS renderer\n\n", vita::kYellow);
     int failures = 0;
 
     g_compiler = LoadCompiler();
@@ -542,39 +531,79 @@ int main() {
     }
 
     if (g_compiler) {
-        Say("\nhow the compiler spells 8-bit vectors:\n", vita::kYellow);
-        for (const Spelling& s : kSpellings) {
-            const Compiled c = Compile(s.source, true);
-            std::snprintf(line, sizeof line, "  %-40s %.100s\n", s.name, c.program ? "compiles" : c.error.c_str());
-            Say(line, c.program ? vita::kGreen : vita::kGrey);
+        Say("\nsemantics on an input (varying / uniform):\n", vita::kYellow);
+        for (const char* semantic : kSemantics) {
+            for (bool uniform : {false, true}) {
+                char source[256];
+                std::snprintf(source, sizeof source, "float4 main(%sfloat4 dst : %s) : COLOR { return dst; }\n",
+                              uniform ? "uniform " : "", semantic);
+                const Compiled c = Compile(source, true);
+                std::snprintf(line, sizeof line, "  %-14s %-8s %.150s\n", semantic, uniform ? "uniform" : "varying",
+                              c.program ? Describe(c.program).c_str() : c.error.c_str());
+                Say(line, c.program ? ((Flags(c.program) & 0x80) ? vita::kGreen : vita::kWhite) : vita::kGrey);
+            }
+        }
+        Say("\nqualifiers:\n", vita::kYellow);
+        for (const char* source : kQualified) {
+            const Compiled c = Compile(source, true);
+            std::string shown(source);
+            shown.resize(shown.find('{') == std::string::npos ? shown.size() : shown.find('{'));
+            std::snprintf(line, sizeof line, "  %.70s\n    -> %.150s\n", shown.c_str(),
+                          c.program ? Describe(c.program).c_str() : c.error.c_str());
+            Say(line, c.program ? ((Flags(c.program) & 0xC0) ? vita::kGreen : vita::kWhite) : vita::kGrey);
         }
     }
 
     if (vp && constant_fp) {
-        Say("\nreading the destination in the shader:\n", vita::kYellow);
-        const int want[4] = {102, 166, 204, 255};
-        for (const Variant& variant : kVariants) {
-            const Compiled c = Compile(variant.source, true);
-            if (!c.program) {
-                std::snprintf(line, sizeof line, "  %-46s does not compile: %.100s\n", variant.name, c.error.c_str());
-                Say(line, vita::kGrey);
-                continue;
-            }
+        Say("\nuniform float4 : FRAGCOLOR, drawn:\n", vita::kYellow);
+        {
+            const Compiled c = Compile(kUniformFragcolor, true);
             Program p;
             std::string how;
-            SceGxmFragmentProgram* fp = Register(g, c, &p) ? FragmentProgram(g, p, vertex, &how) : nullptr;
+            SceGxmFragmentProgram* fp = c.program && Register(g, c, &p) ? FragmentProgram(g, p, vertex, &how) : nullptr;
             if (!fp) {
-                std::snprintf(line, sizeof line, "  %-46s compiles, does not link: %s\n", variant.name, how.c_str());
-                Say(line, vita::kRed);
-                continue;
+                Say("  " + (c.program ? how : c.error) + "\n", vita::kRed);
+            } else {
+                Say("  " + Describe(p.gxp) + "\n", vita::kGrey);
+                const struct {
+                    const char* name;
+                    float fill;
+                } runs[] = {{"uniform buffer zero", 0.0f}, {"uniform buffer 0.5", 0.5f}};
+                for (const auto& run : runs) {
+                    // The "dst" uniform filled (when it is one) through uColour's path: by name.
+                    Draw(g, vp, vertex.gxp, {{constant_fp, constant_gxp, {0.8f, 0.4f, 0.2f, 1.0f}}});
+                    std::memset(g.pixels, 0, kSide * kSide * 4);
+                    int r = sceGxmBeginScene(g.context, 0, g.target, nullptr, nullptr, nullptr, &g.surface, &g.depth);
+                    sceGxmSetViewportEnable(g.context, SCE_GXM_VIEWPORT_ENABLED);
+                    sceGxmSetViewport(g.context, kSide / 2.0f, kSide / 2.0f, kSide / 2.0f, -(kSide / 2.0f), 0.5f, 0.5f);
+                    sceGxmSetFrontDepthFunc(g.context, SCE_GXM_DEPTH_FUNC_ALWAYS);
+                    sceGxmSetFrontDepthWriteEnable(g.context, SCE_GXM_DEPTH_WRITE_DISABLED);
+                    for (int pass = 0; pass < 2 && r >= 0; ++pass) {
+                        sceGxmSetVertexProgram(g.context, vp);
+                        sceGxmSetFragmentProgram(g.context, pass == 0 ? constant_fp : fp);
+                        const SceGxmProgram* gxp = pass == 0 ? constant_gxp : p.gxp;
+                        if (sceGxmProgramGetDefaultUniformBufferSize(gxp)) {
+                            void* buffer = nullptr;
+                            sceGxmReserveFragmentDefaultUniformBuffer(g.context, &buffer);
+                            const float colour[4] = {0.8f, 0.4f, 0.2f, 1.0f}, fill[4] = {run.fill, run.fill, run.fill, run.fill};
+                            if (const SceGxmProgramParameter* u = sceGxmProgramFindParameterByName(gxp, "uColour"))
+                                sceGxmSetUniformDataF(buffer, u, 0, 4, colour);
+                            if (const SceGxmProgramParameter* d = sceGxmProgramFindParameterByName(gxp, "dst"))
+                                sceGxmSetUniformDataF(buffer, d, 0, 4, fill);
+                        }
+                        sceGxmSetVertexStream(g.context, 0, g.vertices);
+                        r = sceGxmDraw(g.context, SCE_GXM_PRIMITIVE_TRIANGLES, SCE_GXM_INDEX_FORMAT_U16, g.indices, 3);
+                    }
+                    sceGxmEndScene(g.context, nullptr, nullptr);
+                    sceGxmFinish(g.context);
+                    std::uint8_t px[4];
+                    std::snprintf(line, sizeof line, "  %-20s %s%s\n", run.name, Pixel(g, 32, 32, px).c_str(),
+                                  r < 0 ? (" draw " + Hex(r)).c_str() : "");
+                    Say(line);
+                }
+                Say("  (102, 166, 204, 255): the destination read; (64, 191, 128, 255) with 0.5: a plain uniform\n",
+                    vita::kGrey);
             }
-            Draw(g, vp, vertex.gxp, {{constant_fp, constant_gxp, {0.8f, 0.4f, 0.2f, 1.0f}}, {fp, p.gxp, {0, 0, 0, 0}}});
-            std::uint8_t px[4];
-            const std::string got = Pixel(g, 32, 32, px);
-            const bool ok = Near(px, want, variant.tolerance);
-            std::snprintf(line, sizeof line, "  %-46s %s %s (%s, %.0f ms)\n", variant.name, got.c_str(),
-                          ok ? "WORKS" : "wrong", how.c_str(), c.ms);
-            Say(line, ok ? vita::kGreen : vita::kRed);
         }
 
         Say("\nintegers in a fragment program:\n", vita::kYellow);

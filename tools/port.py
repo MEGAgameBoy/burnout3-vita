@@ -162,6 +162,18 @@ def _visual_studio_tool(*parts) -> str:
     return os.path.join(root, "Common7", "IDE", "CommonExtensions", "Microsoft", "CMake", *parts)
 
 
+def port_environment() -> dict:
+    """The environment the port and its tests run in: this one, without the
+    PS2RT_EE_ROUND_NEAREST the compiled checks set for themselves on import
+    (cppcheck.py, liftcheck.py - their harnesses compare with the interpreter,
+    which rounds to nearest). The port rounds as the console does, toward zero;
+    inherited, the variable made a run started here round otherwise (and the
+    host tests' ArithmeticIsThePcs fail)."""
+    environment = dict(os.environ)
+    environment.pop("PS2RT_EE_ROUND_NEAREST", None)
+    return environment
+
+
 def _tool(name: str) -> str:
     import shutil
     path = shutil.which(name)
@@ -198,7 +210,7 @@ def build_with_cmake(game, generated: str, target_system: str) -> str:
         print("built %s" % built)
         return built
     tests = os.path.join(binary, "ps2host", "ps2host_tests")
-    result = subprocess.run([tests], capture_output=True, text=True)
+    result = subprocess.run([tests], capture_output=True, text=True, env=port_environment())
     print(result.stdout.strip())
     if result.returncode:
         raise SystemExit("the host's own tests failed")
@@ -230,7 +242,7 @@ def build(game, generated: str, target_system: str = "pc") -> str:
         raise SystemExit("port build failed:\n" + "\n".join(errors[:40] or
                                                            (result.stdout + result.stderr)[-4000:].splitlines()))
     tests = os.path.join(binary, "ps2host", "ps2host_tests.exe")
-    result = subprocess.run([tests], capture_output=True, text=True)
+    result = subprocess.run([tests], capture_output=True, text=True, env=port_environment())
     print(result.stdout.strip())
     if result.returncode:
         raise SystemExit("the host's own tests failed")
@@ -259,7 +271,7 @@ def run(game, executable: str, extra) -> int:
         try:
             result = subprocess.run([executable, elf, "--discover", discoveries_path(game)]
                                     + options + list(extra), stdout=out, stderr=subprocess.STDOUT,
-                                    timeout=timeout + HOST_GRACE_SECONDS)
+                                    timeout=timeout + HOST_GRACE_SECONDS, env=port_environment())
             code = result.returncode
         except subprocess.TimeoutExpired:
             # The host stops itself at its own time limit; outliving it by this
