@@ -565,7 +565,11 @@ int Run(const Options& options) {
         // or the executable, so they go where the player's saves go.
         std::filesystem::path where;
         if (!options.memcard.empty()) {
-            where = std::filesystem::absolute(options.memcard).parent_path();
+            // Its parent as written (made absolute only when it has none):
+            // the Vita's ux0:data/... has no root std::filesystem knows, and
+            // absolute() would put the working directory before it.
+            const std::filesystem::path card(options.memcard);
+            where = card.has_parent_path() ? card.parent_path() : std::filesystem::absolute(card).parent_path();
         } else {
             where = ps2plat::DataDirectory();       // beside the executable (the Vita: its data directory)
         }
