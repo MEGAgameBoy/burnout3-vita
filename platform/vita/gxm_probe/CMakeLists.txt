@@ -15,5 +15,5 @@ include(${PS2_ENGINE_DIR}/cmake/vita.cmake)
 add_executable(ps2plat_gxm_probe ${CMAKE_CURRENT_LIST_DIR}/gxm_probe.cpp)
 # libshacccg's imports weak: the probe starts without it and says so.
 target_link_libraries(ps2plat_gxm_probe PRIVATE ps2plat SceGxm_stub SceShaccCg_stub_weak SceKernelModulemgr_stub)
-ps2_vita_package(ps2plat_gxm_probe TITLE "GXM probe" TITLE_ID PTEN00002 VERSION 01.00
+ps2_vita_package(ps2plat_gxm_probe TITLE "GXM probe 2" TITLE_ID PTEN00003 VERSION 01.00
                  SCE_SYS ${PS2_ENGINE_DIR}/platform/vita/tests_sce_sys)

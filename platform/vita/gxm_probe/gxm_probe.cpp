@@ -17,7 +17,7 @@
  *      the expected bytes.
  *   4. Integer arithmetic in a fragment program (GS memory's swizzle).
  *
- * Results on the screen and in ux0:data/ps2plat_gxm_probe/result.txt.
+ * Results on the screen and in ux0:data/ps2plat_gxm_probe2/result.txt.
  */
 
 #include <psp2/ctrl.h>
@@ -476,7 +476,9 @@ const char kIntegers[] =
 }  // namespace
 
 int main() {
-    ps2plat::SetAppName("ps2plat_gxm_probe");
+    // Its own data directory (and bubble, CMakeLists.txt): the first version's
+    // result.txt left behind cannot be taken for this one's.
+    ps2plat::SetAppName("ps2plat_gxm_probe2");
     ps2plat::StartUp();
     vita::ConsoleShow();
     g_out = std::fopen(ps2plat::JoinPath(ps2plat::DataDirectory(), "result.txt").c_str(), "w");
