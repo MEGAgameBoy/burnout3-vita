@@ -545,6 +545,7 @@ fast (the blanks a second, the blanks lost) and `--frame-times 600` in its
 log; `run.args` in the data directory, when there, adds options (a scripted
 run from `port/runs`, `{data}` the data directory). `ps2_add_port` packages a port as a VPK too (`VITA_TITLE`,
 `VITA_TITLE_ID`, `VITA_SCE_SYS`, `VITA_EXTENDED_MEMORY`), and `port.py
---game <g> build --target vita` drives it. GCC's time on generated code is
+--game <g> --target vita build` drives it (`--target` before the action:
+what follows the action goes to the port itself). GCC's time on generated code is
 the Vita build's cost: the VU corpus (3.3 MB of C++) takes it half an hour at
 `-O3`.
