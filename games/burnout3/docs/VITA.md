@@ -54,7 +54,7 @@ export VITASDK=/usr/local/vitasdk PATH=$VITASDK/bin:$PATH
 cp SLUS_210.50 games/burnout3/extracted/
 python3 engine/tools/analyze.py --game games/burnout3
 python3 engine/tools/lift.py --game games/burnout3 --structure --emit     # hours: verifies every function (g++)
-python3 engine/tools/port.py --game games/burnout3 build --target vita    # games/burnout3/build/port/vita/burnout3.vpk
+python3 engine/tools/port.py --game games/burnout3 --target vita build    # games/burnout3/build/port/vita/burnout3.vpk
 ```
 
 or, with the generated sources in place, CMake directly:
