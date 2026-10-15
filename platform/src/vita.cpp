@@ -36,6 +36,14 @@
 #include "ps2plat/platform.h"
 #include "ps2plat/vita_console.h"
 
+extern "C" {
+/* std::thread's stack. VitaSDK's pthreads give a thread 32 KB unless the
+   program defines this (pthread-embedded's create.c): far too little for the
+   host's threads - the GS model, VIF1 and VU1's compiled programs, the IOP's
+   sound - which get what the EE's fibers get. */
+unsigned int _pthread_stack_default_user = 1024u * 1024u;
+}
+
 namespace ps2plat {
 
 // ------------------------------------------------------------ threads
