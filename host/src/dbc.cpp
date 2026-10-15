@@ -33,9 +33,7 @@
  * profile FF FF FF FF 00.
  */
 
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
+#include "ps2plat/keys.h"     // the keyboard's keys, as Win32 virtual keys on every system
 
 #include <algorithm>
 #include <cstdio>

@@ -51,6 +51,7 @@
 #include "ps2host/vif.h"
 #include "ps2host/vu.h"
 #include "ps2host/profile.h"
+#include "ps2plat/platform.h"
 
 namespace ps2host {
 
@@ -467,7 +468,7 @@ void StartCapture(u64 frame) {
     char name[64];
     const std::time_t now = std::time(nullptr);
     std::tm tm{};
-    localtime_s(&tm, &now);
+    ps2plat::LocalTime(now, &tm);
     std::snprintf(name, sizeof name, "%04d%02d%02d-%02d%02d%02d-frame%llu", tm.tm_year + 1900, tm.tm_mon + 1,
                   tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, static_cast<unsigned long long>(frame + 1));
     const fs::path dir = base / name;

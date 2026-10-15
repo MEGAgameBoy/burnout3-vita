@@ -10,7 +10,9 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
-#include <xmmintrin.h>
+#if defined(__SSE2__) || defined(_M_X64) || defined(_M_IX86)
+#include <xmmintrin.h>      // (ARM: vu_math.h's sse_on_neon.h has _mm_getcsr and _mm_setcsr, over FPSCR)
+#endif
 
 namespace lifted {
 

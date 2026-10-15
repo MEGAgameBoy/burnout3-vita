@@ -20,16 +20,27 @@
 #define PS2RT_VU_INLINE inline __attribute__((always_inline))
 #endif
 
+/* PS2RT_VU_SSE: the four lanes at once, in SSE's operations - on x86 SSE
+   itself, on ARM with NEON the same operations made of NEON and VFP
+   (sse_on_neon.h, with SSE's results to the bit). */
 #if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
 #include <emmintrin.h>
 #define PS2RT_VU_SSE 1
+#define PS2RT_VU_NEON 0
+#elif defined(__arm__) && defined(__ARM_NEON)
+#include "ps2rt/sse_on_neon.h"
+#define PS2RT_VU_SSE 1
+#define PS2RT_VU_NEON 1
 #else
 #define PS2RT_VU_SSE 0
+#define PS2RT_VU_NEON 0
 #endif
 /* SSE4.1 (pminud): every x86-64 processor a Vulkan port runs on has it; MSVC
    takes its intrinsics without /arch, and other compilers say so with
-   __SSE4_1__. */
-#if PS2RT_VU_SSE && (defined(__SSE4_1__) || defined(_M_X64))
+   __SSE4_1__. (NEON has its own: sse_on_neon.h's _mm_min_epu32.) */
+#if PS2RT_VU_NEON
+#define PS2RT_VU_SSE41 1
+#elif PS2RT_VU_SSE && (defined(__SSE4_1__) || defined(_M_X64))
 #include <smmintrin.h>
 #define PS2RT_VU_SSE41 1
 #else

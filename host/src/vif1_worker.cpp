@@ -40,6 +40,7 @@
 #include "ps2host/profile.h"
 #include "ps2host/timeline.h"
 #include "ps2host/run.h"
+#include "ps2plat/platform.h"
 
 namespace ps2host {
 
@@ -64,7 +65,7 @@ struct Worker {
 
     void Run() {
         t_on_worker = true;
-        FastThread();
+        ps2plat::SetThreadRole(ps2plat::ThreadRole::kVif1);
         if (SampleVif1Thread()) StartSampler();
         for (;;) {
             std::function<void()> command;

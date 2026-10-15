@@ -466,3 +466,78 @@ so a new game gets them as soon as its routines are named.
 
 Each stage is measured the same way: run, read the report, implement what
 stopped it.
+
+## Other systems
+
+What differs from one system to another is the platform layer's
+(`engine/platform`, `ps2plat/platform.h`): the EE's fibers, the host's
+threads (their priorities, and on the Vita their cores), precise sleeps,
+files read at an offset, the data directory, messages and the disc picker.
+One implementation a system - `win32.cpp` (the calls the host made before
+the layer existed, unchanged), `posix.cpp`, `vita.cpp` - and nothing else in
+the host includes a system's headers for these. The window, the GPU renderer
+and the controllers are still Windows' alone (SDL3 and Vulkan, `engine/gpu`):
+elsewhere a run is headless, its pictures written with `--frames`.
+
+The translated code is the same on every system, so its arithmetic must be
+too. The VU's lanes and the MMI are written in SSE's operations; on ARMv7
+with NEON (the Vita's Cortex-A9) `ps2rt/sse_on_neon.h` gives the same
+operations with SSE's results to the bit - integer lanes, masks and shuffles
+in NEON; the float lanes in VFP, because NEON always rounds to nearest and
+the VUs round toward zero; `_mm_getcsr` and `_mm_setcsr` over FPSCR. The
+host's tests hash the EE's FPU, macro mode's FMAC, the MMI and the VU corpus
+over inputs chosen to be awkward (denormals, infinities, NaNs, the edges of
+the range) and compare the hashes with the x86-64 build's
+(`ArithmeticIsThePcs`). The compiled code needs `-fno-strict-aliasing -fwrapv
+-ffp-contract=off` with GCC: what MSVC does without being asked.
+
+### Linux
+
+```sh
+cmake -S engine/host -B build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release
+ninja -C build/linux && build/linux/ps2host_tests
+```
+
+ARMv7 Linux under qemu runs the Vita's code paths - the NEON and VFP lanes,
+the ARM fiber switch (`fiber_arm.S`) - on a PC (Ubuntu:
+`g++-arm-linux-gnueabihf qemu-user`):
+
+```sh
+cmake -S engine/host -B build/arm -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_TOOLCHAIN_FILE=engine/cmake/arm-linux-gnueabihf.cmake
+ninja -C build/arm && qemu-arm -L /usr/arm-linux-gnueabihf build/arm/ps2host_tests
+```
+
+On Linux the pipeline's compiled checks (`cppcheck.py`, `liftcheck.py`,
+`equivalence.py`) build with g++ instead of MSVC, and `port.py build` uses the
+CMake and Ninja on the path.
+
+### The PlayStation Vita
+
+With [VitaSDK](https://vitasdk.org) installed (`$VITASDK`; or built from
+its [buildscripts](https://github.com/vitasdk/buildscripts)), the host's tests
+are an application of their own:
+
+```sh
+cmake -S engine/host -B build/vita -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_TOOLCHAIN_FILE=$VITASDK/share/vita.toolchain.cmake
+ninja -C build/vita          # build/vita/ps2host_tests.vpk
+```
+
+Installed with VitaShell, it runs every test and the benchmarks (the VU
+programs' ns a pair, compiled, fast and interpreted; memory; the EE's
+arithmetic; sleeps) on the screen and into `ux0:data/ps2host_tests/results.txt`.
+`engine/platform/vita/probe` makes executables of 32, 64 and 96 MB of code
+(`ps2plat_probe<MB>.vpk`) - whether the system loads one the size of a
+translated game, and whether the linker's long-branch veneers arrive.
+
+On the Vita: the threads by role on the three cores an application has (the
+EE's on the first, VIF1 and VU1's on the second, the GS's on the third);
+the processor at 444 MHz, the bus and GPU at 222; files through `sceIo`
+(64-bit offsets); the player's things in `ux0:data/<name>/`, and there
+`env.txt`, lines `KEY=VALUE`, for the `PS2HOST_*` variables (the Vita has no
+environment). `ps2_add_port` packages a port as a VPK too (`VITA_TITLE`,
+`VITA_TITLE_ID`, `VITA_SCE_SYS`, `VITA_EXTENDED_MEMORY`), and `port.py
+--game <g> build --target vita` drives it. GCC's time on generated code is
+the Vita build's cost: the VU corpus (3.3 MB of C++) takes it half an hour at
+`-O3`.

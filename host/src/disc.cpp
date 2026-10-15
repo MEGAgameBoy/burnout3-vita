@@ -25,9 +25,7 @@ std::string Bare(std::string name) {
 
 }  // namespace
 
-Disc::~Disc() {
-    if (file_) std::fclose(file_);
-}
+Disc::~Disc() = default;
 
 namespace {
 
@@ -67,18 +65,15 @@ u8 ToBcd(u32 v) { return u8((v / 10) << 4 | (v % 10)); }
 }  // namespace
 
 bool Disc::Open(const std::string& path) {
-    if (file_) std::fclose(file_);
-    file_ = nullptr;
+    file_.Close();
     memory_.clear();
     std::string image = path;
     if (image.size() > 4 && Upper(image.substr(image.size() - 4)) == ".CUE") {
         image = CueImage(path);
         if (image.empty()) return false;
     }
-    file_ = std::fopen(image.c_str(), "rb");
-    if (!file_) return false;
-    _fseeki64(file_, 0, SEEK_END);
-    size_ = u64(_ftelli64(file_));
+    if (!file_.Open(image)) return false;
+    size_ = file_.Size();
     DetectFormat();
     return true;
 }
@@ -111,8 +106,7 @@ bool Disc::ReadBytes(u64 offset, u64 length, u8* out) {
         std::memcpy(out, memory_.data() + offset, size_t(length));
         return true;
     }
-    if (!file_ || _fseeki64(file_, s64(offset), SEEK_SET) != 0) return false;
-    return std::fread(out, 1, size_t(length), file_) == length;
+    return file_.ReadAt(offset, out, std::size_t(length));
 }
 
 bool Disc::Read(u32 lsn, u32 count, u8* out) {

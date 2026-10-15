@@ -4,11 +4,13 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -26,6 +28,7 @@
 #include "ps2host/vu.h"
 #include "ps2host/vu_core.h"
 #include "ps2rt/generated.h"
+#include "ps2plat/platform.h"
 
 #if PS2HOST_VULKAN
 #include "ps2gpu/gs_renderer.h"
@@ -1030,6 +1033,225 @@ void VuCompiledIsTheInterpreter() {
     Check(entered == runs, what);
 }
 
+/*
+ * Fibers (ps2plat: Windows' own; on ARM a switch of our own; ucontext
+ * elsewhere), as the EE's threads use them: two fibers taking turns with the
+ * host's, doubles kept in callee-saved registers across every switch, an
+ * exception thrown and caught inside one, a deep stack in the other. And
+ * what a switch costs, for the record.
+ */
+namespace fiber_test {
+ps2plat::Fiber *host = nullptr, *a = nullptr, *b = nullptr;
+int turns = 0;
+bool caught = false;
+double kept = 0.0;
+int deepest = 0;
+constexpr int kTurns = 1000;
+
+double Step(double x) { return x * 1.0000001 + 0.5; }
+
+int Deep(int depth) {
+    volatile char frame[256];
+    frame[depth & 255] = char(depth);
+    return depth == 0 ? frame[0] : Deep(depth - 1) + 1;
+}
+
+void A(void*) {
+    double x = 1.5, y = -2.25;
+    for (int i = 0; i < kTurns; ++i) {
+        x = Step(x);
+        y = Step(y);
+        ps2plat::SwitchTo(b);
+    }
+    try {
+        throw std::runtime_error("thrown in a fiber");
+    } catch (const std::exception&) {
+        caught = true;
+    }
+    kept = x + y;
+    ps2plat::SwitchTo(host);            // never resumed
+}
+
+void B(void*) {
+    deepest = Deep(1000);               // some 300 KB of the 512 KB stack
+    for (;;) {
+        ++turns;
+        ps2plat::SwitchTo(a);
+    }
+}
+
+ps2plat::Fiber* pong = nullptr;
+void Pong(void*) {
+    for (;;) ps2plat::SwitchTo(host);
+}
+}  // namespace fiber_test
+
+void FibersSwitchAndUnwind() {
+    using namespace fiber_test;
+    host = ps2plat::ThreadToFiber();
+    a = ps2plat::NewFiber(512 << 10, A, nullptr);
+    b = ps2plat::NewFiber(512 << 10, B, nullptr);
+    ps2plat::SwitchTo(a);
+    double x = 1.5, y = -2.25;
+    for (int i = 0; i < kTurns; ++i) {
+        x = Step(x);
+        y = Step(y);
+    }
+    Check(turns == kTurns && kept == x + y, "fibers take turns, doubles kept across switches");
+    Check(caught, "fibers: an exception thrown and caught inside one");
+    Check(deepest == 1000, "fibers: a deep stack");
+    ps2plat::FreeFiber(a);
+    ps2plat::FreeFiber(b);
+    pong = ps2plat::NewFiber(64 << 10, Pong, nullptr);
+    const auto began = std::chrono::steady_clock::now();
+    constexpr int kSwitches = 200000;
+    for (int i = 0; i < kSwitches / 2; ++i) ps2plat::SwitchTo(pong);
+    const double ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - began).count();
+    std::printf("fibers: %.0f ns a switch\n", ns / kSwitches);
+    ps2plat::FreeFiber(pong);
+}
+
+/*
+ * The same arithmetic on every processor. The port runs one translation of
+ * the game everywhere, so the EE's FPU, VU0's macro mode, the VU programs and
+ * the MMI must leave the same bits on ARM (the Vita: NEON and VFP lanes,
+ * FPSCR's rounding) as on the PC (x86-64, SSE) - not just agree with
+ * themselves. Each part is hashed over random inputs and compared with the
+ * hash a PC build gave (kPc*; ARM builds print theirs). The VU corpus is
+ * vurecomp's, made by the build's Python: its programs are hashed too, and
+ * compared only when they are the ones the PC hash was made from.
+ */
+struct Fnv {
+    u64 h = 0xCBF29CE484222325ull;
+    void Add(const void* data, std::size_t size) {
+        const auto* p = static_cast<const unsigned char*>(data);
+        for (std::size_t i = 0; i < size; ++i) h = (h ^ p[i]) * 0x100000001B3ull;
+    }
+    template <typename T>
+    void Of(const T& value) { Add(&value, sizeof value); }
+};
+
+void ArithmeticIsThePcs() {
+    // Recorded from the x86-64 build (GCC 13, SSE; MSVC's is the same SSE).
+    constexpr u64 kPcCorpus = 0xC55468E84D825446ull, kPcVu = 0xC0F321C949A5192Dull,
+                  kPcMacro = 0xDCE9557991444CB5ull, kPcFpu = 0xBAA155C57922E6B5ull, kPcMmi = 0x503D33F3D142B379ull;
+    u32 seed = 4321;
+    auto next = [&] { return seed = seed * 1664525u + 1013904223u; };
+    auto value = [&]() -> u32 {
+        const u32 r = next(), sign = r & 0x80000000u;
+        switch ((r >> 8) % 8) {
+            case 0: return sign;
+            case 1: return sign | (r & 0x007FFFFFu);                        // denormal
+            case 2: return sign | 0x7F800000u | ((r >> 4) & 1);             // infinity, NaN
+            case 3: return sign | 0x7F000000u | (next() & 0x007FFFFFu);     // near the top
+            case 4: return sign | 0x00800000u | (next() & 0x00FFFFFFu);     // near the bottom
+            case 5: return sign | 0x3F800000u | (next() & 0x007FFFFFu);     // about one
+            default: return next();
+        }
+    };
+
+    // The VU corpus, interpreted and compiled, from the same states as
+    // VuCompiledIsTheInterpreter's.
+    Fnv corpus, vu;
+    std::size_t count = 0;
+    const ps2host::VuCompiled* programs = VuGeneratedPrograms(&count);
+    u32 vu_seed = 77;
+    for (std::size_t i = 0; i < count; ++i) {
+        const ps2host::VuCompiled& program = programs[i];
+        const u32* code = program.code;
+        const u32 runs_in = *code;
+        std::size_t words = 1;
+        for (u32 r = 0, at = 1; r < runs_in; ++r) {
+            words += 2 + code[at + 1];
+            at += 2 + code[at + 1];
+        }
+        corpus.Add(code, words * 4);
+        if (!program.block_count) continue;
+        for (int trial = 0; trial < 6; ++trial) {
+            for (bool compiled : {false, true}) {
+                auto unit = std::make_unique<ps2host::Vu>(program.unit);
+                u32 s = vu_seed;
+                PrepareVuRun(*unit, program, s);
+                unit->use_compiled = compiled;
+                const u64 pairs = unit->Run(program.entry, 3000);
+                vu.Of(pairs);
+                vu.Add(unit->regs.vf, sizeof unit->regs.vf);
+                vu.Add(unit->regs.vc, sizeof unit->regs.vc);
+                vu.Add(unit->regs.vacc, sizeof unit->regs.vacc);
+                vu.Of(unit->mac);
+                vu.Of(unit->status);
+                vu.Of(unit->clip);
+                vu.Of(unit->p);
+                vu.Add(unit->data.data(), unit->data.size());
+                if (compiled) vu_seed = s;
+            }
+        }
+    }
+
+    // Macro mode's FMAC (Cop2: VU0 from EE code, rounded as the game runs
+    // it): the broadcast forms of ADD, SUB, MADD, MSUB, MAX, MINI, MUL.
+    Fnv macro;
+    {
+        auto c = std::make_unique<lifted::Context>();
+        for (int i = 0; i < 200000; ++i) {
+            if ((i & 255) == 0) {
+                for (auto& v : c->vf) for (u32& lane : v) lane = value();
+                for (u32& lane : c->vacc) lane = value();
+            }
+            const u32 funct = next() % 0x1C, dest = 1 + next() % 15;
+            const u32 ft = next() % 32, fs = next() % 32, fd = 1 + next() % 31;
+            lifted::Cop2(*c, 0x4A000000u | dest << 21 | ft << 16 | fs << 11 | fd << 6 | funct);
+            if ((i & 255) == 255) {
+                macro.Add(c->vf, sizeof c->vf);
+                macro.Add(c->vacc, sizeof c->vacc);
+            }
+        }
+    }
+
+    // The EE's FPU (eefpu.cpp: computed in double, saturated, toward zero).
+    Fnv fpu;
+    for (int i = 0; i < 300000; ++i) {
+        const u32 a = value(), b = value(), acc = value();
+        fpu.Of(generated::FloatAdd(a, b));
+        fpu.Of(generated::FloatSub(a, b));
+        fpu.Of(generated::FloatMul(a, b));
+        fpu.Of(generated::FloatDiv(a, b));
+        fpu.Of(generated::FloatSqrt(a));
+        fpu.Of(generated::FloatMulAdd(acc, a, b));
+        fpu.Of(generated::FloatMulSub(acc, a, b));
+        fpu.Of(generated::IntFromFloat(a));
+        fpu.Of(generated::FloatFromInt(b));
+        fpu.Of(lifted::FloatRsqrt(a, b));
+    }
+
+    // The MMI's lanes.
+    Fnv mmi;
+    for (int i = 0; i < 100000; ++i) {
+        const u64 alo = u64(next()) << 32 | next(), ahi = u64(next()) << 32 | next();
+        const u64 blo = u64(next()) << 32 | next(), bhi = u64(next()) << 32 | next();
+        for (int op = lifted::kPmaxw; op <= lifted::kPminh; ++op) {
+            u64 lo = 0, hi = 0;
+            lifted::Lanes(op, lo, hi, alo, ahi, blo, bhi);
+            mmi.Of(lo);
+            mmi.Of(hi);
+        }
+        u64 lo = 0, hi = 0;
+        lifted::Interleave(lo, hi, alo, blo, 8u << (i % 3));
+        mmi.Of(lo);
+        mmi.Of(hi);
+    }
+
+    std::printf("arithmetic: corpus %016llX vu %016llX macro %016llX fpu %016llX mmi %016llX\n",
+                (unsigned long long)corpus.h, (unsigned long long)vu.h, (unsigned long long)macro.h,
+                (unsigned long long)fpu.h, (unsigned long long)mmi.h);
+    if (kPcCorpus == 0) return;     // not recorded yet
+    if (corpus.h == kPcCorpus) Check(vu.h == kPcVu, "the VU corpus runs as on the PC, to the bit");
+    else std::printf("arithmetic: the VU corpus is not the one the PC's hash was made from: not compared\n");
+    Check(macro.h == kPcMacro, "macro mode's FMAC as on the PC, to the bit");
+    Check(fpu.h == kPcFpu, "the EE's FPU as on the PC, to the bit");
+    Check(mmi.h == kPcMmi, "the MMI's lanes as on the PC, to the bit");
+}
+
 // --vu-fast: the corpus's VU1 programs that never read MAC or STATUS
 // (vurecomp's fast_eligible) run their flag-free blocks, and end as the
 // exact blocks do in everything else - registers, memory, CLIP, Q and P,
@@ -1505,44 +1727,173 @@ void SpuDecodesAdpcmAndPlaysAVoice() {
     Check(wet.SetEffectAttr(0, 10, 0, 0, 0, 0) == -1, "SPU2: no eleventh preset");
 }
 
-int main() {
-    MirrorsReachTheSameRam();
-    LoadsExtendAsTheEeDoes();
-    OutsideMemoryFaults();
-    ScratchpadAndHooks();
-    BiosIsReadOnly();
-    Kseg1ReachesDeviceRegisters();
-    DiscFindsFilesByPath();
-    WideWritesReachEveryWordsHook();
-    VifSkipsDataAndAppliesMaskPath3();
-    DmaChainsAreWalked();
-    GsLayoutsArePermutations();
-    GsDrawsASprite();
-    GsFogsTowardsFogcol();
-    GsLoadsACsm2Clut();
-    Path3GoesOneGroupPerWindow();
-    GsKeepsAFlatDepthExact();
-    GsFillsTopLeft();
-    GsTakesImagesInBlocks();
-    GsTakesRegisterPacketsInBlocks();
-    TexturePackNamesAsPcsx2();
+/*
+ * What the processor does with the host's work, measured (PS2HOST_TEST_BENCH;
+ * the Vita's runner asks for it): the numbers the port's speed is estimated
+ * from on a new processor, taken the same way on each. Nothing is checked.
+ */
+void Benchmarks() {
+    using Clock = std::chrono::steady_clock;
+    auto ns_since = [](Clock::time_point from) {
+        return std::chrono::duration<double, std::nano>(Clock::now() - from).count();
+    };
+    std::printf("benchmarks:\n");
+
+    // VU programs: the corpus (random microprograms, vurecomp's) run compiled,
+    // compiled without the flags no one reads (--vu-fast), and interpreted.
+    std::size_t count = 0;
+    const ps2host::VuCompiled* programs = VuGeneratedPrograms(&count);
+    for (int mode = 0; mode < 3; ++mode) {
+        double ns = 0;
+        u64 pairs = 0;
+        for (int pass = 0; pass < 4; ++pass) {
+            u32 seed = 1234;
+            for (std::size_t i = 0; i < count; ++i) {
+                const ps2host::VuCompiled& program = programs[i];
+                if (!program.block_count || (mode == 1 && !program.fast_blocks)) continue;
+                auto unit = std::make_unique<ps2host::Vu>(program.unit);
+                PrepareVuRun(*unit, program, seed);
+                unit->use_compiled = mode != 2;
+                unit->fast = mode == 1;
+                const auto began = Clock::now();
+                pairs += unit->Run(program.entry, 3000);
+                ns += ns_since(began);
+            }
+        }
+        static const char* const kModes[] = {"compiled", "compiled, fast", "interpreted"};
+        std::printf("  VU %-16s %7.1f ns a pair (%llu pairs)\n", kModes[mode], pairs ? ns / double(pairs) : 0.0,
+                    (unsigned long long)pairs);
+    }
+
+    // Main memory: a copy of the size of the PS2's RAM.
+    {
+        std::vector<u8> from(32u << 20, 1), to(32u << 20);
+        const auto began = Clock::now();
+        for (int i = 0; i < 4; ++i) std::memcpy(to.data(), from.data(), from.size());
+        std::printf("  memcpy             %7.0f MB/s\n", 4.0 * 32.0 / (ns_since(began) / 1e9));
+    }
+
+    // The generated code's arithmetic: every EE register a u64, most of it
+    // word arithmetic sign-extended - against the same in 32 bits.
+    {
+        volatile u64 seed64 = 0x12345678;
+        u64 a = seed64, b = seed64 * 3;
+        auto began = Clock::now();
+        for (int i = 0; i < 20000000; ++i) {
+            a = u64(s64(s32(u32(a + b))));
+            b = (b << 1) ^ (a >> 3);
+        }
+        const double ns64 = ns_since(began);
+        volatile u32 seed32 = 0x12345678;
+        u32 c = seed32, d = seed32 * 3;
+        began = Clock::now();
+        for (int i = 0; i < 20000000; ++i) {
+            c = c + d;
+            d = (d << 1) ^ (c >> 3);
+        }
+        const double ns32 = ns_since(began);
+        std::printf("  integer steps      %7.2f ns in 64 bits, %.2f in 32 (%llu %u)\n", ns64 / 20e6, ns32 / 20e6,
+                    (unsigned long long)(a ^ b), unsigned(c ^ d));
+    }
+
+    // The EE's FPU as the generated code calls it.
+    {
+        u32 x = 0x3F800001u, acc = 0;
+        const auto began = Clock::now();
+        for (int i = 0; i < 2000000; ++i) {
+            acc = generated::FloatAdd(acc, generated::FloatMul(x, 0x3F7FFFF0u));
+            x = generated::FloatAdd(x, 0x33800000u);
+        }
+        std::printf("  EE float add+mul  %7.1f ns (%08X)\n", ns_since(began) / 2e6, acc);
+    }
+
+    // Macro mode's COP2 (its rounding set and put back each time).
+    {
+        auto c = std::make_unique<lifted::Context>();
+        for (auto& v : c->vf) for (u32& lane : v) lane = 0x3F800000u;
+        const auto began = Clock::now();
+        for (int i = 0; i < 500000; ++i) lifted::Cop2(*c, 0x4A000000u | 15u << 21 | 2u << 16 | 1u << 11 | 3u << 6 | 0x28);
+        std::printf("  COP2 ADD           %7.1f ns\n", ns_since(began) / 5e5);
+    }
+
+    // Sleeping: a 200 us sleep (the EE's idle wait), how long it takes.
+    {
+        double total = 0, worst = 0;
+        for (int i = 0; i < 50; ++i) {
+            const auto began = Clock::now();
+            ps2plat::SleepUntil(began + std::chrono::microseconds(200));
+            const double us = ns_since(began) / 1000.0;
+            total += us;
+            worst = std::max(worst, us);
+        }
+        std::printf("  sleep 200 us       %7.0f us on average, %.0f at worst\n", total / 50, worst);
+    }
+}
+
+/*
+ * Every test, named, in order. Timed when PS2HOST_TEST_TIMES is set (the
+ * Vita's runner sets it), with the benchmarks after them when
+ * PS2HOST_TEST_BENCH is. `observe`, if given, hears of each as it ends.
+ */
+int RunHostTests(void (*observe)(const char* name, double ms, int failures)) {
+    struct Named {
+        const char* name;
+        void (*test)();
+    };
+    static const Named kTests[] = {
+        {"MirrorsReachTheSameRam", MirrorsReachTheSameRam},
+        {"LoadsExtendAsTheEeDoes", LoadsExtendAsTheEeDoes},
+        {"OutsideMemoryFaults", OutsideMemoryFaults},
+        {"ScratchpadAndHooks", ScratchpadAndHooks},
+        {"BiosIsReadOnly", BiosIsReadOnly},
+        {"Kseg1ReachesDeviceRegisters", Kseg1ReachesDeviceRegisters},
+        {"DiscFindsFilesByPath", DiscFindsFilesByPath},
+        {"WideWritesReachEveryWordsHook", WideWritesReachEveryWordsHook},
+        {"VifSkipsDataAndAppliesMaskPath3", VifSkipsDataAndAppliesMaskPath3},
+        {"DmaChainsAreWalked", DmaChainsAreWalked},
+        {"GsLayoutsArePermutations", GsLayoutsArePermutations},
+        {"GsDrawsASprite", GsDrawsASprite},
+        {"GsFogsTowardsFogcol", GsFogsTowardsFogcol},
+        {"GsLoadsACsm2Clut", GsLoadsACsm2Clut},
+        {"Path3GoesOneGroupPerWindow", Path3GoesOneGroupPerWindow},
+        {"GsKeepsAFlatDepthExact", GsKeepsAFlatDepthExact},
+        {"GsFillsTopLeft", GsFillsTopLeft},
+        {"GsTakesImagesInBlocks", GsTakesImagesInBlocks},
+        {"GsTakesRegisterPacketsInBlocks", GsTakesRegisterPacketsInBlocks},
+        {"TexturePackNamesAsPcsx2", TexturePackNamesAsPcsx2},
 #if PS2HOST_VULKAN
-    GpuMemorySwizzlesAsTheGs();
-    GpuScaledColourTransfersAsTheGs();
-    GpuDecodesTexturesAsTheGs();
+        {"GpuMemorySwizzlesAsTheGs", GpuMemorySwizzlesAsTheGs},
+        {"GpuScaledColourTransfersAsTheGs", GpuScaledColourTransfersAsTheGs},
+        {"GpuDecodesTexturesAsTheGs", GpuDecodesTexturesAsTheGs},
 #endif
-    VifRunsMicroprogramsOnAVu();
-    MemoryCardKeepsSaves();
-    VuLanesAreTheModel();
-    VuCompiledIsTheInterpreter();
-    VuFastIsTheExactButFlags();
-    VuTimingIsVisible();
-    VuFlagsOfAResultIntoVf0();
-    VuMaxKeepsADenormal();
-    MmiLanesAreScalar();
-    IpuDecodesAndRetriesCleanly();
-    IopInstructionsMatchTheR5900();
-    SpuDecodesAdpcmAndPlaysAVoice();
+        {"VifRunsMicroprogramsOnAVu", VifRunsMicroprogramsOnAVu},
+        {"MemoryCardKeepsSaves", MemoryCardKeepsSaves},
+        {"VuLanesAreTheModel", VuLanesAreTheModel},
+        {"VuCompiledIsTheInterpreter", VuCompiledIsTheInterpreter},
+        {"ArithmeticIsThePcs", ArithmeticIsThePcs},
+        {"FibersSwitchAndUnwind", FibersSwitchAndUnwind},
+        {"VuFastIsTheExactButFlags", VuFastIsTheExactButFlags},
+        {"VuTimingIsVisible", VuTimingIsVisible},
+        {"VuFlagsOfAResultIntoVf0", VuFlagsOfAResultIntoVf0},
+        {"VuMaxKeepsADenormal", VuMaxKeepsADenormal},
+        {"MmiLanesAreScalar", MmiLanesAreScalar},
+        {"IpuDecodesAndRetriesCleanly", IpuDecodesAndRetriesCleanly},
+        {"IopInstructionsMatchTheR5900", IopInstructionsMatchTheR5900},
+        {"SpuDecodesAdpcmAndPlaysAVoice", SpuDecodesAdpcmAndPlaysAVoice},
+    };
+    const bool times = std::getenv("PS2HOST_TEST_TIMES") != nullptr;
+    for (const Named& t : kTests) {
+        const auto began = std::chrono::steady_clock::now();
+        t.test();
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count();
+        if (times) std::printf("  %-36s %9.1f ms\n", t.name, ms);
+        if (observe) observe(t.name, ms, g_failures);
+    }
+    if (std::getenv("PS2HOST_TEST_BENCH")) Benchmarks();
     std::printf(g_failures ? "host tests: %d failed\n" : "host tests: all passed\n", g_failures);
     return g_failures ? EXIT_FAILURE : EXIT_SUCCESS;
 }
+
+#ifndef PS2HOST_TESTS_NO_MAIN
+int main() { return RunHostTests(nullptr); }
+#endif

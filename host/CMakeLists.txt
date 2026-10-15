@@ -68,6 +68,14 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${PS2_ENGINE_DIR}
 target_include_directories(ps2host PUBLIC ${CMAKE_CURRENT_LIST_DIR}/include)
 target_link_libraries(ps2host PUBLIC ps2rt)
 
+# The platform layer (engine/platform): what differs from one system to another.
+if(NOT TARGET ps2plat)
+    add_subdirectory(${PS2_ENGINE_DIR}/platform ${CMAKE_BINARY_DIR}/ps2plat)
+endif()
+target_link_libraries(ps2host PUBLIC ps2plat)
+# ps2rt's headers are inline in the generated code; ps2plat's CpuRelax too.
+target_link_libraries(ps2rt PUBLIC ps2plat)
+
 # Texture packs (texture_pack.cpp): single headers, pinned by hash - xxHash
 # (BSD-2-Clause; PCSX2's names are XXH3 hashes), bcdec (MIT or Unlicense; DDS
 # BC1-BC7) and stb_image (MIT or public domain; PNG).
@@ -87,8 +95,15 @@ endforeach()
 target_include_directories(ps2host PRIVATE ${third_party_dir})
 target_sources(ps2host PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src/texture_pack.cpp)
 
-# The window through SDL3 and Vulkan (engine/gpu), with GDI as the fallback.
-option(PS2HOST_VULKAN "Present the picture through SDL3 and Vulkan" ON)
+# The window through SDL3 and Vulkan (engine/gpu), with GDI as the fallback:
+# Windows. (Elsewhere for now: no window - Linux runs headless for the tests;
+# the Vita's display is its own, GXM.)
+if(WIN32)
+    set(ps2host_vulkan_default ON)
+else()
+    set(ps2host_vulkan_default OFF)
+endif()
+option(PS2HOST_VULKAN "Present the picture through SDL3 and Vulkan" ${ps2host_vulkan_default})
 if(PS2HOST_VULKAN)
     add_subdirectory(${PS2_ENGINE_DIR}/gpu ${CMAKE_BINARY_DIR}/ps2gpu)
     target_link_libraries(ps2host PUBLIC ps2gpu)
@@ -104,6 +119,18 @@ if(MSVC)
     target_compile_options(ps2host PRIVATE /Z7)     # symbols for --sample, as the ports'
     target_compile_options(ps2rt PRIVATE /Z7)
     target_link_libraries(ps2host PRIVATE dbghelp winmm)  # ...which resolves them; 1 ms sleeps
+else()
+    # GCC and Clang (Linux, the Vita). The translated code was verified as
+    # MSVC compiles it, which neither assumes strict aliasing nor exploits a
+    # signed overflow: the same here. No fused or contracted float
+    # arithmetic: the EE's and the VUs' results are rounded step by step.
+    target_compile_options(ps2rt PUBLIC -fno-strict-aliasing -fwrapv -ffp-contract=off)
+endif()
+if(PS2HOST_ARM_FLAGS)
+    # ARMv7-A with NEON (the Vita's Cortex-A9; ARM Linux for the checks under
+    # qemu): VU lanes in NEON for their integer half, VFP for the floats
+    # (vu_math.h), FPSCR's rounding as the VUs round (vu.cpp, vu0.cpp).
+    target_compile_options(ps2rt PUBLIC ${PS2HOST_ARM_FLAGS})
 endif()
 
 # The host's own tests, which need no game.
@@ -124,6 +151,15 @@ if(PS2HOST_VULKAN)
 endif()
 # The IOP interpreter's internals, for its instruction tests.
 target_include_directories(ps2host_tests PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src)
+# On the Vita the tests are an application of their own (ps2host_tests.vpk):
+# results on the screen and in ux0:data/ps2host_tests/results.txt.
+include(${PS2_ENGINE_DIR}/cmake/vita.cmake)
+if(VITA)
+    target_sources(ps2host_tests PRIVATE ${CMAKE_CURRENT_LIST_DIR}/tests/vita_main.cpp)
+    target_compile_definitions(ps2host_tests PRIVATE PS2HOST_TESTS_NO_MAIN=1)
+    ps2_vita_package(ps2host_tests TITLE "PS2 port engine tests" TITLE_ID PTEN00001 VERSION 01.00
+                     SCE_SYS ${PS2_ENGINE_DIR}/platform/vita/tests_sce_sys)
+endif()
 
 # ps2_add_port(<target>
 #     GENERATED <dir with dispatch.cpp from engine/tools/port.py>
@@ -137,8 +173,16 @@ target_include_directories(ps2host_tests PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src)
 # port's own, port/icon.ico - or build/port/icon.ico where a player made one
 # for their own build (from their disc: a game's port/tools/make_icon.py). The
 # game's project needs the RC language for it.
+#
+# On the Vita (VitaSDK's toolchain file) the port is also packaged as
+# <target>.vpk: VITA_TITLE "<the name under the bubble>", VITA_TITLE_ID
+# <ABCD12345>, VITA_SCE_SYS <the LiveArea's files>, VITA_HEAP_MB <newlib's
+# heap>, and VITA_EXTENDED_MEMORY for the 365 MB budget (param.sfo's
+# ATTRIBUTE2=12) instead of 256.
 function(ps2_add_port target)
-    cmake_parse_arguments(PORT "" "GENERATED;TRANSLATED;GAME" "SOURCES" ${ARGN})
+    cmake_parse_arguments(PORT "VITA_EXTENDED_MEMORY"
+                          "GENERATED;TRANSLATED;GAME;VITA_TITLE;VITA_TITLE_ID;VITA_SCE_SYS;VITA_HEAP_MB"
+                          "SOURCES" ${ARGN})
     file(GLOB translated ${PORT_TRANSLATED}/*.cpp)
     # dispatch.cpp, and discovered.cpp: code found copied at run time, translated.
     file(GLOB generated ${PORT_GENERATED}/*.cpp)
@@ -148,6 +192,9 @@ function(ps2_add_port target)
         ${translated}
         ${PORT_SOURCES})
     target_link_libraries(${target} PRIVATE ps2host)
+    # The application's name: its data directory on the Vita (ux0:data/<it>),
+    # its log's name.
+    target_compile_definitions(${target} PRIVATE PS2HOST_APP_NAME="${target}")
     if(PORT_GAME)
         get_filename_component(game_dir ${PORT_GAME} ABSOLUTE)
         set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${game_dir}/game.json)
@@ -166,7 +213,9 @@ function(ps2_add_port target)
                                                      PS2HOST_GAME_TITLE="${game_title}"
                                                      PS2HOST_GAME_VERSION="${game_version}"
                                                      PS2HOST_GAME_EXECUTABLE="${game_executable}")
-        target_link_libraries(${target} PRIVATE comdlg32)
+        if(WIN32)
+            target_link_libraries(${target} PRIVATE comdlg32)
+        endif()
         set(icon ${game_dir}/build/port/icon.ico)
         if(NOT EXISTS ${icon})
             set(icon ${game_dir}/port/icon.ico)
@@ -219,5 +268,36 @@ END
         # The symbols' file named by its name alone in the executable, not the
         # path it was built at (a release carries no one's folders).
         target_link_options(${target} PRIVATE /DEBUG /OPT:REF /OPT:ICF "/PDBALTPATH:%_PDB%")
+    endif()
+    if(VITA)
+        # A section a function: the linker puts its long-branch veneers between
+        # input sections, and a translated game's code is far past a Thumb
+        # call's 16 MB reach (engine/platform/vita/probe found a single section
+        # cannot be carried). -O2 rather than the toolchain's -O3 for the
+        # translated code: GCC takes many times as long at -O3 on generated
+        # sources (VITA_PLAN.md, "Code size, compile time, link").
+        target_compile_options(${target} PRIVATE -ffunction-sections)
+        set_source_files_properties(${translated} ${generated} TARGET_DIRECTORY ${target}
+                                    PROPERTIES COMPILE_OPTIONS "-O2")
+        if(PORT_VITA_HEAP_MB)
+            target_compile_definitions(${target} PRIVATE PS2HOST_VITA_HEAP_MB=${PORT_VITA_HEAP_MB})
+        endif()
+        if(NOT PORT_VITA_TITLE)
+            set(PORT_VITA_TITLE "${target}")
+            if(game_title)
+                set(PORT_VITA_TITLE "${game_title}")
+            endif()
+        endif()
+        if(NOT PORT_VITA_TITLE_ID)
+            message(FATAL_ERROR "ps2_add_port(${target}): VITA_TITLE_ID is needed on the Vita")
+        endif()
+        set(vita_args TITLE "${PORT_VITA_TITLE}" TITLE_ID ${PORT_VITA_TITLE_ID} VERSION 01.00)
+        if(PORT_VITA_SCE_SYS)
+            list(APPEND vita_args SCE_SYS ${PORT_VITA_SCE_SYS})
+        endif()
+        if(PORT_VITA_EXTENDED_MEMORY)
+            list(APPEND vita_args EXTENDED_MEMORY)
+        endif()
+        ps2_vita_package(${target} ${vita_args})
     endif()
 endfunction()

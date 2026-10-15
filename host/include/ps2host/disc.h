@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 
+#include "ps2plat/platform.h"
 #include "ps2rt/types.h"
 
 namespace ps2host {
@@ -36,7 +37,7 @@ public:
     /* Use an image held in memory instead (the host's own tests): 2048-byte
        sectors, or raw 2352-byte ones when it starts with a sector's sync. */
     void Use(std::vector<u8> image);
-    bool IsOpen() const { return file_ != nullptr || !memory_.empty(); }
+    bool IsOpen() const { return file_.IsOpen() || !memory_.empty(); }
     /* A CD rather than a DVD: a raw image, or an .iso small enough for a CD. */
     bool IsCd() const;
 
@@ -61,7 +62,7 @@ private:
     void DetectFormat();
     bool ReadBytes(u64 offset, u64 length, u8* out);
 
-    std::FILE* file_ = nullptr;
+    ps2plat::ReadOnlyFile file_;
     std::vector<u8> memory_;
     u64 size_ = 0;
     u32 data_offset_ = 0;       // within a raw sector: 16 (Mode 1), 24 (Mode 2); 0 for an .iso

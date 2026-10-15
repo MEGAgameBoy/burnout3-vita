@@ -5,12 +5,11 @@
  * With the GPU display built in (PS2HOST_VULKAN, engine/gpu) the window is an
  * SDL3 window presenting through Vulkan; without it, or when no Vulkan device
  * can be had, a plain Win32 window drawn with GDI. Both are pumped on the host's
- * thread at each frame (FrameDone).
+ * thread at each frame (FrameDone). Elsewhere without a display there is no
+ * window: a run is headless (--frames writes its pictures).
  */
 
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
+#include "ps2plat/keys.h"       // windows.h on Windows; the virtual keys elsewhere
 
 #include <chrono>
 #include <cstdio>
@@ -35,7 +34,11 @@ namespace ps2host {
 
 namespace {
 
+#ifdef _WIN32
 HWND g_window = nullptr;
+#else
+void* g_window = nullptr;           // no GDI: never opened
+#endif
 bool g_closed = false;
 
 #ifdef PS2HOST_VULKAN
@@ -72,6 +75,7 @@ int Scancode(int key) {
 }
 #endif
 
+#ifdef _WIN32
 LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM w, LPARAM l) {
     switch (message) {
         case WM_CLOSE:
@@ -126,6 +130,16 @@ void PresentGdi() {
                   DIB_RGB_COLORS, SRCCOPY);
     ReleaseDC(g_window, dc);
 }
+
+bool GdiFocused() { return g_window && GetForegroundWindow() == g_window; }
+bool GdiKeyDown(int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; }
+#else
+// No GDI: the window is a display's (ps2gpu), or there is none.
+bool OpenGdiWindow(const wchar_t*, int, int) { return false; }
+void PresentGdi() {}
+bool GdiFocused() { return false; }
+bool GdiKeyDown(int) { return false; }
+#endif
 
 #ifdef PS2HOST_VULKAN
 /* The "antialiasing" setting as the display takes it: supersampling's
@@ -202,7 +216,7 @@ bool WindowFocused() {
 #ifdef PS2HOST_VULKAN
     if (g_display) return g_display->Focused();
 #endif
-    return g_window && GetForegroundWindow() == g_window;
+    return GdiFocused();
 }
 
 bool WindowClosed() { return g_closed; }
@@ -214,7 +228,7 @@ bool HostKeyDown(int key) {
 #ifdef PS2HOST_VULKAN
     if (g_display) return g_display->KeyDown(Scancode(key));
 #endif
-    return (GetAsyncKeyState(key) & 0x8000) != 0;
+    return GdiKeyDown(key);
 }
 
 void HostTriggerEffects(const HostTriggerEffect& left, const HostTriggerEffect& right) {
@@ -395,7 +409,7 @@ std::vector<std::string> g_overlay_lines;      // SetWindowOverlay's: the panel'
 
 // Draws the lines as the window's overlay (none when empty).
 void DrawOverlay(const std::vector<std::string>& lines) {
-#ifdef PS2HOST_VULKAN
+#if defined(PS2HOST_VULKAN) && defined(_WIN32)
     if (!g_display) return;
     if (lines.empty()) {
         g_display->SetOverlay({}, 0, 0);

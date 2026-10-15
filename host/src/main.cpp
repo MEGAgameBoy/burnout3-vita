@@ -1,25 +1,21 @@
 /*
  * Every game port's entry point. The game supplies its translated functions (the
  * table engine/tools/port.py generates) and its overrides; the rest is shared.
+ * What differs from one system to another - the disc picker, the console, the
+ * log's place, message boxes - is the platform layer's (ps2plat).
  */
 
 #include <cstdio>
-#include <fcntl.h>
+#include <cstdlib>
 #include <filesystem>
-#include <io.h>
-#include <sys/stat.h>
 #include <string>
 #include <vector>
-
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
-#include <commdlg.h>
 
 #include "ps2host/disc.h"
 #include "ps2host/host.h"
 #include "ps2host/run.h"
 #include "ps2host/settings.h"
+#include "ps2plat/platform.h"
 
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
 #include <intrin.h>
@@ -31,7 +27,34 @@ extern const std::size_t kGuestFunctionCount;
 /* The game's host implementations of guest functions (its port's overrides.cpp). */
 void RegisterGameOverrides();
 
+#ifdef __vita__
+extern "C" {
+/* The heap newlib takes as the program starts (one memory block), and the
+   main thread's stack - the host's, under the EE's fibers (whose stacks are
+   on the heap). PS2HOST_VITA_HEAP_MB: the port's CMake, from the memory the
+   application is given (param.sfo's ATTRIBUTE2). */
+#ifndef PS2HOST_VITA_HEAP_MB
+#define PS2HOST_VITA_HEAP_MB 192
+#endif
+unsigned int _newlib_heap_size_user = PS2HOST_VITA_HEAP_MB * 1024u * 1024u;
+const unsigned int sceUserMainThreadStackSize = 2u * 1024u * 1024u;
+}
+#endif
+
 namespace {
+
+#if defined(PS2HOST_APP_NAME) && defined(__GNUC__)
+/* The application's name and the environment (the Vita's env.txt: it has
+   no environment of its own) before any other static object is made: some
+   read their PS2HOST_* variable as they are. */
+struct EarlyStart {
+    EarlyStart() {
+        ps2plat::SetAppName(PS2HOST_APP_NAME);
+        ps2plat::LoadEnvironment();
+    }
+};
+EarlyStart g_early_start __attribute__((init_priority(101)));
+#endif
 
 /* The port is built for AVX2 (engine/host/CMakeLists.txt; the VU's lanes and
    the rest take its three-operand forms): a processor without it is told so
@@ -64,89 +87,57 @@ bool IsGameDisc(const std::string& path) {
     const std::size_t semicolon = boot.find(';');
     if (semicolon != std::string::npos) boot.resize(semicolon);
     while (!boot.empty() && (boot[0] == '\\' || boot[0] == '/')) boot.erase(0, 1);
-    return _stricmp(boot.c_str(), PS2HOST_GAME_EXECUTABLE) == 0;
-}
-
-/* The player's disc image, from a file dialog; "" if they cancel. */
-std::string PickDisc() {
-    char file[MAX_PATH] = {};
-    OPENFILENAMEA dialog = {};
-    dialog.lStructSize = sizeof dialog;
-    dialog.lpstrFilter = "Disc images (*.iso; *.cue; *.bin)\0*.iso;*.cue;*.bin\0All files (*.*)\0*.*\0";
-    dialog.lpstrFile = file;
-    dialog.nMaxFile = MAX_PATH;
-    dialog.lpstrTitle = "Choose your " PS2HOST_GAME_NAME " disc image";
-    dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
-    return GetOpenFileNameA(&dialog) ? std::string(file) : std::string();
+    return ps2plat::CompareNoCase(boot.c_str(), PS2HOST_GAME_EXECUTABLE) == 0;
 }
 #endif
 
-/* Started without arguments - from Explorer, a shortcut - the port plays its
-   game from the player's own disc image: the one chosen before (kept in the
-   PC settings, beside the executable), or asked for and checked to be the
-   game's disc; the memory card a directory beside it too. In a window, with
-   sound, on the GPU, with no time limit (the default is for test runs).
-   An empty list: the player gave none. */
+/* Started without arguments - from Explorer, a shortcut, the Vita's home
+   screen - the port plays its game from the player's own disc image: the one
+   chosen before (kept in the settings, in the data directory), or asked for
+   and checked to be the game's disc; the memory card a directory beside it
+   too. In a window, with sound, on the GPU, with no time limit (the default
+   is for test runs). An empty list: the player gave none. */
 std::vector<std::string> PlayArguments(const char* self) {
 #ifdef PS2HOST_GAME_EXECUTABLE
-    wchar_t exe[MAX_PATH] = {};
-    GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    const std::filesystem::path here = std::filesystem::path(exe).parent_path();
-    ps2host::LoadSettings((here / "pc_settings.ini").string());     // where --memcard puts them
+    const std::string here = ps2plat::DataDirectory();
+    ps2host::LoadSettings(ps2plat::JoinPath(here, "pc_settings.ini"));     // where --memcard puts them
     std::string disc = ps2host::Setting("disc");
     while (!IsGameDisc(disc)) {
-        if (!disc.empty() && GetFileAttributesA(disc.c_str()) != INVALID_FILE_ATTRIBUTES)
-            MessageBoxA(nullptr, ("This is not an image of the " PS2HOST_GAME_NAME " disc "
-                                  "(" PS2HOST_GAME_EXECUTABLE "):\n\n" + disc).c_str(),
-                        PS2HOST_GAME_NAME, MB_OK | MB_ICONWARNING);
-        disc = PickDisc();
+        if (!disc.empty() && ps2plat::FileExists(disc))
+            ps2plat::ShowMessage(PS2HOST_GAME_NAME,
+                                 "This is not an image of the " PS2HOST_GAME_NAME " disc "
+                                 "(" PS2HOST_GAME_EXECUTABLE "):\n\n" + disc,
+                                 false);
+        disc = ps2plat::PickDiscImage(PS2HOST_GAME_NAME, &IsGameDisc);
         if (disc.empty()) return {};
     }
     if (disc != ps2host::Setting("disc")) ps2host::SetSetting("disc", disc);
-    // No terminal to read: what the run says goes to a log beside it. Opened
-    // once, shared (fopen's would lock the file to one stream), and given to
-    // both: their lines in the order they were written.
-    g_log = std::filesystem::path(exe).stem().string() + ".log";
-    const std::string log = (here / g_log).string();
-    std::FILE* stream = nullptr;
-    freopen_s(&stream, "NUL", "w", stdout);    // streams with descriptors, in a windowed program
-    freopen_s(&stream, "NUL", "w", stderr);
-    const int file = _open(log.c_str(), _O_WRONLY | _O_CREAT | _O_TRUNC | _O_TEXT, _S_IREAD | _S_IWRITE);
-    if (file >= 0) {
-        _dup2(file, _fileno(stdout));
-        _dup2(file, _fileno(stderr));
-        _close(file);
-    }
-    std::setvbuf(stdout, nullptr, _IONBF, 0);  // a run ended by force loses nothing
-    std::setvbuf(stderr, nullptr, _IONBF, 0);
+    // No terminal to read: what the run says goes to a log beside it.
+    g_log = std::filesystem::path(self ? self : "port").stem().string() + ".log";
+#ifdef PS2HOST_APP_NAME
+    g_log = std::string(PS2HOST_APP_NAME) + ".log";
+#endif
+    ps2plat::RedirectOutput(ps2plat::JoinPath(here, g_log));
     std::fprintf(stderr, "[port] disc %s\n", disc.c_str());
-    return {self, "--disc", disc, "--memcard", (here / "memcard").string(), "--window", "--gpu",
+    return {self ? self : "port", "--disc", disc, "--memcard", ps2plat::JoinPath(here, "memcard"), "--window", "--gpu",
             "--audio", "--timeout", "315360000"};     // ten years
 #else
-    return {self};
+    return {self ? self : "port"};
 #endif
 }
 
 }  // namespace
 
-/* A port built as a windowed program has no console of its own. Started from
-   a terminal its output goes to that one; redirected (a file, a pipe: the
-   tools' runs), where it was sent. */
-void AttachTerminal() {
-    const HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (out != nullptr && out != INVALID_HANDLE_VALUE) return;
-    if (!AttachConsole(ATTACH_PARENT_PROCESS)) return;
-    std::FILE* stream = nullptr;
-    freopen_s(&stream, "CONOUT$", "w", stdout);
-    freopen_s(&stream, "CONOUT$", "w", stderr);
-}
-
 int main(int argc, char** argv) {
-    AttachTerminal();
+#ifdef PS2HOST_APP_NAME
+    ps2plat::SetAppName(PS2HOST_APP_NAME);
+#endif
+    ps2plat::StartUp();
+    ps2plat::AttachTerminal();
     std::vector<std::string> play;
     std::vector<char*> play_argv;
-    if (argc == 1) {
-        play = PlayArguments(argv[0]);
+    if (argc <= 1) {
+        play = PlayArguments(argc > 0 ? argv[0] : nullptr);
         if (play.empty()) return 0;
         for (std::string& arg : play) play_argv.push_back(arg.data());
         play_argv.push_back(nullptr);
@@ -170,8 +161,7 @@ int main(int argc, char** argv) {
         std::fflush(nullptr);
         const std::string text = "The game stopped because of an error. What happened is in " +
                                  g_log + ", beside the game.";
-        MessageBoxA(nullptr, text.c_str(), ps2host::GameTitle().empty() ? "PS2 port" : ps2host::GameTitle().c_str(),
-                    MB_OK | MB_ICONERROR);
+        ps2plat::ShowMessage(ps2host::GameTitle().empty() ? "PS2 port" : ps2host::GameTitle(), text, true);
     }
     // What must be finished is (the report written, the settings and the
     // memory card saved as they changed, the WAV's header here); the rest -
@@ -182,6 +172,5 @@ int main(int argc, char** argv) {
     ps2host::CloseAudio();
     ps2host::ReleaseController();
     std::fflush(nullptr);
-    TerminateProcess(GetCurrentProcess(), UINT(code));
-    return code;
+    ps2plat::QuickExit(code);
 }

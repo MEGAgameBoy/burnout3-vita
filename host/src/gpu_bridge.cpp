@@ -1858,6 +1858,10 @@ bool StartGpuRenderer(std::string* error, GpuMode, bool) {
 void GpuSetScale(u32) {}
 void GpuShadowFrame(gs::u64, const std::string&) {}
 std::string GpuShadowSummary() { return ""; }
+u64 GpuBusyMicroseconds() { return 0; }
+bool GpuPrimary() { return false; }
+void GpuCaptureBegin(u64, const std::string&) {}
+std::string GpuCaptureScreen(const std::string&) { return ""; }
 
 #endif
 

@@ -11,7 +11,13 @@
  *
  * --audio-wav records the same output to a WAV file instead of (or as well as)
  * playing it: how sound is checked without anyone listening.
+ *
+ * Elsewhere (the second half of this file) the same buffers go to the
+ * platform's device (ps2plat: the Vita's sceAudioOut) from a feeder thread of
+ * their own, a grain at a time, as the device asks for them.
  */
+
+#ifdef _WIN32
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -221,3 +227,156 @@ void AudioFrames(const short* frames, unsigned count) {
 }
 
 }  // namespace ps2host
+
+#else  // !_WIN32
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "ps2host/run.h"
+#include "ps2plat/platform.h"
+
+namespace ps2host {
+
+namespace {
+
+constexpr int kBuffers = 8;
+constexpr unsigned kFrames = 1024;              // 21 ms at 48 kHz
+
+/* Buffers filled by the IOP's thread (AudioFrames) and played by the feeder,
+   in order; as on Windows, when every buffer waits to be played the newest
+   samples are dropped rather than the emulation waiting, and the device plays
+   silence when none waits. */
+struct Device {
+    bool open = false;
+    bool mute = false;
+    std::vector<short> data[kBuffers];
+    int filling = 0, playing = 0;
+    unsigned filled = 0;
+    int queued = 0;                             // full buffers not yet played
+    unsigned long long dropped = 0;
+    unsigned ran_out = 0;
+    std::mutex lock;
+    std::condition_variable ready;
+    std::atomic<bool> stop{false};
+    std::thread feeder;
+    std::FILE* wav = nullptr;
+    unsigned long long wav_frames = 0;
+
+    ~Device() { Close(); }
+    void Close() {
+        if (open) {
+            stop = true;
+            ready.notify_all();
+            if (feeder.joinable()) feeder.join();
+            ps2plat::CloseAudioOut();
+            open = false;
+        }
+        if (!wav) return;
+        WriteHeader(unsigned(wav_frames * 4));
+        std::fclose(wav);
+        wav = nullptr;
+    }
+    void WriteHeader(unsigned bytes) {
+        unsigned char h[44] = {'R', 'I', 'F', 'F', 0, 0, 0, 0, 'W', 'A', 'V', 'E', 'f', 'm', 't', ' ',
+                               16, 0, 0, 0, 1, 0, 2, 0, 0x80, 0xBB, 0, 0, 0, 0xEE, 2, 0,
+                               4, 0, 16, 0, 'd', 'a', 't', 'a', 0, 0, 0, 0};
+        const unsigned riff = 36 + bytes;
+        std::memcpy(h + 4, &riff, 4);
+        std::memcpy(h + 40, &bytes, 4);
+        std::fseek(wav, 0, SEEK_SET);
+        std::fwrite(h, 1, 44, wav);
+        std::fseek(wav, 0, SEEK_END);
+    }
+    void Feed() {
+        ps2plat::SetThreadRole(ps2plat::ThreadRole::kAudio);
+        const std::vector<short> silence(kFrames * 2, 0);
+        std::vector<short> grain(kFrames * 2);
+        while (!stop) {
+            bool have = false;
+            {
+                std::unique_lock<std::mutex> hold(lock);
+                if (queued > 0) {
+                    grain.swap(data[playing]);
+                    playing = (playing + 1) % kBuffers;
+                    --queued;
+                    have = true;
+                } else {
+                    ++ran_out;
+                }
+            }
+            ps2plat::AudioOutWrite(have ? grain.data() : silence.data());   // blocks: the device's pace
+        }
+    }
+};
+
+Device& D() {
+    static Device device;
+    return device;
+}
+
+}  // namespace
+
+void CloseAudio() { D().Close(); }
+
+bool OpenAudio() {
+    Device& d = D();
+    if (d.open) return true;
+    if (!ps2plat::OpenAudioOut(kFrames)) return false;
+    d.mute = std::getenv("PS2HOST_AUDIO_MUTE") != nullptr;
+    for (auto& buffer : d.data) buffer.assign(kFrames * 2, 0);
+    d.open = true;
+    d.stop = false;
+    d.feeder = std::thread([&d] { d.Feed(); });
+    std::fprintf(stderr, "[audio] playing\n");
+    return true;
+}
+
+bool OpenWavDump(const std::string& path) {
+    Device& d = D();
+    d.wav = std::fopen(path.c_str(), "wb");
+    if (!d.wav) return false;
+    d.WriteHeader(0);
+    return true;
+}
+
+void AudioFrames(const short* frames, unsigned count) {
+    Device& d = D();
+    if (d.wav) {
+        std::fwrite(frames, 4, count, d.wav);
+        d.wav_frames += count;
+    }
+    if (!d.open) return;
+    std::lock_guard<std::mutex> hold(d.lock);
+    while (count) {
+        if (d.queued == kBuffers) {             // every buffer waits to be played: drop
+            d.dropped += count;
+            return;
+        }
+        const unsigned take = std::min(count, kFrames - d.filled);
+        short* to = d.data[d.filling].data() + d.filled * 2;
+        if (d.mute) std::memset(to, 0, take * 4);
+        else std::memcpy(to, frames, take * 4);
+        d.filled += take;
+        frames += take * 2;
+        count -= take;
+        if (d.filled == kFrames) {
+            d.filling = (d.filling + 1) % kBuffers;
+            d.filled = 0;
+            ++d.queued;
+        }
+    }
+}
+
+}  // namespace ps2host
+
+#endif  // _WIN32

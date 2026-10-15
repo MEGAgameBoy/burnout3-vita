@@ -29,11 +29,8 @@
 #include <thread>
 #include <vector>
 
-#if defined(_MSC_VER)
-#include <intrin.h>
-#endif
-
 #include "ps2host/gs.h"
+#include "ps2plat/platform.h"
 #include "ps2host/timeline.h"
 #include "ps2host/profile.h"
 #include "ps2host/run.h"
@@ -98,11 +95,7 @@ struct Producing {
 
 u32 Header(u32 type, int path, u32 count) { return type << 28 | u32(path & 0xF) << 24 | (count & 0xFFFFFF); }
 
-void Pause() {
-#if defined(_MSC_VER)
-    _mm_pause();
-#endif
-}
+void Pause() { ps2plat::CpuRelax(); }
 
 struct Feed {
     std::vector<u32> ring = std::vector<u32>(kRing);
@@ -278,7 +271,7 @@ void StartGsThread() {
     g_feed = &TheFeed();
     g_feed->thread = std::thread([] {
         timeline::NameThread("GS");
-        FastThread();
+        ps2plat::SetThreadRole(ps2plat::ThreadRole::kGs);
         if (SampleGsThread()) StartSampler();
         g_feed->Run();
     });
