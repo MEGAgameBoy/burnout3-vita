@@ -6,11 +6,15 @@
  *      install it (ur0:data/, ur0:data/external/): its version, and how long
  *      a shader takes to compile at run time.
  *   2. A scene drawn into a target in CPU-visible memory and read back: a
- *      constant colour (the control: GXM, the shader patcher, the read-back).
- *   3. Fragment programs that read the pixel they replace - the GS's blend,
- *      FBMSK, DATE done in the shader - in each spelling the compiler might
- *      take; for each, whether it compiles, links, and leaves the expected
- *      bytes.
+ *      constant colour, from literals and from a uniform (the controls: GXM,
+ *      the shader patcher, the read-back), with a depth/stencil surface - the
+ *      first version's disabled one made every draw fail (0x805B001F).
+ *   3. How the compiler spells 8-bit vectors, and fragment programs that
+ *      read the pixel they replace - the GS's blend, FBMSK, DATE done in the
+ *      shader - in each spelling it might take (the first version found
+ *      FRAGCOLOR known but not on a plain varying, and __regformat not
+ *      before a function); for each, whether it compiles, links, and leaves
+ *      the expected bytes.
  *   4. Integer arithmetic in a fragment program (GS memory's swizzle).
  *
  * Results on the screen and in ux0:data/ps2plat_gxm_probe/result.txt.
@@ -237,7 +241,18 @@ bool Start(Gpu& g) {
         Say("sceGxmColorSurfaceInit: " + Hex(r) + "\n", vita::kRed);
         return false;
     }
-    sceGxmDepthStencilSurfaceInitDisabled(&g.depth);
+    // A depth and stencil surface, S8D24 and tiled as vita2d's: with a
+    // disabled one every draw failed (0x805B001F, the first probe's run).
+    const unsigned tiled_w = (kSide + SCE_GXM_TILE_SIZEX - 1) & ~(SCE_GXM_TILE_SIZEX - 1);
+    const unsigned samples = tiled_w * ((kSide + SCE_GXM_TILE_SIZEY - 1) & ~(SCE_GXM_TILE_SIZEY - 1));
+    void* depth = GpuAlloc(SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE, 4 * samples, SCE_GXM_MEMORY_ATTRIB_RW, &uid);
+    void* stencil = GpuAlloc(SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE, 4 * samples, SCE_GXM_MEMORY_ATTRIB_RW, &uid);
+    r = sceGxmDepthStencilSurfaceInit(&g.depth, SCE_GXM_DEPTH_STENCIL_FORMAT_S8D24, SCE_GXM_DEPTH_STENCIL_SURFACE_TILED,
+                                      tiled_w, depth, stencil);
+    if (r < 0) {
+        Say("sceGxmDepthStencilSurfaceInit: " + Hex(r) + "\n", vita::kRed);
+        return false;
+    }
     SceGxmShaderPatcherParams sp{};
     sp.hostAllocCallback = PatcherHostAlloc;
     sp.hostFreeCallback = PatcherHostFree;
@@ -307,28 +322,54 @@ SceGxmFragmentProgram* FragmentProgram(Gpu& g, const Program& p, const Program& 
     return nullptr;
 }
 
-/* One scene: the target filled with zeros by the CPU, then each fragment
-   program in turn over the whole target. */
-bool Draw(Gpu& g, SceGxmVertexProgram* vp, const std::vector<SceGxmFragmentProgram*>& programs) {
+/* A fragment program to draw with, and the program it came from (for its
+   default uniform buffer: uColour, when it has one, gets `colour`). */
+struct Pass {
+    SceGxmFragmentProgram* fp;
+    const SceGxmProgram* gxp;
+    float colour[4];
+};
+
+/* One scene: the target filled with zeros by the CPU, then each pass over
+   the whole target. */
+bool Draw(Gpu& g, SceGxmVertexProgram* vp, const SceGxmProgram* vertex_gxp, const std::vector<Pass>& passes) {
     std::memset(g.pixels, 0, kSide * kSide * 4);
     int r = sceGxmBeginScene(g.context, 0, g.target, nullptr, nullptr, nullptr, &g.surface, &g.depth);
     if (r < 0) {
         Say("  sceGxmBeginScene: " + Hex(r) + "\n", vita::kRed);
         return false;
     }
-    // Clip space onto the whole target (y down, as the surface's rows).
+    // Clip space onto the whole target (y down, as the surface's rows); no
+    // depth test or write.
     sceGxmSetViewportEnable(g.context, SCE_GXM_VIEWPORT_ENABLED);
     sceGxmSetViewport(g.context, kSide / 2.0f, kSide / 2.0f, kSide / 2.0f, -(kSide / 2.0f), 0.5f, 0.5f);
-    sceGxmSetVertexProgram(g.context, vp);
-    for (SceGxmFragmentProgram* fp : programs) {
-        sceGxmSetFragmentProgram(g.context, fp);
+    sceGxmSetFrontDepthFunc(g.context, SCE_GXM_DEPTH_FUNC_ALWAYS);
+    sceGxmSetFrontDepthWriteEnable(g.context, SCE_GXM_DEPTH_WRITE_DISABLED);
+    bool ok = true;
+    for (const Pass& pass : passes) {
+        sceGxmSetVertexProgram(g.context, vp);
+        sceGxmSetFragmentProgram(g.context, pass.fp);
+        if (sceGxmProgramGetDefaultUniformBufferSize(vertex_gxp)) {
+            void* buffer = nullptr;
+            sceGxmReserveVertexDefaultUniformBuffer(g.context, &buffer);
+        }
+        if (sceGxmProgramGetDefaultUniformBufferSize(pass.gxp)) {
+            void* buffer = nullptr;
+            r = sceGxmReserveFragmentDefaultUniformBuffer(g.context, &buffer);
+            if (r < 0) Say("  sceGxmReserveFragmentDefaultUniformBuffer: " + Hex(r) + "\n", vita::kRed);
+            if (const SceGxmProgramParameter* colour = sceGxmProgramFindParameterByName(pass.gxp, "uColour"))
+                sceGxmSetUniformDataF(buffer, colour, 0, 4, pass.colour);
+        }
         sceGxmSetVertexStream(g.context, 0, g.vertices);
         r = sceGxmDraw(g.context, SCE_GXM_PRIMITIVE_TRIANGLES, SCE_GXM_INDEX_FORMAT_U16, g.indices, 3);
-        if (r < 0) Say("  sceGxmDraw: " + Hex(r) + "\n", vita::kRed);
+        if (r < 0) {
+            Say("  sceGxmDraw: " + Hex(r) + "\n", vita::kRed);
+            ok = false;
+        }
     }
     sceGxmEndScene(g.context, nullptr, nullptr);
     sceGxmFinish(g.context);
-    return true;
+    return ok;
 }
 
 std::string Pixel(const Gpu& g, unsigned x, unsigned y, std::uint8_t out[4]) {
@@ -352,10 +393,27 @@ const char kVertex[] =
     "    vPosition = float4(aPosition, 0.5f, 1.0f);\n"
     "}\n";
 
-// The control: (0.8, 0.4, 0.2, 1.0), as bytes (204, 102, 51, 255).
+// The controls: (0.8, 0.4, 0.2, 1.0), as bytes (204, 102, 51, 255) - from
+// literals, and from a uniform (vita2d's clear).
 const char kConstant[] = "float4 main() : COLOR { return float4(0.8f, 0.4f, 0.2f, 1.0f); }\n";
+const char kUniformConstant[] = "float4 main(uniform float4 uColour) : COLOR { return uColour; }\n";
 
-// The destination read: r halved, g + 0.25, b inverted, a one - from
+// How the compiler spells an 8-bit vector (compiled only).
+struct Spelling {
+    const char* name;
+    const char* source;
+};
+const Spelling kSpellings[] = {
+    {"uniform uchar4", "float4 main(uniform uchar4 u) : COLOR { return float4(u) / 255.0f; }\n"},
+    {"uniform unsigned char4", "float4 main(uniform unsigned char4 u) : COLOR { return float4(u) / 255.0f; }\n"},
+    {"uniform __regformat float4", "float4 main(uniform __regformat float4 u) : COLOR { return u; }\n"},
+    {"out __regformat uchar4 : COLOR",
+     "void main(out __regformat uchar4 col : COLOR) { col = uchar4(1, 2, 3, 4); }\n"},
+    {"out __regformat unsigned char4 : COLOR",
+     "void main(out __regformat unsigned char4 col : COLOR) { col = unsigned char4(1, 2, 3, 4); }\n"},
+};
+
+// The destination read: r halved, g + 0.25 (64), b inverted, a one - from
 // (204, 102, 51, 255) that is (102, 166, 204, 255).
 struct Variant {
     const char* name;
@@ -363,31 +421,48 @@ struct Variant {
     int tolerance;
 };
 const Variant kVariants[] = {
-    {"float4 : FRAGCOLOR",
-     "float4 main(float4 dst : FRAGCOLOR) : COLOR {\n"
+    {"in __regformat uchar4 : FRAGCOLOR, out uchar4",
+     "void main(__regformat uchar4 dst : FRAGCOLOR, out __regformat uchar4 col : COLOR) {\n"
+     "    col = uchar4(dst.r >> 1, dst.g + 64, 255 - dst.b, 255);\n"
+     "}\n", 0},
+    {"in __regformat unsigned char4 : FRAGCOLOR, out",
+     "void main(__regformat unsigned char4 dst : FRAGCOLOR, out __regformat unsigned char4 col : COLOR) {\n"
+     "    col = unsigned char4(dst.r >> 1, dst.g + 64, 255 - dst.b, 255);\n"
+     "}\n", 0},
+    {"in __regformat uchar4 : FRAGCOLOR, float4 out",
+     "float4 main(__regformat uchar4 dst : FRAGCOLOR) : COLOR {\n"
+     "    float4 d = float4(dst) / 255.0f;\n"
+     "    return float4(d.r * 0.5f, d.g + 0.25f, 1.0f - d.b, 1.0f);\n"
+     "}\n", 2},
+    {"in __regformat unsigned char4 : FRAGCOLOR, float4",
+     "float4 main(__regformat unsigned char4 dst : FRAGCOLOR) : COLOR {\n"
+     "    float4 d = float4(dst) / 255.0f;\n"
+     "    return float4(d.r * 0.5f, d.g + 0.25f, 1.0f - d.b, 1.0f);\n"
+     "}\n", 2},
+    {"uniform __regformat uchar4 : FRAGCOLOR",
+     "void main(uniform __regformat uchar4 dst : FRAGCOLOR, out __regformat uchar4 col : COLOR) {\n"
+     "    col = uchar4(dst.r >> 1, dst.g + 64, 255 - dst.b, 255);\n"
+     "}\n", 0},
+    {"uniform float4 : FRAGCOLOR",
+     "float4 main(uniform float4 dst : FRAGCOLOR) : COLOR {\n"
      "    return float4(dst.r * 0.5f, dst.g + 0.25f, 1.0f - dst.b, 1.0f);\n"
-     "}\n",
-     2},
-    {"half4 : FRAGCOLOR",
-     "half4 main(half4 dst : FRAGCOLOR) : COLOR {\n"
+     "}\n", 2},
+    {"in __regformat float4 : FRAGCOLOR",
+     "float4 main(__regformat float4 dst : FRAGCOLOR) : COLOR {\n"
+     "    return float4(dst.r * 0.5f, dst.g + 0.25f, 1.0f - dst.b, 1.0f);\n"
+     "}\n", 2},
+    {"in __regformat half4 : FRAGCOLOR",
+     "half4 main(__regformat half4 dst : FRAGCOLOR) : COLOR {\n"
      "    return half4(dst.r * 0.5h, dst.g + 0.25h, 1.0h - dst.b, 1.0h);\n"
-     "}\n",
-     2},
-    {"__regformat uchar4 : FRAGCOLOR",
-     "__regformat unsigned char4 main(__regformat unsigned char4 dst : FRAGCOLOR) : COLOR {\n"
-     "    return unsigned char4(dst.r >> 1, dst.g + 64, 255 - dst.b, 255);\n"
-     "}\n",
-     0},
-    {"__nativecolor __regformat uchar4 : FRAGCOLOR",
-     "__nativecolor __regformat unsigned char4 main(__regformat unsigned char4 dst : FRAGCOLOR) : COLOR {\n"
-     "    return unsigned char4(dst.r >> 1, dst.g + 64, 255 - dst.b, 255);\n"
-     "}\n",
-     0},
-    {"__nativecolor float4 : FRAGCOLOR",
-     "__nativecolor float4 main(float4 dst : FRAGCOLOR) : COLOR {\n"
-     "    return float4(dst.r * 0.5f, dst.g + 0.25f, 1.0f - dst.b, 1.0f);\n"
-     "}\n",
-     2},
+     "}\n", 2},
+    {"out __nativecolor __regformat uchar4 : COLOR",
+     "void main(__regformat uchar4 dst : FRAGCOLOR, out __nativecolor __regformat uchar4 col : COLOR) {\n"
+     "    col = uchar4(dst.r >> 1, dst.g + 64, 255 - dst.b, 255);\n"
+     "}\n", 0},
+    {"inout float4 : COLOR",
+     "void main(inout float4 col : COLOR) {\n"
+     "    col = float4(col.r * 0.5f, col.g + 0.25f, 1.0f - col.b, 1.0f);\n"
+     "}\n", 2},
 };
 
 // Integers in a fragment program: at pixel (5, 9), ((x ^ y) & 31) << 3 = 96.
@@ -405,7 +480,7 @@ int main() {
     ps2plat::StartUp();
     vita::ConsoleShow();
     g_out = std::fopen(ps2plat::JoinPath(ps2plat::DataDirectory(), "result.txt").c_str(), "w");
-    Say("GXM probe: the Vita's GPU for the GS renderer\n\n", vita::kYellow);
+    Say("GXM probe (2): the Vita's GPU for the GS renderer\n\n", vita::kYellow);
     int failures = 0;
 
     g_compiler = LoadCompiler();
@@ -416,34 +491,60 @@ int main() {
     Gpu g;
     if (g_compiler && !Start(g)) ++failures, g_compiler = false;
 
-    Program vertex, constant;
+    Program vertex, constant, uniform_constant;
     SceGxmVertexProgram* vp = nullptr;
-    SceGxmFragmentProgram* constant_fp = nullptr;
+    SceGxmFragmentProgram* constant_fp = nullptr;      // the first control that drew right
+    const SceGxmProgram* constant_gxp = nullptr;
+    char line[320];
     if (g_compiler) {
-        const Compiled v = Compile(kVertex, false), c = Compile(kConstant, true);
-        char line[160];
+        const Compiled v = Compile(kVertex, false), c = Compile(kConstant, true), u = Compile(kUniformConstant, true);
         std::snprintf(line, sizeof line, "\nvertex shader: %s (%.1f ms)\n", v.program ? "compiled" : v.error.c_str(), v.ms);
         Say(line, v.program ? vita::kWhite : vita::kRed);
-        std::snprintf(line, sizeof line, "constant fragment shader: %s (%.1f ms)\n",
-                      c.program ? "compiled" : c.error.c_str(), c.ms);
-        Say(line, c.program ? vita::kWhite : vita::kRed);
         std::string how;
-        if (Register(g, v, &vertex) && Register(g, c, &constant)) {
-            vp = VertexProgram(g, vertex);
-            if (vp) constant_fp = FragmentProgram(g, constant, vertex, &how);
-        }
-        if (!vp || !constant_fp) {
-            Say("the control's programs could not be made (" + how + ")\n", vita::kRed);
+        if (Register(g, v, &vertex)) vp = VertexProgram(g, vertex);
+        if (!vp) {
+            Say("the vertex program could not be made\n", vita::kRed);
             ++failures;
         } else {
-            Draw(g, vp, {constant_fp});
+            std::snprintf(line, sizeof line, "  default uniform buffer: %u bytes\n",
+                          sceGxmProgramGetDefaultUniformBufferSize(vertex.gxp));
+            Say(line, vita::kGrey);
+        }
+        const int want[4] = {204, 102, 51, 255};
+        const struct {
+            const char* name;
+            const Compiled* compiled;
+            Program* program;
+        } controls[] = {{"control (literal)", &c, &constant}, {"control (uniform)", &u, &uniform_constant}};
+        for (const auto& control : controls) {
+            if (!vp) break;
+            SceGxmFragmentProgram* fp =
+                Register(g, *control.compiled, control.program) ? FragmentProgram(g, *control.program, vertex, &how) : nullptr;
+            if (!fp) {
+                Say(std::string(control.name) + ": " + (control.compiled->program ? how : control.compiled->error) + "\n",
+                    vita::kRed);
+                ++failures;
+                continue;
+            }
+            Draw(g, vp, vertex.gxp, {{fp, control.program->gxp, {0.8f, 0.4f, 0.2f, 1.0f}}});
             std::uint8_t px[4];
-            const int want[4] = {204, 102, 51, 255};
             const std::string got = Pixel(g, 32, 32, px);
             const bool ok = Near(px, want, 1);
-            Say(std::string("control: ") + got + (ok ? " as expected\n" : " - expected (204, 102, 51, 255)\n"),
-                ok ? vita::kGreen : vita::kRed);
+            std::snprintf(line, sizeof line, "%s: %s %s (uniform buffer %u bytes, %.0f ms)\n", control.name, got.c_str(),
+                          ok ? "as expected" : "- expected (204, 102, 51, 255)",
+                          sceGxmProgramGetDefaultUniformBufferSize(control.program->gxp), control.compiled->ms);
+            Say(line, ok ? vita::kGreen : vita::kRed);
             failures += !ok;
+            if (ok && !constant_fp) constant_fp = fp, constant_gxp = control.program->gxp;
+        }
+    }
+
+    if (g_compiler) {
+        Say("\nhow the compiler spells 8-bit vectors:\n", vita::kYellow);
+        for (const Spelling& s : kSpellings) {
+            const Compiled c = Compile(s.source, true);
+            std::snprintf(line, sizeof line, "  %-40s %.100s\n", s.name, c.program ? "compiles" : c.error.c_str());
+            Say(line, c.program ? vita::kGreen : vita::kGrey);
         }
     }
 
@@ -452,9 +553,8 @@ int main() {
         const int want[4] = {102, 166, 204, 255};
         for (const Variant& variant : kVariants) {
             const Compiled c = Compile(variant.source, true);
-            char line[256];
             if (!c.program) {
-                std::snprintf(line, sizeof line, "  %-46s does not compile: %.90s\n", variant.name, c.error.c_str());
+                std::snprintf(line, sizeof line, "  %-46s does not compile: %.100s\n", variant.name, c.error.c_str());
                 Say(line, vita::kGrey);
                 continue;
             }
@@ -466,7 +566,7 @@ int main() {
                 Say(line, vita::kRed);
                 continue;
             }
-            Draw(g, vp, {constant_fp, fp});
+            Draw(g, vp, vertex.gxp, {{constant_fp, constant_gxp, {0.8f, 0.4f, 0.2f, 1.0f}}, {fp, p.gxp, {0, 0, 0, 0}}});
             std::uint8_t px[4];
             const std::string got = Pixel(g, 32, 32, px);
             const bool ok = Near(px, want, variant.tolerance);
@@ -484,11 +584,11 @@ int main() {
             Say("  " + (c.program ? how : c.error) + "\n", vita::kRed);
             ++failures;
         } else {
-            Draw(g, vp, {fp});
+            Draw(g, vp, vertex.gxp, {{fp, p.gxp, {0, 0, 0, 0}}});
             std::uint8_t px[4];
-            const int want[4] = {96, 15, 4, 255};
+            const int iwant[4] = {96, 15, 4, 255};
             const std::string got = Pixel(g, 5, 9, px);
-            const bool ok = Near(px, want, 1);
+            const bool ok = Near(px, iwant, 1);
             Say("  at (5, 9): " + got + (ok ? " as expected\n" : " - expected (96, 15, 4, 255)\n"),
                 ok ? vita::kGreen : vita::kRed);
             failures += !ok;
