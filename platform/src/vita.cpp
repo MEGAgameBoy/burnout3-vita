@@ -18,10 +18,12 @@
 #include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/power.h>
+#include <psp2/touch.h>
 
 #include <strings.h>
 
 #include <algorithm>
+#include <cmath>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -120,6 +122,79 @@ void CloseAudioOut() {
     g_audio_port = -1;
 }
 
+// ------------------------------------------------------------ the controls
+
+namespace {
+/* A stick from the Vita's 0-255 (128 centred): a radial dead zone taken out
+   (the Vita's sticks rest a few steps off centre) and the rest stretched over
+   the whole travel, so the smallest push past it is a small push. */
+void Stick(std::uint8_t x, std::uint8_t y, std::uint8_t* out_x, std::uint8_t* out_y) {
+    constexpr float kDead = 0.15f;
+    float fx = float(int(x) - 128) / 127.0f, fy = float(int(y) - 128) / 127.0f;
+    const float length = std::sqrt(fx * fx + fy * fy);
+    if (length <= kDead) {
+        *out_x = *out_y = 0x80;
+        return;
+    }
+    const float scale = std::min(1.0f, (length - kDead) / (1.0f - kDead)) / length;
+    auto axis = [](float v) { return std::uint8_t(std::clamp(int(std::lround(128.0f + v * 127.0f)), 0, 255)); };
+    *out_x = axis(fx * scale);
+    *out_y = axis(fy * scale);
+}
+
+SceTouchPanelInfo g_rear{};
+bool g_rear_ready = false;
+}  // namespace
+
+bool ReadController(ControllerState* state) {
+    SceCtrlData pad{};
+    if (sceCtrlPeekBufferPositive(0, &pad, 1) < 0) return false;
+    // The Vita's buttons, as the DualShock 2's (libpad's order). Its shoulder
+    // buttons are L1 and R1 (the system names them as triggers).
+    static const struct {
+        unsigned vita;
+        int input;
+    } kButtons[] = {
+        {SCE_CTRL_SELECT, 0},   {SCE_CTRL_START, 3},     {SCE_CTRL_UP, 4},     {SCE_CTRL_RIGHT, 5},
+        {SCE_CTRL_DOWN, 6},     {SCE_CTRL_LEFT, 7},      {SCE_CTRL_LTRIGGER, 10}, {SCE_CTRL_RTRIGGER, 11},
+        {SCE_CTRL_TRIANGLE, 12}, {SCE_CTRL_CIRCLE, 13},  {SCE_CTRL_CROSS, 14}, {SCE_CTRL_SQUARE, 15},
+    };
+    ControllerState s;
+    for (const auto& b : kButtons)
+        if (pad.buttons & b.vita) s.buttons |= std::uint16_t(1u << b.input);
+    Stick(pad.rx, pad.ry, &s.sticks[0], &s.sticks[1]);
+    Stick(pad.lx, pad.ly, &s.sticks[2], &s.sticks[3]);
+    // L2 and R2, which the Vita lacks: the rear panel's upper left and upper
+    // right quarters, as seen from the front (where the fingers reach without
+    // resting); its lower half is left alone, where they rest.
+    if (!g_rear_ready) {
+        g_rear_ready = true;
+        if (sceTouchGetPanelInfo(SCE_TOUCH_PORT_BACK, &g_rear) < 0) g_rear = SceTouchPanelInfo{};
+    }
+    SceTouchData touch{};
+    if (g_rear.maxAaX > g_rear.minAaX && sceTouchPeek(SCE_TOUCH_PORT_BACK, &touch, 1) > 0) {
+        const int middle_x = (g_rear.minAaX + g_rear.maxAaX) / 2, middle_y = (g_rear.minAaY + g_rear.maxAaY) / 2;
+        for (SceUInt32 i = 0; i < touch.reportNum && i < 8; ++i) {
+            const SceTouchReport& r = touch.report[i];
+            if (r.y >= middle_y) continue;
+            if (r.x < middle_x) s.buttons |= 1u << 8, s.l2 = 0xFF;
+            else s.buttons |= 1u << 9, s.r2 = 0xFF;
+        }
+    }
+    *state = s;
+    return true;
+}
+
+// ------------------------------------------------------------ a status screen
+
+bool ShowStatus(const std::vector<std::string>& lines) {
+    if (!vita::ConsoleShow()) return false;
+    vita::ConsoleClear();
+    for (std::size_t i = 0; i < lines.size(); ++i)
+        vita::ConsolePrint(lines[i] + "\n", i == 0 ? vita::kYellow : vita::kWhite);
+    return true;
+}
+
 // ------------------------------------------------------------ files
 
 ReadOnlyFile::~ReadOnlyFile() { Close(); }
@@ -211,6 +286,7 @@ void StartUp() {
     sceIoMkdir("ux0:data", 0777);
     sceIoMkdir(DataDirectory().c_str(), 0777);
     sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG_WIDE);
+    sceTouchSetSamplingState(SCE_TOUCH_PORT_BACK, SCE_TOUCH_SAMPLING_STATE_START);   // L2, R2 (ReadController)
 }
 
 // ------------------------------------------------------------ the rest

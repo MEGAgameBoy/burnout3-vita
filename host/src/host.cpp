@@ -599,6 +599,10 @@ int Run(const Options& options) {
         if (!StartGpuRenderer(&error, mode, options.gpu_show))
             std::fprintf(stderr, "%s: %s\n", options.gpu ? "--gpu" : "--gpu-shadow", error.c_str());
     }
+    // --no-draw: no picture at all - what a game does without its drawing's
+    // cost (a system with no renderer yet). Local memory still takes every
+    // transfer, so what the game reads back of it is there.
+    if (options.no_draw && !GpuPrimary()) gs::TheGs().rasterize = false;
     bool sound = false;
     if (options.audio) {
         sound = OpenAudio();
@@ -674,6 +678,7 @@ int Main(int argc, char** argv) {
         else if (arg == "--window") options.window = true;
         else if (arg == "--gs-trace") options.gs_trace = true;
         else if (arg == "--gpu") options.gpu = true;
+        else if (arg == "--no-draw") options.no_draw = true;
         else if (arg == "--gpu-shadow") options.gpu_shadow = true;
         else if (arg == "--gpu-shadow-rtt") options.gpu_shadow = options.gpu_shadow_rtt = true;
         else if (arg == "--gpu-show") options.gpu_shadow = options.gpu_shadow_rtt = options.gpu_show = true;

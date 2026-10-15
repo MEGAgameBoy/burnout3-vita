@@ -146,6 +146,18 @@ bool OpenAudioOut(unsigned frames) {
 void AudioOutWrite(const short* grain) { (void)grain; }
 void CloseAudioOut() {}
 
+// ------------------------------------------------------------ the controls, a status screen
+// The window's controller is the display's (engine/gpu); the picture is the window's.
+
+bool ReadController(ControllerState* state) {
+    (void)state;
+    return false;
+}
+bool ShowStatus(const std::vector<std::string>& lines) {
+    (void)lines;
+    return false;
+}
+
 // ------------------------------------------------------------ files
 
 ReadOnlyFile::~ReadOnlyFile() { Close(); }

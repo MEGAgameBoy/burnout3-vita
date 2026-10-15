@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <ctime>
 #include <string>
+#include <vector>
 
 #if defined(_MSC_VER)
 #include <intrin.h>
@@ -80,6 +81,26 @@ void WakeAll(const std::atomic<std::uint32_t>* address);
 bool OpenAudioOut(unsigned frames);
 void AudioOutWrite(const short* grain);
 void CloseAudioOut();
+
+// ------------------------------------------------------------ the controls
+/* The system's own controls as a DualShock 2 - the Vita's buttons, sticks and
+   rear touch panel: false where the system has none of its own (on a PC the
+   window's controller is the display's, engine/gpu). `buttons` bit n is input
+   n in libpad's order (Select, L3, R3, Start, Up, Right, Down, Left, L2, R2,
+   L1, R1, Triangle, Circle, Cross, Square); the sticks right X, Y, left X, Y
+   (0x80 centred, a dead zone taken out); l2, r2 the triggers' travel. */
+struct ControllerState {
+    std::uint16_t buttons = 0;
+    std::uint8_t sticks[4] = {0x80, 0x80, 0x80, 0x80};
+    std::uint8_t l2 = 0, r2 = 0;
+};
+bool ReadController(ControllerState* state);
+
+// ------------------------------------------------------------ a status screen
+/* Lines of text on the screen where there is no picture yet (the Vita until
+   it has a renderer): what the run is doing. False where there is no such
+   screen. Cheap enough for once a second. */
+bool ShowStatus(const std::vector<std::string>& lines);
 
 // ------------------------------------------------------------ files
 /* A file read at offsets, past 4 GB too (a DVD image is up to 8.5). */

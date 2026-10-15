@@ -52,6 +52,7 @@ Options for finding out why boot stops, passed after `run --`:
 | `--until-frame N` | stop when frame N is done - with `--virtual-time`, the same point of the game every time |
 | `--virtual-time` | the scheduler keeps the clock (each loop slice is 1 ms, waiting skips to the next event): the EE timers, alarms, the IOP and the vblanks follow it, so a scripted run (`--press`) is the same run on any machine under any load; frame-identical across runs |
 | `--gpu` | the GPU renderer draws instead of the software GS (`gpu_bridge.cpp`); local memory is kept in step with the GPU's images where the game reads it (transfers, CLUT loads, textures, the picture). Compare its `--frames` with a software run's using `engine/tools/framediff.py` |
+| `--no-draw` | the GS model takes every packet, register and transfer but draws nothing: a run headless and without its drawing's cost (a system with no renderer yet - the Vita's builds until GXM) |
 | `--gpu-shadow` | the GPU renderer draws every primitive too; each frame its targets are compared with the software GS's (and written beside `--frames` pictures as gpu_/soft_ BMPs) |
 | `--gpu-shadow-rtt` | the same, a texture that is a GPU target sampled from the target (render to texture), as the GPU renderer will on its own |
 | `--gpu-show` | `--gpu-shadow-rtt`, and the window (`--window`) shows the GPU renderer's picture instead of the software GS's |
@@ -536,7 +537,13 @@ EE's on the first, VIF1 and VU1's on the second, the GS's on the third);
 the processor at 444 MHz, the bus and GPU at 222; files through `sceIo`
 (64-bit offsets); the player's things in `ux0:data/<name>/`, and there
 `env.txt`, lines `KEY=VALUE`, for the `PS2HOST_*` variables (the Vita has no
-environment). `ps2_add_port` packages a port as a VPK too (`VITA_TITLE`,
+environment). Its controls are the DualShock 2's (`ps2plat::ReadController`):
+the shoulder buttons L1 and R1, L2 and R2 the rear touch panel's upper left
+and right quarters, the sticks with a radial dead zone. Until the Vita has a
+renderer a port started there runs `--no-draw`, a status screen saying how
+fast (the blanks a second, the blanks lost) and `--frame-times 600` in its
+log; `run.args` in the data directory, when there, adds options (a scripted
+run from `port/runs`, `{data}` the data directory). `ps2_add_port` packages a port as a VPK too (`VITA_TITLE`,
 `VITA_TITLE_ID`, `VITA_SCE_SYS`, `VITA_EXTENDED_MEMORY`), and `port.py
 --game <g> build --target vita` drives it. GCC's time on generated code is
 the Vita build's cost: the VU corpus (3.3 MB of C++) takes it half an hour at

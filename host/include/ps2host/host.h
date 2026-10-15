@@ -113,6 +113,8 @@ struct Options {
     bool vu_interpret = false;     /* --vu-interpret: no compiled microprograms */
     bool vu_fast = false;          /* --vu-fast: VU1 programs without MAC/STATUS readers skip those flags */
     bool gpu = false;              /* draw on the GPU instead of the software GS (gpu_bridge.cpp) */
+    bool no_draw = false;          /* --no-draw: the GS model takes every packet, register and transfer
+                                      but draws nothing - a system with no renderer yet (headless) */
     bool gpu_shadow = false;       /* draw on the GPU too, and compare (gpu_bridge.cpp) */
     bool gpu_shadow_rtt = false;   /* ...sampling GPU targets as textures */
     bool gpu_show = false;         /* ...and the window shows the GPU's picture */

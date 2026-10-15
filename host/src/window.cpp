@@ -23,6 +23,7 @@
 #include "ps2host/run.h"
 #include "ps2host/settings.h"
 #include "ps2host/texture_pack.h"
+#include "ps2plat/platform.h"
 
 #ifdef PS2HOST_VULKAN
 #include <SDL3/SDL_scancode.h>
@@ -325,8 +326,52 @@ bool HostPad(HostPadState* state) {
         return true;
     }
 #endif
-    (void)state;
+    // The system's own controls (the Vita's), where it has them.
+    ps2plat::ControllerState own;
+    if (ps2plat::ReadController(&own)) {
+        state->buttons = own.buttons;
+        for (int i = 0; i < 4; ++i) state->sticks[i] = own.sticks[i];
+        state->l2 = own.l2;
+        state->r2 = own.r2;
+        return true;
+    }
     return false;   // the GDI window has none
+}
+
+void StatusFrame(u64 frame) {
+#ifdef PS2HOST_VULKAN
+    if (g_display) return;
+#endif
+    if (g_window) return;
+    using Clock = std::chrono::steady_clock;
+    static const Clock::time_point started = Clock::now();
+    static Clock::time_point shown{};
+    static u64 frame_then = 0, lost_then = 0;
+    static bool none = false;               // this system has no status screen
+    if (none) return;
+    const Clock::time_point now = Clock::now();
+    if (shown != Clock::time_point{} && now - shown < std::chrono::seconds(1)) return;
+    const double seconds = shown == Clock::time_point{} ? 0.0 : std::chrono::duration<double>(now - shown).count();
+    const long running = long(std::chrono::duration_cast<std::chrono::seconds>(now - started).count());
+    const u64 lost = LostVblanks();
+    char line[160];
+    std::vector<std::string> lines;
+    lines.push_back(GameTitle().empty() ? std::string("PS2 port") : GameTitle());
+    lines.push_back("");
+    std::snprintf(line, sizeof line, "vertical blank %llu    %.1f a second (the console's 60)",
+                  (unsigned long long)frame, seconds > 0 ? double(frame - frame_then) / seconds : 0.0);
+    lines.push_back(line);
+    std::snprintf(line, sizeof line, "blanks lost while the game was busy: %llu in the last second",
+                  (unsigned long long)(lost - lost_then));
+    lines.push_back(line);
+    std::snprintf(line, sizeof line, "running for %ld:%02ld", running / 60, running % 60);
+    lines.push_back(line);
+    lines.push_back("");
+    lines.push_back("No picture yet: this build has no renderer. What the game does goes to its log.");
+    if (!ps2plat::ShowStatus(lines)) none = true;
+    shown = now;
+    frame_then = frame;
+    lost_then = lost;
 }
 
 namespace {

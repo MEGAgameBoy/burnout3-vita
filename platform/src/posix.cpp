@@ -55,6 +55,18 @@ bool OpenAudioOut(unsigned frames) {
 void AudioOutWrite(const short* grain) { (void)grain; }
 void CloseAudioOut() {}
 
+// ------------------------------------------------------------ the controls, a status screen
+// Headless: none (scripted presses drive a run).
+
+bool ReadController(ControllerState* state) {
+    (void)state;
+    return false;
+}
+bool ShowStatus(const std::vector<std::string>& lines) {
+    (void)lines;
+    return false;
+}
+
 // ------------------------------------------------------------ files
 
 ReadOnlyFile::~ReadOnlyFile() { Close(); }

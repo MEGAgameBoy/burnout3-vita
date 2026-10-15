@@ -294,6 +294,9 @@ void PresentFrame();
 /* The window's events alone (PresentFrame without the picture, which the GS
    thread presents): false once it has been closed. */
 bool PumpWindow();
+/* With no window, on a system with a screen of text (the Vita before its
+   renderer): what the run is doing, redrawn once a second; called each frame. */
+void StatusFrame(u64 frame);
 /* Fullscreen on or off (saved as the "fullscreen" setting, settings.h, which
    the window opens with); and whether it is. */
 void SetWindowFullscreen(bool on);

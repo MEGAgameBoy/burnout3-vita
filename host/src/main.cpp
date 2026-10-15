@@ -91,6 +91,36 @@ bool IsGameDisc(const std::string& path) {
 }
 #endif
 
+/* The options in a file (run.args): split at spaces and line ends, "double
+   quotes" keeping spaces in one; none when there is no such file. */
+std::vector<std::string> RunArguments(const std::string& path) {
+    std::vector<std::string> args;
+    std::FILE* f = ps2plat::OpenFile(path, "r");
+    if (!f) return args;
+    std::string text;
+    char chunk[512];
+    for (std::size_t n; (n = std::fread(chunk, 1, sizeof chunk, f)) > 0;) text.append(chunk, n);
+    std::fclose(f);
+    std::string arg;
+    bool quoted = false, any = false;
+    for (char ch : text) {
+        if (ch == '"') {
+            quoted = !quoted;
+            any = true;
+        } else if (!quoted && (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r')) {
+            if (any) args.push_back(arg);
+            arg.clear();
+            any = false;
+        } else {
+            arg += ch;
+            any = true;
+        }
+    }
+    if (any) args.push_back(arg);
+    if (!args.empty()) std::fprintf(stderr, "[port] %zu options from %s\n", args.size(), path.c_str());
+    return args;
+}
+
 /* Started without arguments - from Explorer, a shortcut, the Vita's home
    screen - the port plays its game from the player's own disc image: the one
    chosen before (kept in the settings, in the data directory), or asked for
@@ -119,8 +149,23 @@ std::vector<std::string> PlayArguments(const char* self) {
 #endif
     ps2plat::RedirectOutput(ps2plat::JoinPath(here, g_log));
     std::fprintf(stderr, "[port] disc %s\n", disc.c_str());
-    return {self ? self : "port", "--disc", disc, "--memcard", ps2plat::JoinPath(here, "memcard"), "--window", "--gpu",
-            "--audio", "--timeout", "315360000"};     // ten years
+    std::vector<std::string> args = {self ? self : "port", "--disc", disc, "--memcard", ps2plat::JoinPath(here, "memcard"),
+                                     "--audio", "--timeout", "315360000"};     // ten years
+#ifdef __vita__
+    // The Vita has no renderer yet: the game runs headless, the status screen
+    // and the log (--frame-times every ten seconds) saying how fast.
+    for (const char* arg : {"--no-draw", "--frame-times", "600"}) args.push_back(arg);
+#else
+    for (const char* arg : {"--window", "--gpu"}) args.push_back(arg);
+#endif
+    // run.args in the data directory, when there: more options for this run
+    // (a scripted run on a system with no command line - the Vita's - from
+    // port/runs; later options win). {data} is the data directory.
+    for (std::string arg : RunArguments(ps2plat::JoinPath(here, "run.args"))) {
+        for (std::size_t at; (at = arg.find("{data}")) != std::string::npos;) arg.replace(at, 6, here);
+        args.push_back(arg);
+    }
+    return args;
 #else
     return {self ? self : "port"};
 #endif
