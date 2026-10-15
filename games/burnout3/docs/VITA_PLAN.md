@@ -378,28 +378,45 @@ timeline, not now.
 
 ### The renderer: raw GXM (decided)
 
-Recommended over vitaGL:
+Raw GXM over vitaGL: the PC renderer is explicit about pipelines, passes and
+memory, and so is GXM (scenes, surfaces, memory blocks), where vitaGL would
+put a GL state machine and its own memory manager between the bridge and the
+hardware; GXM has palettes (P8/P4), memory the CPU can map, and control over
+scenes, which a tile-based GPU needs when GS effects switch targets many
+times a frame. The cost: memory, scenes and the shader patcher are ours
+(vita2d and vitaGL as references).
 
-* The GS's blend - (A - B) x C + D with C the destination alpha or a factor
-  over 1 -, FBMSK in part of a channel, DATE and AFAIL took the PC renderer
-  dual-source blending, logic ops, a stencil pass and a target copy. On GXM a
-  fragment program can read the pixel it replaces, so all of them become exact
-  shader code in one pass. vitaGL is an OpenGL ES 2-style blender and documents
-  no way to read the destination.
-* The PC renderer is explicit about pipelines, passes and memory; so is GXM
-  (scenes, surfaces, memory blocks). vitaGL would put a GL state machine and its
-  own memory manager between the bridge and the hardware.
-* GXM's palettes (P8/P4), its memory the CPU can map, and control over scenes,
-  which a tile-based GPU needs when GS effects switch targets many times a frame.
+**What the hardware probes found (2026-10-16, GXM probes 1-3 on the player's
+Vita):**
 
-The cost: memory, scenes and the shader patcher are ours to write (vita2d and
-vitaGL as references). Mapping of what the Vulkan renderer does:
+* libshacccg (SDK 3.0.0, shacc r13225) loads from `ur0:data/` and compiles a
+  shader in 82-92 ms: a few dozen shaders compiled once, cached as GXP.
+* A scene drawn into memory the CPU reads back is exact (a constant colour
+  from literals and from a uniform), given a depth/stencil surface - without
+  one every draw fails (0x805B001F).
+* **Integers in fragment programs work**: `floor`, `(int)`, XOR, AND, shifts,
+  multiplies, all exact (`(int)` rounds to nearest there: floor first). GS
+  memory's swizzle can run in fragment passes.
+* **The destination cannot be read in the shader with this compiler.**
+  FRAGCOLOR is "not a valid semantic for a varying"; on a `uniform` any
+  semantic is ignored (a plain uniform: proved by filling it); `__regformat`
+  and `__nativecolor` are not keywords anywhere; no program compiled had
+  GXP's FRAGCOLOR_USED flag. (The hardware has it - Vita3K reads such
+  programs' output register - so a GXP compiled elsewhere could; there is no
+  open compiler that writes one.)
 
-| Vulkan | GXM |
+So the blend is the fixed-function blender's, as on the PC before shader
+blending - and as PCSX2's GLES-era renderers did it:
+
+| GS | GXM |
 | --- | --- |
-| compute swizzle/decode/patch over the GPU's copy of GS memory | GS memory as a 1024 x 1024 RGBA8 surface; fragment passes computing each texel's address (the inverse swizzle) - needs integer operations in Cg fragment programs, to be proved first - or NEON on the CPU where cheaper |
-| dual-source blending, logic ops, DATE's stencil pass | blending in the fragment program from the pixel read back |
-| D32 + S8 depth | DF32 / S8D24 / D16 by ZBUF's format; depth read as a texture (the race's PSMZ16 depth of field) needs depth stored to memory (force-store) or written as colour by a pass - open |
+| Cv = (A - B) * C + D, the common cases (Cs-Cd)*As+Cd, Cs*As+Cd, (Cs-Cd)*FIX+Cd, Cd*As..., additive | the blender's factors, colour and alpha separately (SceGxmBlendInfo): the source's alpha written as is; FIX given to the blend as the source alpha where alpha is not written |
+| C = Ad (the destination's alpha), factors over 1 (As > 0x80), what the blender cannot reach | the target's region copied to a texture (the scene ended, a transfer), the draw blending in the shader from the copy - rare, costly; approximations behind a setting first |
+| DATE | the target's alpha bit into stencil by a pass, the draw stencil-tested (S8D24 surfaces) - as on the PC |
+| AFAIL | two passes, the shader told which pixels each keeps (discard) - as on the PC |
+| FBMSK by channel | the colour mask; within a channel (the race's 0x3FFF through a 16-bit view): the shader-blend path |
+| compute swizzle/decode/patch over GS memory | fragment passes over a 1024 x 1024 surface, the address computed per pixel with integers (proved), or NEON on the CPU where cheaper |
+| D32 + S8 depth | S8D24 (Z24 exact; Z32 rounded) / D16; depth sampled as a texture (the race's depth of field) needs depth stored to memory (force-store) - open |
 | FXAA, SSAA | dropped |
 | three frames in flight | GXM notifications and the display queue |
 
