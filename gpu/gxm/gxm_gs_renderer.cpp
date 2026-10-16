@@ -36,10 +36,13 @@
  * into the stencil by a pass at the start of a scene, the batch stencil-
  * tested; PABE as two passes, blended and not, by the source alpha.
  *
- * Not yet: an internal resolution above 1x, FBMSK within a channel, 16-bit targets' five bits a channel
- * when blending, PSMT8H through the CLUT, the region clamp and repeat modes
- * when sampling (decoded textures have them baked in), mipmaps, a texture
- * pack.
+ * A target read as PSMT8H indexes the GPU's CLUT (a 256 x 1 texture) by its
+ * alpha.
+ *
+ * Not yet: an internal resolution above 1x, FBMSK within a channel, 16-bit
+ * targets' five bits a channel when blending, the region clamp and repeat
+ * modes when sampling (decoded textures have them baked in), mipmaps, a
+ * texture pack.
  */
 
 #include <psp2/gxm.h>
@@ -182,7 +185,7 @@ const char kVertexSource[] =
                 0x80), 2 FIX (uParams.y)
      bits 12-13 a target sampled as a texture: 0 as it is (32-bit), 1 24-bit
                 (TEXA's alpha), 2 16-bit (five bits a channel, the alpha
-                bit's TEXA)
+                bit's TEXA), 3 PSMT8H (its alpha indexing the CLUT)
      bits 14-15 PABE's passes: 0 every pixel, 1 those with As >= 0x80 (blended),
                 2 those below (written as they are)
    And on its own, kDateSetup | DATM: the destination alpha test's setup -
@@ -217,6 +220,9 @@ std::string FragmentSource(Variant v) {
     static const char body[] =
         "float4 main(float4 vColor : COLOR0, float3 vStq : TEXCOORD0, float vFog : TEXCOORD1,\n"
         "            uniform sampler2D uTexture : TEXUNIT0,\n"
+        "#if TEX_FORMAT == 3\n"
+        "            uniform sampler2D uClut : TEXUNIT1,\n"
+        "#endif\n"
         "            uniform float4 uParams,      // AREF, the FIX factor, TA0, TA1 (all over 255)\n"
         "            uniform float4 uFog,         // FOGCOL's R, G, B over 255; AEM\n"
         "            uniform float2 uTexScale) : COLOR {\n"
@@ -231,6 +237,8 @@ std::string FragmentSource(Variant v) {
         "    t.rgb = floor(t.rgb * (255.0f / 8.0f) + 0.001f) * (8.0f / 255.0f);\n"
         "    float black = dot(t.rgb, float3(1.0f, 1.0f, 1.0f)) == 0.0f ? 1.0f : 0.0f;\n"
         "    t.a = bit > 0.5f ? uParams.w : ((uFog.w > 0.5f && black > 0.5f) ? 0.0f : uParams.z);\n"
+        "#elif TEX_FORMAT == 3\n"
+        "    t = tex2D(uClut, float2((floor(t.a * 255.0f + 0.5f) + 0.5f) / 256.0f, 0.5f));\n"
         "#endif\n"
         "    const float k = 255.0f / 128.0f;\n"
         "#if TFX == 0\n"
@@ -506,6 +514,10 @@ private:
 
     ps2host::gs::Memory memory_;    // GS local memory "on the GPU"
     u32 clut_[256] = {};            // the GPU's CLUT (ClutFromMemory, ClutRows)
+    bool clut_changed_ = true;      // ...since clut_texture_ was made from it
+    u32* clut_pixels_ = nullptr;
+    SceGxmTexture clut_texture_{};
+    void UseClut();
     u64 draws_ = 0, scenes_ = 0, waits_ = 0;
 };
 
@@ -835,6 +847,8 @@ void GxmGsRenderer::Pass(Variant variant, const SceGxmBlendInfo& blend, const Gs
         if (params->tex_scale) sceGxmSetUniformDataF(uniforms, params->tex_scale, 0, 2, tex_scale);
     }
     if (texture) sceGxmSetFragmentTexture(ctx, 0, texture);
+    if (((variant >> kTexFormatShift) & 3u) == 3u && !(variant & kDateSetup))
+        sceGxmSetFragmentTexture(ctx, 1, &clut_texture_);
     sceGxmSetVertexStream(ctx, 0, vertices);
     const int r = sceGxmDraw(ctx, SCE_GXM_PRIMITIVE_TRIANGLES, SCE_GXM_INDEX_FORMAT_U16, indices_, count);
     if (r < 0) {
@@ -868,7 +882,8 @@ void GxmGsRenderer::Flush() {
                 // S and T are over TEX0's size; the target is its own size.
                 tex_scale[0] = float(s.tw ? s.tw : found->second.width) / float(found->second.width);
                 tex_scale[1] = float(s.th ? s.th : found->second.height) / float(found->second.height);
-                tex_format = s.tex_format == 1 ? 1 : s.tex_format == 2 ? 2 : 0;
+                tex_format = s.tex_format == 1 ? 1 : s.tex_format == 2 ? 2 : s.tex_format == 4 ? 3 : 0;
+                if (tex_format == 3) UseClut();
                 texture = &sampled;
             }
         } else {
@@ -1319,6 +1334,7 @@ void GxmGsRenderer::ClutFromMemory(const GsClutLoad& load) {
         }
         clut_[load.eight ? i : (load.csa * 16 + i) % 256] = colour;
     }
+    clut_changed_ = true;
 }
 
 void GxmGsRenderer::ClutRows(const u32* clut, u32 rows) {
@@ -1326,6 +1342,21 @@ void GxmGsRenderer::ClutRows(const u32* clut, u32 rows) {
     if (!rows) return;
     for (u32 r = 0; r < 16; ++r)
         if (rows >> r & 1) std::memcpy(clut_ + r * 16, clut + r * 16, 64);
+    clut_changed_ = true;
+}
+
+void GxmGsRenderer::UseClut() {
+    // The CLUT as a 256 x 1 texture, made again when it has changed (what
+    // is recorded reads the one it was drawn with).
+    if (!clut_changed_ && clut_pixels_) return;
+    if (clut_pixels_) Release(clut_pixels_);
+    clut_pixels_ = static_cast<u32*>(heap_.Take(256 * 4));
+    if (!clut_pixels_) return;
+    std::memcpy(clut_pixels_, clut_, sizeof clut_);
+    sceGxmTextureInitLinear(&clut_texture_, clut_pixels_, SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR, 256, 1, 0);
+    sceGxmTextureSetMinFilter(&clut_texture_, SCE_GXM_TEXTURE_FILTER_POINT);
+    sceGxmTextureSetMagFilter(&clut_texture_, SCE_GXM_TEXTURE_FILTER_POINT);
+    clut_changed_ = false;
 }
 
 }  // namespace
