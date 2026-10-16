@@ -177,6 +177,26 @@ the display queue's callback waiting for the refresh; taken back, and the
 host's threads now say what they wait on in a hang's report, which the
 stop buttons can ask for even then (they are watched off the EE's thread).
 
+**The ninth run (2026-10-17): the same hang, and its cause.** The boot's
+load took 18.6 s; then the stop buttons, two minutes into the hang, gave
+the report: no frame for 118 s, 60,774 blanks lost, the EE's time all in
+the SPU2's section - and the EE back as soon as the stop ended the
+vertical blank timer's thread. The race's loading sleeps three horizontal
+blanks at a time (0x00131B90: SetAlarm, then SleepThread); an alarm due
+was the timer thread's next event at once, on every pass, until the EE
+took it - and on the Vita that thread is above the EE on its core, so the
+EE never ran to take it (it stood where it was, in the SPU2's mixing: the
+section's "99%"). The eighth run's hang was the same (its frontend's first
+SetAlarm), not the display's wait taken back then. Fixed (engine,
+threads.cpp): the timer does not wait again for an alarm already marked
+due, never makes two passes without a sleep, and the EE takes a due alarm
+in its own idle wait (213 us a sleep of 190, not 520).
+`ps2host_timer_priority_test` puts the Vita's arrangement on one Linux
+core (SCHED_FIFO, the timer above the EE) and fails in 10 s without the
+fix. Also new: `[host] no frame for N s` with where the host's threads
+are, every 30 s of a hang, and the same at the stop buttons; the SPU2's
+time in the frame line (its handlers', its output's, its longest call).
+
 The GPU tests on the hardware (sixth run of them: 6 failures left, all
 REGION_CLAMP/REPEAT and FBMSK within a channel): every depth surface the probe tried (DF32,
 DF32 + S8, S8D24; linear or tiled; CDRAM or LPDDR) keeps depth across scenes
