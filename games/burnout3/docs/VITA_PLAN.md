@@ -105,6 +105,40 @@ libshacccg), so it is started while M1's numbers come in:
   PSMT8H through the CLUT, the frame pipelined (notifications rather than
   a finish), fragment passes for the swizzles that cost.
 
+**The fourth build on the hardware (2026-10-16): the LOADING screen.** With
+the blank's timer asleep rather than spinning (it starved the EE on their
+shared core), the game boots: the IOP rebooted with the disc's modules, the
+GTFS file loads, the LOADING screen drawn by the GPU after ~30 s, ~12,000
+draws. Then it stayed there for the 30 s the player waited, the EE's thread
+busy throughout (`EE idle` never printed), a picture every 2-3 s while the
+blanks came eight times as fast (FastLoading). On the PC the same load is
+8 s at the console's pace, the EE 85% idle. Two candidates, measured by the
+next build: the game's code (the plain lifted form on a 32-bit core), or an
+IOP module that never waits - the PC saw one at boot hold the EE past blanks
+with its 20-million-instruction slice, which on the Vita's interpreter is
+on the order of a second a frame. So:
+
+* `[frames]` says the IOP's and the SPU2's share of the EE's thread, the
+  IOP's instructions a second and its busiest thread; `[load]` and
+  `[frontend]` say how far the load is (port/overrides.cpp).
+* `--iop-share 25` (the Vita's default): the IOP's runs at frames take at
+  most a quarter of the EE's thread in real time, an RPC's 2 ms (iop_vm.cpp's
+  Run, threads.cpp's IopFrameBudgetNs). Scripted runs (virtual time) are
+  unchanged.
+* L, R, SELECT and START held three seconds stop the run with its report
+  (RequestReportStop): where a stuck game is, without a debugger.
+
+The GPU tests on the hardware: every depth surface the probe tried (DF32,
+DF32 + S8, S8D24; linear or tiled; CDRAM or LPDDR) keeps depth across scenes
+with force load and store - the renderer's DF32 + S8 linear in CDRAM is
+right. The 20 failures left were mostly the renderer's own bug: ReadTarget
+(and DisplayTarget, TargetToMemory, DepthToMemory) looked the target up
+before recording the draws still pending, so a target made by the last draw
+was "not there" (the tests' DEADBEEF). Expected still: REGION_CLAMP and
+REGION_REPEAT, FBMSK within a channel. The status screen was also put up
+over the GPU's pictures once a second (the flicker the player saw): with the
+GPU drawing, only the caption now.
+
 ## How it will be measured
 
 * **Exactness, without a renderer** - a per-frame checksum of everything the

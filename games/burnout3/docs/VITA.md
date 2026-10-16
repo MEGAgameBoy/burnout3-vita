@@ -5,12 +5,14 @@ not emulated - compiled for the Vita with VitaSDK. Unofficial and fan-made,
 like the PC port: you need your own disc (NTSC-U, SLUS-21050), and nothing of
 the game is in this repository or in what it builds from it.
 
-**Where it stands (M2 begun, 2026-10-16): the GPU draws, untested.** The
-GS is drawn by the Vita's GPU (GXM) in a first version written without the
-hardware at hand; where it cannot start (no libshacccg) or the `renderer`
-setting says `software`, the engine's software GS draws instead - the CPU's
-work, so slow. Either way the picture is scaled to the screen with a line
-over it saying how fast the run goes, and the log says what the game does.
+**Where it stands (M2, 2026-10-16): the boot's LOADING screen, drawn by
+the GPU.** The GS is drawn by the Vita's GPU (GXM); where it cannot start
+(no libshacccg) or the `renderer` setting says `software`, the engine's
+software GS draws instead - the CPU's work, so slow. Either way the picture
+is scaled to the screen with a line over it saying how fast the run goes,
+and the log says what the game does. On the hardware the game reaches its
+LOADING screen in about 30 s and was still loading 30 s later: how far its
+load gets, and where the time goes, is what the log now says (below).
 The plan, the measurements and the risks: [VITA_PLAN.md](VITA_PLAN.md).
 
 ## Installing and running
@@ -33,6 +35,15 @@ The plan, the measurements and the risks: [VITA_PLAN.md](VITA_PLAN.md).
 What it writes, all in `ux0:data/burnout3/`: `burnout3.log` (send it with any
 report), `pc_settings.ini` (the disc chosen, the settings), `memcard/` (the
 game's saves, slot 1).
+
+**If it seems stuck**, hold **L, R, SELECT and START** together for three
+seconds: the game stops and the log ends with where it was - the game's
+call stack, its threads and the IOP's, the functions it called most - then
+the error screen comes up. Send that log. Meanwhile the log says, every 600
+of the PS2's vertical blanks, how fast it ran and where the EE's thread went
+(`[frames]`: the IOP's and the SPU2's shares, the IOP's busiest thread), and
+for a load how long it has gone on (`[load]`) and which stage of the
+start-up sequence the game is at (`[frontend]`).
 
 ### Controls
 
@@ -125,9 +136,14 @@ The LiveArea's art is the port's own, drawn by
 
 * The GPU renderer is a first version (VITA_PLAN.md, "M2"): native
   resolution, the GPU finished at every frame's end, local memory's swizzles
-  and decodes on the CPU; the destination alpha test, PABE and FBMSK within a
-  channel not yet drawn. Sound goes to the Vita's speaker (sceAudioOut) but
-  is not yet heard on hardware.
+  and decodes on the CPU; REGION_CLAMP/REPEAT and FBMSK within a channel not
+  yet drawn. Sound goes to the Vita's speaker (sceAudioOut) but is not yet
+  heard on hardware.
+* The boot's load is slow (above): the game's code is still the plain lifted
+  form (every EE register through memory) until the structured form's
+  verification has finished, and the IOP's modules run in an interpreter on
+  the EE's core. The IOP gets at most a quarter of that core at each frame
+  (`--iop-share 25`, the Vita's default; `run.args` can say otherwise).
 * No settings menu for the Vita's options yet; rumble does nothing (the Vita
   has none).
 * Speed: to be measured on the hardware (VITA_PLAN.md). Expect the race to

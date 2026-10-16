@@ -8,6 +8,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -45,6 +46,8 @@ void F_001F2408(lifted::Context& c);
 // The frame's post effects: glow and speed blur (see PostEffects).
 void F_002FA9A0(lifted::Context& c);
 void F_001322B0(lifted::Context& c);
+// The frontend's start-up sequence (see FrontendSequence).
+void F_00131480(lifted::Context& c);
 // The frontend: its string lookup, the main menu's input, a message box.
 void F_00271A00(lifted::Context& c);
 void F_00318100(lifted::Context& c);
@@ -153,12 +156,58 @@ void WaitsForInterrupt(lifted::Context& c) {
     Wait(c);
 }
 
-template <void (*Load)(lifted::Context&)>
+/* A load's progress in the log: how long it took and how many steps (the
+   main loop's frames that called it) - every ten seconds while it goes on,
+   so a load that crawls (the Vita's first boots) says it is not stuck. */
+struct LoadProgress {
+    std::chrono::steady_clock::time_point began{}, said{};
+    u64 steps = 0;
+    void Step(u32 address, bool done) {
+        const auto now = std::chrono::steady_clock::now();
+        if (!steps) began = said = now;
+        ++steps;
+        const double seconds = std::chrono::duration<double>(now - began).count();
+        if (done) {
+            std::fprintf(stderr, "[load] 0x%08X done in %.1f s, %llu steps\n", unsigned(address), seconds,
+                         static_cast<unsigned long long>(steps));
+            steps = 0;
+        } else if (now - said >= std::chrono::seconds(10)) {
+            std::fprintf(stderr, "[load] 0x%08X loading for %.0f s, %llu steps (%.1f a second)\n", unsigned(address),
+                         seconds, static_cast<unsigned long long>(steps), double(steps) / std::max(seconds, 0.001));
+            said = now;
+        }
+    }
+};
+
+template <u32 kAddress, void (*Load)(lifted::Context&)>
 void FastLoading(lifted::Context& c) {
     static const char* forced = std::getenv("PS2HOST_LOAD_SPEED");
     const unsigned speed = forced ? unsigned(std::max(1, std::atoi(forced))) : 8u;
+    static LoadProgress progress;
     Load(c);
-    ps2host::SetFastForward(u32(c.r[2]) ? 1 : speed);
+    const bool done = u32(c.r[2]) != 0;
+    progress.Step(kAddress, done);
+    ps2host::SetFastForward(done ? 1 : speed);
+}
+
+/* 0x00131480, the frontend's start-up sequence (FINDINGS, "The loading
+   screen's wait"): a screen object whose stage (+0x2F4) goes up to 0x17 as
+   the boot's loading screen waits on its parts - the music player, the
+   sound banks. Each new stage in the log, with when: where a load that
+   does not finish waits. */
+void FrontendSequence(lifted::Context& c) {
+    static const auto started = std::chrono::steady_clock::now();
+    static u32 last_screen = 0, last_stage = ~0u, said = 0;
+    const u32 screen = u32(c.r[4]);
+    F_00131480(c);
+    const u32 stage = generated::ReadU32(screen + 0x2F4);
+    if ((screen != last_screen || stage != last_stage) && said < 64) {
+        ++said;
+        std::fprintf(stderr, "[frontend] screen 0x%08X stage %u at %.1f s\n", unsigned(screen), unsigned(stage),
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
+    }
+    last_screen = screen;
+    last_stage = stage;
 }
 
 // ------------------------------------------------------------ PC SETTINGS
@@ -661,8 +710,9 @@ void RegisterGameOverrides() {
     ps2host::Override(0x001156C0u, KernelStore, "kernel-mode store");
     ps2host::Override(0x0010D3E8u, TtyWrite, "TTY write (printf)");
     ps2host::Override(0x001313C0u, SkipMovie, "a movie screen's update: Start skips the movie");
-    ps2host::Override(0x0019A950u, FastLoading<F_0019A950>, "a race's loading: fast-forwarded while it waits");
-    ps2host::Override(0x001322B0u, FastLoading<F_001322B0>, "the game's loading: fast-forwarded while it waits");
+    ps2host::Override(0x0019A950u, FastLoading<0x0019A950u, F_0019A950>, "a race's loading: fast-forwarded while it waits");
+    ps2host::Override(0x001322B0u, FastLoading<0x001322B0u, F_001322B0>, "the game's loading: fast-forwarded while it waits");
+    ps2host::Override(0x00131480u, FrontendSequence, "the frontend's start-up sequence: its stages in the log");
     ps2host::Override(0x00271A00u, GetString, "the string lookup: PC SETTINGS' words");
     ps2host::Override(0x003181E0u, MainMenuInput, "the main menu's input: PC SETTINGS, QUIT GAME");
     ps2host::Override(0x00318100u, MainMenu, "the main menu: QUIT GAME's message box");
