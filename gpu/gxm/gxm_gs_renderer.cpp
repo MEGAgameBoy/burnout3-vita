@@ -32,8 +32,11 @@
  *    program, fragment programs by what a batch needs (Variant), each with
  *    the blends it is used with (the shader patcher bakes the blend in).
  *
- * Not yet: an internal resolution above 1x, the destination alpha test
- * (DATE), PABE, FBMSK within a channel, 16-bit targets' five bits a channel
+ * The destination alpha test (DATE) as on the PC: the target's alpha bit
+ * into the stencil by a pass at the start of a scene, the batch stencil-
+ * tested; PABE as two passes, blended and not, by the source alpha.
+ *
+ * Not yet: an internal resolution above 1x, FBMSK within a channel, 16-bit targets' five bits a channel
  * when blending, PSMT8H through the CLUT, the region clamp and repeat modes
  * when sampling (decoded textures have them baked in), mipmaps, a texture
  * pack.
@@ -180,18 +183,35 @@ const char kVertexSource[] =
      bits 12-13 a target sampled as a texture: 0 as it is (32-bit), 1 24-bit
                 (TEXA's alpha), 2 16-bit (five bits a channel, the alpha
                 bit's TEXA)
+     bits 14-15 PABE's passes: 0 every pixel, 1 those with As >= 0x80 (blended),
+                2 those below (written as they are)
+   And on its own, kDateSetup | DATM: the destination alpha test's setup -
+   the pixels of the target sampled where its alpha bit equals DATM kept
+   (the stencil set there), the rest discarded.
 */
 using Variant = u32;
 constexpr Variant kTextured = 1u, kTcc = 1u << 3, kFog = 1u << 4, kFailing = 1u << 9;
-constexpr int kTfxShift = 1, kAtstShift = 5, kAlphaOutShift = 10, kTexFormatShift = 12;
+constexpr int kTfxShift = 1, kAtstShift = 5, kAlphaOutShift = 10, kTexFormatShift = 12, kPabeShift = 14;
+constexpr Variant kDateSetup = 1u << 20;
 
 std::string FragmentSource(Variant v) {
-    char defines[256];
+    if (v & kDateSetup) {
+        char text[512];
+        std::snprintf(text, sizeof text,
+                      "float4 main(float3 vStq : TEXCOORD0, uniform sampler2D uTexture : TEXUNIT0) : COLOR {\n"
+                      "    float a = tex2D(uTexture, vStq.xy).a;\n"
+                      "    if ((a >= (127.5f / 255.0f)) != %s) discard;\n"
+                      "    return float4(0.0f, 0.0f, 0.0f, 0.0f);\n"
+                      "}\n",
+                      (v & 1u) ? "true" : "false");
+        return text;
+    }
+    char defines[320];
     std::snprintf(defines, sizeof defines,
                   "#define TEXTURED %u\n#define TFX %u\n#define TCC %u\n#define FOG %u\n#define ATST %d\n"
-                  "#define FAILING %u\n#define ALPHA_OUT %u\n#define TEX_FORMAT %u\n",
+                  "#define FAILING %u\n#define ALPHA_OUT %u\n#define TEX_FORMAT %u\n#define PABE %u\n",
                   v & 1u, (v >> kTfxShift) & 3u, (v >> 3) & 1u, (v >> 4) & 1u, int((v >> kAtstShift) & 15u) - 1,
-                  (v >> 9) & 1u, (v >> kAlphaOutShift) & 3u, (v >> kTexFormatShift) & 3u);
+                  (v >> 9) & 1u, (v >> kAlphaOutShift) & 3u, (v >> kTexFormatShift) & 3u, (v >> kPabeShift) & 3u);
     // Colours in the GS's terms: a byte 0-255 is 0-1 here, and the GS's
     // 0x80 = 1.0 where it multiplies is 128/255.
     static const char body[] =
@@ -258,6 +278,11 @@ std::string FragmentSource(Variant v) {
         "#else\n"
         "    if (!pass) discard;\n"
         "#endif\n"
+        "#endif\n"
+        "#if PABE == 1\n"
+        "    if (a < (127.5f / 255.0f)) discard;\n"
+        "#elif PABE == 2\n"
+        "    if (a >= (127.5f / 255.0f)) discard;\n"
         "#endif\n"
         "#if ALPHA_OUT == 1\n"
         "    a = min(a * (255.0f / 128.0f), 1.0f);\n"
@@ -376,7 +401,8 @@ bool SameBatch(const GsDrawState& x, const GsDrawState& y) {
                             x.tex_format == y.tex_format && x.ta0 == y.ta0 && x.ta1 == y.ta1 && x.aem == y.aem)) &&
            x.alpha_test == y.alpha_test &&
            (!x.alpha_test || (x.atst == y.atst && x.aref == y.aref && x.afail == y.afail)) && x.blend == y.blend &&
-           (!x.blend || (x.a == y.a && x.b == y.b && x.c == y.c && x.d == y.d && x.fix == y.fix)) &&
+           (!x.blend || (x.a == y.a && x.b == y.b && x.c == y.c && x.d == y.d && x.fix == y.fix && x.pabe == y.pabe)) &&
+           x.date == y.date && (!x.date || x.datm == y.datm) &&
            x.depth == y.depth && (!x.depth || (x.zbp == y.zbp && x.ztst == y.ztst && x.depth_write == y.depth_write)) &&
            x.fog == y.fog && (!x.fog || x.fogcol == y.fogcol);
 }
@@ -444,8 +470,13 @@ private:
         const SceGxmProgramParameter* tex_scale = nullptr;
     };
     const SceGxmProgram* FragmentGxp(Variant variant, SceGxmShaderPatcherId* id, Params** params);
+    /* Stencil in a pass: off, tested (the destination alpha test's: drawn
+       where the setup set it), or set to 0 or 1 where drawn. */
+    enum class Stencil { kOff, kTest, kClear, kSet };
     void Pass(Variant variant, const SceGxmBlendInfo& blend, const GsDrawState& s, const SceGxmTexture* texture,
-              const float tex_scale[2], const void* vertices, u32 count, SceGxmDepthFunc depth_func, bool depth_write);
+              const float tex_scale[2], const void* vertices, u32 count, SceGxmDepthFunc depth_func, bool depth_write,
+              Stencil stencil = Stencil::kOff);
+    void DateSetup(Target* t, u32 datm);
     u32 TexelAt(const GsTextureDecode& d, int u, int v, int level) const;
 
     Device* device_ = nullptr;
@@ -764,7 +795,7 @@ void GxmGsRenderer::DrawTriangles(const GsDrawState& state, const GsVertex* v, s
 
 void GxmGsRenderer::Pass(Variant variant, const SceGxmBlendInfo& blend, const GsDrawState& s,
                          const SceGxmTexture* texture, const float tex_scale[2], const void* vertices, u32 count,
-                         SceGxmDepthFunc depth_func, bool depth_write) {
+                         SceGxmDepthFunc depth_func, bool depth_write, Stencil stencil) {
     SceGxmFragmentProgram* program = Fragment(variant, blend);
     if (!program) return;
     SceGxmShaderPatcherId id = nullptr;
@@ -775,6 +806,23 @@ void GxmGsRenderer::Pass(Variant variant, const SceGxmBlendInfo& blend, const Gs
     sceGxmSetFragmentProgram(ctx, program);
     sceGxmSetFrontDepthFunc(ctx, depth_func);
     sceGxmSetFrontDepthWriteEnable(ctx, depth_write ? SCE_GXM_DEPTH_WRITE_ENABLED : SCE_GXM_DEPTH_WRITE_DISABLED);
+    switch (stencil) {
+        case Stencil::kOff:
+            sceGxmSetFrontStencilFunc(ctx, SCE_GXM_STENCIL_FUNC_ALWAYS, SCE_GXM_STENCIL_OP_KEEP, SCE_GXM_STENCIL_OP_KEEP,
+                                      SCE_GXM_STENCIL_OP_KEEP, 0xFF, 0xFF);
+            break;
+        case Stencil::kTest:
+            sceGxmSetFrontStencilFunc(ctx, SCE_GXM_STENCIL_FUNC_EQUAL, SCE_GXM_STENCIL_OP_KEEP, SCE_GXM_STENCIL_OP_KEEP,
+                                      SCE_GXM_STENCIL_OP_KEEP, 0xFF, 0x00);
+            sceGxmSetFrontStencilRef(ctx, 1);
+            break;
+        case Stencil::kClear:
+        case Stencil::kSet:
+            sceGxmSetFrontStencilFunc(ctx, SCE_GXM_STENCIL_FUNC_ALWAYS, SCE_GXM_STENCIL_OP_REPLACE,
+                                      SCE_GXM_STENCIL_OP_REPLACE, SCE_GXM_STENCIL_OP_REPLACE, 0xFF, 0xFF);
+            sceGxmSetFrontStencilRef(ctx, stencil == Stencil::kSet ? 1 : 0);
+            break;
+    }
     if (params->params || params->fog || params->tex_scale) {
         void* uniforms = nullptr;
         sceGxmReserveFragmentDefaultUniformBuffer(ctx, &uniforms);
@@ -862,6 +910,16 @@ void GxmGsRenderer::Flush() {
     }
     OpenScene(t, d);
     if (!scene_open_) return;
+    // The destination alpha test: the target's alpha bit into the stencil
+    // first, from a new scene (what it samples is the target's memory as
+    // the scene began: everything drawn before it).
+    if (s.date) {
+        CloseScene();
+        OpenScene(t, d);
+        if (!scene_open_) return;
+        DateSetup(t, s.datm);
+    }
+    const Stencil stencil = s.date ? Stencil::kTest : Stencil::kOff;
     // The scissor, inclusive, within the target.
     const int x0 = std::max(0, s.scissor_x0), y0 = std::max(0, s.scissor_y0);
     const int x1 = std::min(int(t->width) - 1, s.scissor_x1), y1 = std::min(int(t->height) - 1, s.scissor_y1);
@@ -887,22 +945,30 @@ void GxmGsRenderer::Flush() {
     // a second pass writes it.
     const bool factor_out = s.blend && s.c != BlendAlpha::Dest;
     const u32 alpha_out = !factor_out ? 0u : s.c == BlendAlpha::Fix ? 2u : 1u;
+    auto blended = [&](Variant v, u8 colour_mask, bool test_depth_write) {
+        const u8 colour = colour_mask & u8(SCE_GXM_COLOR_MASK_R | SCE_GXM_COLOR_MASK_G | SCE_GXM_COLOR_MASK_B);
+        if (factor_out && (colour_mask & SCE_GXM_COLOR_MASK_A)) {
+            if (colour)
+                Pass(v | (alpha_out << kAlphaOutShift), Blending(s, colour), s, texture, tex_scale, out, count,
+                     depth_func, false, stencil);
+            Pass(v, Plain(SCE_GXM_COLOR_MASK_A), s, texture, tex_scale, out, count, depth_func, test_depth_write,
+                 stencil);
+        } else {
+            Pass(v | (alpha_out << kAlphaOutShift), Blending(s, colour_mask), s, texture, tex_scale, out, count,
+                 depth_func, test_depth_write, stencil);
+        }
+    };
     auto draw = [&](Variant v, u8 colour_mask, bool test_depth_write) {
         if (!colour_mask && !test_depth_write) return;
         if (s.blend && colour_mask) {
-            const u8 colour = colour_mask & u8(SCE_GXM_COLOR_MASK_R | SCE_GXM_COLOR_MASK_G | SCE_GXM_COLOR_MASK_B);
-            if (factor_out && (colour_mask & SCE_GXM_COLOR_MASK_A)) {
-                if (colour)
-                    Pass(v | (alpha_out << kAlphaOutShift), Blending(s, colour), s, texture, tex_scale, out, count,
-                         depth_func, false);
-                Pass(v, Plain(SCE_GXM_COLOR_MASK_A), s, texture, tex_scale, out, count, depth_func, test_depth_write);
-            } else {
-                Pass(v | (alpha_out << kAlphaOutShift), Blending(s, colour_mask), s, texture, tex_scale, out, count,
-                     depth_func, test_depth_write);
-            }
+            if (!s.pabe) return blended(v, colour_mask, test_depth_write);
+            // PABE: blended where As >= 0x80, written as it is below.
+            blended(v | (1u << kPabeShift), colour_mask, test_depth_write);
+            Pass(v | (2u << kPabeShift), Plain(colour_mask), s, texture, tex_scale, out, count, depth_func,
+                 test_depth_write, stencil);
             return;
         }
-        Pass(v, Plain(colour_mask), s, texture, tex_scale, out, count, depth_func, test_depth_write);
+        Pass(v, Plain(colour_mask), s, texture, tex_scale, out, count, depth_func, test_depth_write, stencil);
     };
     if (s.alpha_test && s.atst != 1) {
         // The passing pixels with everything; the failing ones with what
@@ -919,6 +985,28 @@ void GxmGsRenderer::Flush() {
     } else {
         draw(base, mask, depth_write);
     }
+}
+
+void GxmGsRenderer::DateSetup(Target* t, u32 datm) {
+    // Over the whole target: the stencil cleared, then set where the alpha
+    // bit is DATM. Clip space corners, texture coordinates over the target:
+    // each pixel reads its own texel.
+    if (vertex_used_ + 6 * sizeof(GxmVertex) > kVertexRing) return;
+    GxmVertex* v = reinterpret_cast<GxmVertex*>(static_cast<u8*>(vertex_memory_.base) + vertex_used_);
+    vertex_used_ += 6 * sizeof(GxmVertex);
+    const float corners[6][4] = {{-1, -1, 0, 0}, {1, -1, 1, 0}, {-1, 1, 0, 1}, {1, -1, 1, 0}, {1, 1, 1, 1}, {-1, 1, 0, 1}};
+    for (int i = 0; i < 6; ++i) v[i] = GxmVertex{corners[i][0], corners[i][1], 0.0f, corners[i][2], corners[i][3], 1.0f,
+                                                 0, 0, 0, 0, 0xFF, {0, 0, 0}};
+    sceGxmSetRegionClip(device_->context(), SCE_GXM_REGION_CLIP_OUTSIDE, 0, 0, t->width - 1, t->height - 1);
+    SceGxmTexture own = t->texture;
+    sceGxmTextureSetMinFilter(&own, SCE_GXM_TEXTURE_FILTER_POINT);
+    sceGxmTextureSetMagFilter(&own, SCE_GXM_TEXTURE_FILTER_POINT);
+    sceGxmTextureSetUAddrMode(&own, SCE_GXM_TEXTURE_ADDR_CLAMP);
+    sceGxmTextureSetVAddrMode(&own, SCE_GXM_TEXTURE_ADDR_CLAMP);
+    const float one[2] = {1.0f, 1.0f};
+    GsDrawState none;
+    Pass(0, Plain(0), none, nullptr, one, v, 6, SCE_GXM_DEPTH_FUNC_ALWAYS, false, Stencil::kClear);
+    Pass(kDateSetup | (datm & 1u), Plain(0), none, &own, one, v, 6, SCE_GXM_DEPTH_FUNC_ALWAYS, false, Stencil::kSet);
 }
 
 void GxmGsRenderer::Kick() {
