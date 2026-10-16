@@ -419,6 +419,7 @@ void Report(const Options& options, const std::string& outcome) {
             std::printf("  %s\n", Describe(thread[i]).c_str());
     }
     std::printf("threads:\n%s%s", ThreadReport().c_str(), iop::Report().c_str());
+    std::printf("the host's threads: %s\n", Activities().c_str());
     if (!options.dump_ram.empty()) {
         if (std::FILE* f = std::fopen(options.dump_ram.c_str(), "wb")) {
             std::fwrite(GuestMemory().rdram(), 1, 32u << 20, f);
@@ -504,9 +505,31 @@ public:
         // Looked at twice a second for the player's stop (its flag is not
         // under this lock: a wake-up could be missed).
         const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
-        while (!finished_ && !g_report_stop.load() && std::chrono::steady_clock::now() < limit)
+        std::chrono::steady_clock::time_point held_since{};
+        while (!finished_ && !g_report_stop.load() && std::chrono::steady_clock::now() < limit) {
             done_.wait_for(lock, std::min<std::chrono::steady_clock::duration>(
                                      std::chrono::milliseconds(500), limit - std::chrono::steady_clock::now()));
+#ifdef __vita__
+            // L, R, SELECT and START held three seconds: the player's stop
+            // (RequestReportStop). Looked at here, on the watchdog's own
+            // thread, so it works when the EE's thread is stuck too.
+            constexpr std::uint16_t kCombo = (1u << 0) | (1u << 3) | (1u << 10) | (1u << 11);
+            ps2plat::ControllerState pad;
+            if (ps2plat::ReadController(&pad) && (pad.buttons & kCombo) == kCombo) {
+                const auto now = std::chrono::steady_clock::now();
+                if (held_since == std::chrono::steady_clock::time_point{}) held_since = now;
+                else if (now - held_since >= std::chrono::seconds(3)) {
+                    lock.unlock();
+                    RequestReportStop("L, R, SELECT and START held - the player stopped the run");
+                    lock.lock();
+                }
+            } else {
+                held_since = {};
+            }
+#else
+            (void)held_since;
+#endif
+        }
         if (!finished_) {
             fired = !g_report_stop.load();
             StopRequested() = true;
@@ -516,14 +539,14 @@ public:
             // A run that does not stop is stuck in host code (no guest loop
             // head comes): say where the guest was, rather than be killed
             // without a word.
-            if (!done_.wait_for(lock, std::chrono::seconds(20), [this] { return finished_; })) {
+            if (!done_.wait_for(lock, std::chrono::seconds(fired ? 20 : 10), [this] { return finished_; })) {
                 u32 calls[32];
                 const int n = GuestCallsNow(calls, 32);
-                std::fprintf(stderr, "\n=== host report ===\nstuck: the run did not stop 20 s after %s "
-                                     "- the host is in a loop of its own\nguest call stack (innermost first):",
-                             fired ? "its time limit" : "the player stopped it");
+                std::fprintf(stderr, "\n=== host report ===\nstuck: the run did not stop %d s after %s "
+                                     "- the host is in a loop or a wait of its own\nguest call stack (innermost first):",
+                             fired ? 20 : 10, fired ? "its time limit" : "the player stopped it");
                 for (int i = 0; i < n; ++i) std::fprintf(stderr, " 0x%08X", unsigned(calls[i]));
-                std::fprintf(stderr, "\n");
+                std::fprintf(stderr, "\nthe host's threads: %s\n", Activities().c_str());
                 std::fflush(nullptr);
                 // PS2HOST_STUCK_RAM=file: EE RAM as it stands, to look into.
                 if (const char* path = std::getenv("PS2HOST_STUCK_RAM")) {
@@ -533,8 +556,9 @@ public:
                         std::fprintf(stderr, "EE RAM written to %s\n", path);
                     }
                 }
-                // The IOP's threads too (read while it runs: a diagnostic, last).
-                std::fprintf(stderr, "%s", iop::Report().c_str());
+                // The guest's threads and the IOP's too (read while they may
+                // still change: a diagnostic, last).
+                std::fprintf(stderr, "threads:\n%s%s", ThreadReport().c_str(), iop::Report().c_str());
                 std::fflush(nullptr);
                 std::_Exit(3);
             }

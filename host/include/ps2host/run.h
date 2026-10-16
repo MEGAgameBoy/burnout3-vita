@@ -212,6 +212,25 @@ void SetVif1Worker(bool on);
    screen counting frames while it loads (a game's hook turns it on and
    off). */
 void SetFastForward(unsigned factor);
+/* What the host's threads are doing, for a run that hangs - the stuck
+   report says it, the guest's call stack alone cannot (a wait in host code):
+   each sets a string literal at the waits that could hang. */
+enum class HostLane : int { kEe, kGs, kVif1, kCount };
+void SetActivity(HostLane lane, const char* what);
+/* "EE: ...; GS thread: ...; VIF1's worker: ..." (and the GPU's, with GXM). */
+std::string Activities();
+/* A lane's activity for a scope, the one before restored after. */
+class Activity {
+public:
+    Activity(HostLane lane, const char* what);
+    ~Activity();
+    Activity(const Activity&) = delete;
+    Activity& operator=(const Activity&) = delete;
+private:
+    HostLane lane_;
+    const char* before_;
+};
+
 /* Stops the run where it is, with its report (the guest's call stack, the
    threads, the IOP's, the functions called most) as a time limit would:
    the player's way to say where a game that seems stuck is (the Vita: L,

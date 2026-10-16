@@ -147,6 +147,7 @@ struct Feed {
         const u64 at = head.load(std::memory_order_relaxed);
         if (at + words - tail.load(std::memory_order_acquire) <= kRing) return;
         Timed timed(Section::GsWait);
+        Activity activity(HostLane::kEe, "waiting for room in the GS thread's ring");
         while (at + words - tail.load(std::memory_order_acquire) > kRing) {
             Rethrow();
             std::this_thread::yield();
@@ -165,6 +166,7 @@ struct Feed {
         const u64 target = head.load(std::memory_order_relaxed);
         if (tail.load(std::memory_order_acquire) >= target) return Rethrow();
         Timed timed(Section::GsWait);
+        Activity activity(HostLane::kEe, "waiting for the GS thread to catch up");
         for (int spins = 0; tail.load(std::memory_order_acquire) < target; ++spins) {
             Rethrow();
             if (spins < 4096) Pause();
@@ -185,6 +187,7 @@ struct Feed {
                     h = head.load(std::memory_order_acquire);
                 }
                 if (t == h) {
+                    SetActivity(HostLane::kGs, "waiting for work");
                     std::unique_lock<std::mutex> lock(mutex);
                     sleeping = true;
                     wake.wait(lock, [&] { return stop.load() || head.load() != tail.load(); });
@@ -205,6 +208,7 @@ struct Feed {
                                        u64(std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count()));
                 }
             } busy{began};
+            SetActivity(HostLane::kGs, "drawing");
             try {
                 while (t < h) {
                     const u32 at = u32(t % kRing);
@@ -233,7 +237,9 @@ struct Feed {
                             if (g_frame_handler) {
                                 const u64 frame = u64(e[1]) | u64(e[2]) << 32;
                                 const u64 took = g_hitch ? ClockNs() : 0;
+                                SetActivity(HostLane::kGs, "a frame's end (the renderer's frame, the picture shown)");
                                 g_frame_handler(frame);
+                                SetActivity(HostLane::kGs, "drawing");
                                 if (g_hitch) HitchFrame(frame, took, ClockNs());
                             }
                             size = 3;

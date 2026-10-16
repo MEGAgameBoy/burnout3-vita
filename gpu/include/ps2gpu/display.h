@@ -180,6 +180,9 @@ std::unique_ptr<Display> CreateVulkanDisplay(const char* title, int width, int h
 /* The Vita's screen through GXM (engine/gpu/gxm); null, with `error` saying
    why, when GXM or the display's programs cannot be had (no libshacccg). */
 std::unique_ptr<Display> CreateGxmDisplay(std::string* error);
+/* What the GXM code is waiting on now, for a run that hangs ("-" when it is
+   not waiting): the GPU's finish, the display queue. */
+const char* GxmActivity();
 
 }  // namespace ps2gpu
 

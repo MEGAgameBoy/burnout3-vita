@@ -46,6 +46,9 @@
 #include "ps2host/run.h"
 #include "ps2host/profile.h"
 #include "ps2plat/platform.h"
+#if PS2HOST_GXM
+#include "ps2gpu/display.h"
+#endif
 
 namespace ps2host {
 
@@ -319,6 +322,7 @@ void IopFrameSpent(std::chrono::steady_clock::duration spent) {
 // One frame's interrupts, delivered to the handlers registered for them.
 bool DeliverFrame() {
     Scheduler& s = S();
+    Activity activity(HostLane::kEe, "a frame's interrupts (the IOP, the handlers)");
     ++s.frames;
     g_intc_stat.fetch_or((1u << kVblankStart) | (1u << kVblankEnd), std::memory_order_relaxed);
     if (s.virtual_time && g_real_time_from && s.frames >= g_real_time_from) StartRealTime();
@@ -859,6 +863,7 @@ void RunThreads(const lifted::Context& initial, u32 entry, s64 loop_budget) {
                 // asks it for a file piece by piece sat idle between pieces.
                 // An answer it sends wakes the EE at once.
                 const auto idle_from = std::chrono::steady_clock::now();
+                Activity activity(HostLane::kEe, "idle: every guest thread waits (the IOP runs meanwhile)");
                 while (!s.vblank_due && !s.timer_due && !StopRequested()) {
                     {
                         Timed timed(Section::Iop);
@@ -1151,6 +1156,29 @@ bool ThreadSyscall(lifted::Context& c, s32 number, u64& result) {
         default:
             return false;
     }
+}
+
+namespace {
+std::atomic<const char*> g_activity[int(HostLane::kCount)] = {};
+}  // namespace
+
+void SetActivity(HostLane lane, const char* what) { g_activity[int(lane)].store(what, std::memory_order_relaxed); }
+
+Activity::Activity(HostLane lane, const char* what)
+    : lane_(lane), before_(g_activity[int(lane)].exchange(what, std::memory_order_relaxed)) {}
+Activity::~Activity() { g_activity[int(lane_)].store(before_, std::memory_order_relaxed); }
+
+std::string Activities() {
+    static const char* const kNames[] = {"EE", "GS thread", "VIF1's worker"};
+    std::string out;
+    for (int i = 0; i < int(HostLane::kCount); ++i) {
+        const char* what = g_activity[i].load(std::memory_order_relaxed);
+        out += std::string(i ? "; " : "") + kNames[i] + ": " + (what ? what : "-");
+    }
+#if PS2HOST_GXM
+    out += std::string("; GPU: ") + ps2gpu::GxmActivity();
+#endif
+    return out;
 }
 
 void SetIopShare(unsigned percent) {

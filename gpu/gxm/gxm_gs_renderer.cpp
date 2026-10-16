@@ -786,7 +786,9 @@ void GxmGsRenderer::Idle() {
     Flush();
     CloseScene();
     const u64 from = WaitClock();
+    SetGxmActivity("the renderer waiting for the GPU to finish");
     sceGxmFinish(device_->context());
+    SetGxmActivity(nullptr);
     if (g_wait_observer) g_wait_observer("the GPU", from, WaitClock());
     ++waits_;
     ++g_waits;

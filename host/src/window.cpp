@@ -445,24 +445,6 @@ bool HostPad(HostPadState* state) {
 }
 
 void StatusFrame(u64 frame) {
-#ifdef __vita__
-    // L, R, SELECT and START held for three seconds: the run stops with its
-    // report in the log (RequestReportStop) - where a game that seems stuck
-    // is, its threads, the IOP's.
-    {
-        static std::chrono::steady_clock::time_point held_since{};
-        constexpr std::uint16_t kCombo = (1u << 0) | (1u << 3) | (1u << 10) | (1u << 11);
-        ps2plat::ControllerState pad;
-        if (ps2plat::ReadController(&pad) && (pad.buttons & kCombo) == kCombo) {
-            const auto now = std::chrono::steady_clock::now();
-            if (held_since == std::chrono::steady_clock::time_point{}) held_since = now;
-            else if (now - held_since >= std::chrono::seconds(3))
-                RequestReportStop("L, R, SELECT and START held - the player stopped the run");
-        } else {
-            held_since = {};
-        }
-    }
-#endif
 #ifdef PS2HOST_VULKAN
     if (g_display) return;
 #endif

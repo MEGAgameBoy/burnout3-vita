@@ -38,6 +38,9 @@ void Release(Memory* memory);
 
 /* What the display queue's callback is given with each picture
    (sceGxmDisplayQueueAddEntry): the buffer to show from the next refresh. */
+/* What the GXM code waits on now (ps2gpu::GxmActivity): a string literal, or null. */
+void SetGxmActivity(const char* what);
+
 struct DisplayEntry {
     void* address;
     std::uint32_t width, height, pitch;

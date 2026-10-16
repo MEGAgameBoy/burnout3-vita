@@ -70,9 +70,11 @@ struct Worker {
         for (;;) {
             std::function<void()> command;
             {
+                SetActivity(HostLane::kVif1, "waiting for work");
                 std::unique_lock<std::mutex> lock(mutex);
                 wake.wait(lock, [&] { return stop || !queue.empty(); });
                 if (queue.empty()) return;          // stopping, all run
+                SetActivity(HostLane::kVif1, "running VIF1 (and VU1)");
                 command = std::move(queue.front());
                 queue.pop_front();
             }
@@ -169,6 +171,7 @@ void Vif1Run(std::function<void()> command) {
     std::unique_lock<std::mutex> lock(w.mutex);
     if (w.pending.load() >= kMaxQueued) {
         Timed timed(Section::GsWait);
+        Activity activity(HostLane::kEe, "waiting for room in VIF1's worker's queue");
         Waited waited{g_full_us};
         w.drained.wait(lock, [&] { return w.pending.load() < kMaxQueued / 2; });
     }
@@ -190,6 +193,7 @@ void Vif1RunFrame(std::function<void()> command) {
     constexpr int kFramesBehind = 2;
     if (w.frames.load() >= kFramesBehind) {
         Timed timed(Section::GsWait);
+        Activity activity(HostLane::kEe, "waiting for VIF1's worker to come within two frames");
         Waited waited{g_frame_wait_us};
         std::unique_lock<std::mutex> lock(w.mutex);
         w.drained.wait(lock, [&] { return w.frames.load() < kFramesBehind; });
@@ -229,6 +233,7 @@ void JoinVif1(const char* why, u32 address) {
     Worker& w = *g_worker;
     if (w.pending.load(std::memory_order_acquire) != 0) {
         Timed timed(Section::GsWait);
+        Activity activity(HostLane::kEe, "waiting for VIF1's worker");
         const auto began = std::chrono::steady_clock::now();
         {
             std::unique_lock<std::mutex> lock(w.mutex);
