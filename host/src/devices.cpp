@@ -693,7 +693,7 @@ void InstallDevices() {
     });
     Vif1().on_mask_path3 = [](bool masked) {
         if (gs::TheGs().trace)
-            std::fprintf(stderr, "[vif1] MSKPATH3 %d, %zu PATH3 words held\n", int(masked), g_path3_held.size());
+            std::fprintf(stderr, "[vif1] MSKPATH3 %d, %llu PATH3 words held\n", int(masked), (unsigned long long)g_path3_held.size());
         u32* stat = reinterpret_cast<u32*>(GuestMemory().Translate(kGifStat, 4));
         // Unmasking lets PATH3 take its turn: the packet group it is in goes
         // through before a mask can stop it again.
@@ -710,7 +710,7 @@ void InstallDevices() {
         GsWords(2, copy.data(), count, from);
     };
     Vif1().on_trace = [](const char* what) {
-        if (gs::TheGs().trace) std::fprintf(gs::TheGs().trace_out, "[vif1] %s, %zu PATH3 words held\n", what, g_path3_held.size());
+        if (gs::TheGs().trace) std::fprintf(gs::TheGs().trace_out, "[vif1] %s, %llu PATH3 words held\n", what, (unsigned long long)g_path3_held.size());
         // FLUSHA waits for PATH3 to finish: unmasked, all it holds goes.
         if (!g_path3_masked) ReleasePath3(true);
     };

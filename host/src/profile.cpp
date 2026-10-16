@@ -319,7 +319,8 @@ std::string SampleReport(int top) {
                 counted[i] = in;
                 kept += in;
             }
-            std::fprintf(stderr, "sample: %zu of %zu samples in %zu spans\n", kept, samples, s.spans.size());
+            std::fprintf(stderr, "sample: %llu of %llu samples in %llu spans\n", (unsigned long long)kept, (unsigned long long)samples,
+                         (unsigned long long)s.spans.size());
         }
     }
     for (std::size_t i = 0; i < samples; ++i) {
@@ -373,8 +374,8 @@ std::string SampleReport(int top) {
     std::string out;
     char line[512];
     if (guest_samples) {
-        std::snprintf(line, sizeof line, "sample: %zu with a guest call stack\n  guest, anywhere on the stack:\n",
-                      guest_samples);
+        std::snprintf(line, sizeof line, "sample: %llu with a guest call stack\n  guest, anywhere on the stack:\n",
+                      (unsigned long long)guest_samples);
         out += line;
         const auto by_guest = ranked(guest_total);
         for (int i = 0; i < top && i < int(by_guest.size()); ++i) {
@@ -397,7 +398,7 @@ std::string SampleReport(int top) {
             out += line;
         }
     }
-    std::snprintf(line, sizeof line, "sample: %zu samples (1 ms apart)\n  self:\n", samples);
+    std::snprintf(line, sizeof line, "sample: %llu samples (1 ms apart)\n  self:\n", (unsigned long long)samples);
     out += line;
     const auto by_self = ranked(self);
     for (int i = 0; i < top && i < int(by_self.size()); ++i) {

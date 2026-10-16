@@ -1278,7 +1278,8 @@ void VuFastIsTheExactButFlags() {
             ++runs;
             if (a != b || !exact->SameState(*fast, false) || !fast->compiled_pairs()) {
                 ++wrong;
-                std::fprintf(stderr, "[fast] program %zu entry %X trial %d: pairs %llu %llu, compiled %llu\n", i,
+                std::fprintf(stderr, "[fast] program %llu entry %X trial %d: pairs %llu %llu, compiled %llu\n",
+                             (unsigned long long)i,
                              program.entry, trial, (unsigned long long)a, (unsigned long long)b,
                              (unsigned long long)fast->compiled_pairs());
                 for (int r = 0; r < 32; ++r)

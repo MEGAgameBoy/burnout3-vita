@@ -124,7 +124,7 @@ int GsReplay(const std::string& file, const std::string& out) {
                 g.WriteBmp(out + "/replay_" + std::to_string(pictures++) + ".bmp");
             }
         } else {
-            std::fprintf(stderr, "gs-replay: bad record at %zu\n", at - 1);
+            std::fprintf(stderr, "gs-replay: bad record at %llu\n", (unsigned long long)(at - 1));
             return 65;
         }
     }
@@ -401,7 +401,7 @@ u32 LoadBootElf() {
 void Report(const Options& options, const std::string& outcome) {
     const Stats& stats = RunStats();
     std::printf("\n=== host report ===\n%s\n", outcome.c_str());
-    std::printf("functions executed: %zu distinct\n", stats.calls.size());
+    std::printf("functions executed: %llu distinct\n", (unsigned long long)stats.calls.size());
     const std::vector<u32>& stack = stats.stopped_in;
     if (!stack.empty()) {
         std::printf("guest call stack where it stopped (innermost last):\n");
@@ -451,7 +451,7 @@ void Report(const Options& options, const std::string& outcome) {
         std::printf("  %4d  %-24s x%llu\n", service, SyscallName(service),
                     (unsigned long long)count);
     auto registers = [&](const char* title, const std::map<u32, u64>& seen) {
-        std::printf("%s: %zu\n", title, seen.size());
+        std::printf("%s: %llu\n", title, (unsigned long long)seen.size());
         int shown = 0;
         for (const auto& [address, count] : seen) {
             if (shown++ == options.report_limit) break;

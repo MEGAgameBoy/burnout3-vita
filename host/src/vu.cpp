@@ -729,7 +729,7 @@ int Vu::Bench(const std::string& path, int passes, bool fast) {
             const u64 total = vu.Run(runs[n].s.pc);
             const int q = holds();
             if (q < 0) continue;
-            std::printf("run %zu (pc %04X, %llu pairs) stores it at quadword %d\n", n, runs[n].s.pc,
+            std::printf("run %llu (pc %04X, %llu pairs) stores it at quadword %d\n", (unsigned long long)n, runs[n].s.pc,
                         (unsigned long long)total, q);
             u64 lo = 0, hi = total;                     // after hi pairs it is there; after lo not
             while (hi - lo > 1) {
@@ -796,8 +796,8 @@ int Vu::Bench(const std::string& path, int passes, bool fast) {
         pairs = pass_pairs;
         hash = pass_hash;
     }
-    std::printf("vu-bench: %zu runs, %llu pairs, best pass %.1f ms, %.2f ns a pair; state hash %016llX\n",
-                runs.size(), (unsigned long long)pairs, best * 1000, pairs ? best * 1e9 / double(pairs) : 0.0,
+    std::printf("vu-bench: %llu runs, %llu pairs, best pass %.1f ms, %.2f ns a pair; state hash %016llX\n",
+                (unsigned long long)runs.size(), (unsigned long long)pairs, best * 1000, pairs ? best * 1e9 / double(pairs) : 0.0,
                 (unsigned long long)hash);
     return 0;
 }

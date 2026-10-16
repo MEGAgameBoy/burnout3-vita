@@ -213,8 +213,9 @@ void Finish() {
     std::vector<double> intervals;
     for (std::size_t i = 1; i < shown.size(); ++i) intervals.push_back(double(shown[i] - shown[i - 1]) / 1e6);
     std::fprintf(stderr, "\n=== frame pacing (PS2HOST_PROFILE) ===\n");
-    std::fprintf(stderr, "%zu blanks, %zu pictures shown, %u dropped before they were shown, %zu blanks lost by the EE\n",
-                 g_blanks.size(), shown.size(), dropped, g_lost.size());
+    std::fprintf(stderr, "%llu blanks, %llu pictures shown, %u dropped before they were shown, %llu blanks lost by the EE\n",
+                 (unsigned long long)g_blanks.size(), (unsigned long long)shown.size(), dropped,
+                 (unsigned long long)g_lost.size());
     if (intervals.empty()) {
         std::fprintf(stderr, "no pictures shown (no window, or the software GS's): the blanks alone\n");
         std::vector<double> gaps;

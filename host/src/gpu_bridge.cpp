@@ -1599,7 +1599,7 @@ void OpenTexturePack() {
     texture_pack::SetBlockCompression(g_bridge->renderer->BlockCompression());
     const std::size_t files = texture_pack::Open(dir);
     if (files)
-        std::fprintf(stderr, "[texture pack] %zu textures in %s (%s; Tab turns it on and off)\n", files, dir.c_str(),
+        std::fprintf(stderr, "[texture pack] %llu textures in %s (%s; Tab turns it on and off)\n", (unsigned long long)files, dir.c_str(),
                      texture_pack::Enabled() ? "on" : "off");
 }
 
@@ -1728,10 +1728,11 @@ void GpuShadowFrame(u64 frame, const std::string& dump_dir) {
             s.renderer->Kick();
         }
         if (frame % 100 == 0)
-            std::fprintf(stderr, "[gpu] frame %llu: %llu draws, %llu write-backs, %llu reloads, %llu decodes, %zu images, %zu textures\n",
+            std::fprintf(stderr, "[gpu] frame %llu: %llu draws, %llu write-backs, %llu reloads, %llu decodes, %llu images, %llu textures\n",
                          static_cast<unsigned long long>(frame), static_cast<unsigned long long>(s.serial),
                          static_cast<unsigned long long>(s.write_backs), static_cast<unsigned long long>(s.reloads),
-                         static_cast<unsigned long long>(s.decodes), s.owned.size(), s.textures.size());
+                         static_cast<unsigned long long>(s.decodes), static_cast<unsigned long long>(s.owned.size()),
+                         static_cast<unsigned long long>(s.textures.size()));
         if (frame % 300 == 0 && std::getenv("PS2HOST_GPU_PROFILE"))
             std::fprintf(stderr, "[gpu] frame %llu: %s\n", static_cast<unsigned long long>(frame),
                          ps2gpu::GpuProfileReport().c_str());

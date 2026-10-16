@@ -119,7 +119,7 @@ std::vector<std::string> RunArguments(const std::string& path) {
         }
     }
     if (any) args.push_back(arg);
-    if (!args.empty()) std::fprintf(stderr, "[port] %zu options from %s\n", args.size(), path.c_str());
+    if (!args.empty()) std::fprintf(stderr, "[port] %llu options from %s\n", (unsigned long long)args.size(), path.c_str());
     return args;
 }
 
