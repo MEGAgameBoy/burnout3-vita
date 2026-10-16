@@ -55,9 +55,12 @@ void* UsseBase(SceUID uid) {
 void* PatcherHostAlloc(void*, unsigned int size) { return std::malloc(size); }
 void PatcherHostFree(void*, void* memory) { std::free(memory); }
 
-/* The display queue's: a finished picture shown from the next refresh. No
-   wait for the refresh here - the game paces its pictures by its own blanks;
-   one finished sooner replaces one not yet shown. */
+/* The display queue's: a finished picture shown from the next refresh, the
+   queue's thread waiting for it - so the queue drains at the screen's pace,
+   and a display that finds it full (a loading screen's blanks eight times
+   as fast) drops its picture rather than draw one the screen never shows:
+   without the wait, 320 a second were drawn, the buffers turned over faster
+   than the screen took them. */
 void DisplayCallback(const void* data) {
     const DisplayEntry* entry = static_cast<const DisplayEntry*>(data);
     SceDisplayFrameBuf frame{};
@@ -68,6 +71,8 @@ void DisplayCallback(const void* data) {
     frame.width = entry->width;
     frame.height = entry->height;
     sceDisplaySetFrameBuf(&frame, SCE_DISPLAY_SETBUF_NEXTFRAME);
+    sceDisplayWaitSetFrameBuf();
+    if (entry->pending) entry->pending->fetch_sub(1, std::memory_order_release);
 }
 
 // ------------------------------------------------------------ the compiler

@@ -109,17 +109,38 @@ def build_gcc(sources, include_dirs, library: str, work_dir: str, parallel: int 
     """The sources compiled with g++ (in parallel, `parallel` at once; all the
     cores when 0) and linked into a shared library at `library`; its path.
     CompileError with the compiler's errors otherwise."""
+    import hashlib
     from concurrent.futures import ThreadPoolExecutor
     compiler = os.environ.get("CXX", "g++")
     includes = ["-I" + os.path.abspath(d) for d in include_dirs]
+    flags = GCC_FLAGS + [optimise] + includes
+    # Objects are kept by what went into them (the source, the headers, the
+    # flags): a run cut short - a machine restarted - builds again only what
+    # changed, not the hour of lifted code it had already compiled.
+    cache = os.path.join(work_dir, "objects")
+    os.makedirs(cache, exist_ok=True)
+    headers = hashlib.sha1()
+    for directory in include_dirs:
+        for root, _dirs, files in sorted(os.walk(directory)):
+            for name in sorted(files):
+                with open(os.path.join(root, name), "rb") as handle:
+                    headers.update(name.encode() + handle.read())
     objects = []
-    for index, source in enumerate(sources):
-        objects.append(os.path.join(work_dir, "%s.%d.o" % (os.path.basename(library), index)))
+    for source in sources:
+        key = hashlib.sha1(" ".join([compiler] + flags).encode() + headers.digest())
+        with open(source, "rb") as handle:
+            key.update(handle.read())
+        objects.append(os.path.join(cache, key.hexdigest() + ".o"))
 
     def compile_one(pair):
         source, obj = pair
-        return subprocess.run([compiler] + GCC_FLAGS + [optimise] + includes + ["-c", source, "-o", obj],
-                              capture_output=True, text=True)
+        if os.path.exists(obj):
+            return subprocess.CompletedProcess([], 0, "", "")
+        result = subprocess.run([compiler] + flags + ["-c", source, "-o", obj + ".part"],
+                                capture_output=True, text=True)
+        if result.returncode == 0:
+            os.replace(obj + ".part", obj)
+        return result
 
     workers = parallel or os.cpu_count() or 2
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -132,9 +153,12 @@ def build_gcc(sources, include_dirs, library: str, work_dir: str, parallel: int 
         failed = linked.returncode != 0
     with open(os.path.join(work_dir, log_name), "w", encoding="utf-8") as handle:
         handle.write(log)
-    for obj in objects:
-        if os.path.exists(obj):
-            os.remove(obj)
+    # The cache holds what the last few builds made, no more.
+    kept = set(objects)
+    made = sorted((os.path.getmtime(os.path.join(cache, n)), n) for n in os.listdir(cache) if n.endswith(".o"))
+    for _when, name in made[:-4 * max(1, len(objects))]:
+        if os.path.join(cache, name) not in kept:
+            os.remove(os.path.join(cache, name))
     if failed:
         errors = [line for line in log.splitlines() if " error: " in line or "fatal error" in line]
         raise CompileError("\n".join(errors) or log[-2000:])

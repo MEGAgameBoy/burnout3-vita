@@ -57,21 +57,18 @@ void Spu2::Level::Step() {
     const bool exponential = (reg & 0x4000) != 0, decreasing = (reg & 0x2000) != 0, negative = (reg & 0x1000) != 0;
     s32 magnitude = now < 0 ? -now : now;
     const u32 shift = rate >> 2;
-    s32 step = decreasing ? -8 + s32(rate & 3) : 7 - s32(rate & 3);
-    if (shift < 11) step <<= 11 - shift;
+    // The counter first: most samples of a slow sweep step nothing, and the
+    // step's own arithmetic is wanted only when one does.
+    const bool slowed = exponential && !decreasing && magnitude >= 0x6000;     // near the top, going up
     u32 increment = shift > 11 ? (shift - 11 >= 16 ? 0 : 0x8000u >> (shift - 11)) : 0x8000u;
-    if (exponential) {
-        if (decreasing) {
-            step = s32((std::int64_t(step) * magnitude) >> 15);
-        } else if (magnitude >= 0x6000) {
-            if (shift < 10) step >>= 2;
-            else if (shift >= 11) increment >>= 2;
-            else { step >>= 1; increment >>= 1; }
-        }
-    }
+    if (slowed && shift >= 10) increment >>= shift >= 11 ? 2 : 1;
     counter += increment;
     if (counter < 0x8000) return;
     counter = 0;
+    s32 step = decreasing ? -8 + s32(rate & 3) : 7 - s32(rate & 3);
+    if (shift < 11) step <<= 11 - shift;
+    if (exponential && decreasing) step = s32((std::int64_t(step) * magnitude) >> 15);
+    else if (slowed && shift < 11) step >>= shift < 10 ? 2 : 1;
     magnitude = std::min(0x7FFF, std::max(0, magnitude + step));
     now = negative ? -magnitude : magnitude;
     // At its end a sweep stays there (a step down from 0 or up from full is
@@ -609,12 +606,18 @@ void Spu2::Advance(u64 now_us, const std::function<void(u32 core)>& irq) {
     for (u32 n = 0; n < count; ++n) {
         s32 left = 0, right = 0;
         const u32 capture_offset = u32((first_sample + n) & 511) * 2;
+        // A sample's two bytes at IRQA raise the interrupt (CheckIrq): looked
+        // at here first, some sixteen times a sample, without a call.
+        auto irq_at = [&](u32 address) {
+            return (cores_[0].irq_enabled && cores_[0].irqa - address < 2u) ||
+                   (cores_[1].irq_enabled && cores_[1].irqa - address < 2u);
+        };
         auto capture = [&](u32 base, s32 sample) {
             const u32 address = base + capture_offset;
             const u16 value = u16(s16(Clamp16(sample)));
             ram_[address] = u8(value);
             ram_[address + 1] = u8(value >> 8);
-            CheckIrq(0, address, address + 2, irq);
+            if (irq_at(address)) CheckIrq(0, address, address + 2, irq);
         };
         for (u32 core = 0; core < 2; ++core) {
             Core& c = cores_[core];
@@ -623,6 +626,24 @@ void Spu2::Advance(u64 now_us, const std::function<void(u32 core)>& irq) {
                 Voice& v = c.voices[i];
                 if ((v.left.reg & 0x8000) && !v.left.settled) v.left.Step();     // a sweep (Step's own test, without the call)
                 if ((v.right.reg & 0x8000) && !v.right.settled) v.right.Step();
+                if (v.phase == Phase::Off) {
+                    // Silent: no sample to make - only its address running on
+                    // through its blocks (their flags, ENDX, the interrupt),
+                    // which drivers time things by. Its decoder's samples and
+                    // the one before are a key-on's to set afresh (Start): not
+                    // kept up meanwhile, which was most of the SPU2's time at
+                    // Burnout 3's boot (42 voices so, none heard).
+                    if (i == 1) capture(core == 0 ? 0x0800 : 0x1800, 0);
+                    if (i == 3) capture(core == 0 ? 0x0C00 : 0x1C00, 0);
+                    if (!v.pitch) continue;
+                    ++work_.silent;
+                    v.counter += v.pitch;
+                    while (v.counter >= kBlockSpan) {
+                        v.counter -= kBlockSpan;
+                        NextBlock(c, i, irq);
+                    }
+                    continue;
+                }
                 s32 shaped = 0;
                 if (v.pitch && v.phase != Phase::Off) {
                     ++work_.heard;
@@ -640,7 +661,6 @@ void Spu2::Advance(u64 now_us, const std::function<void(u32 core)>& irq) {
                 if (i == 1) capture(core == 0 ? 0x0800 : 0x1800, shaped);
                 if (i == 3) capture(core == 0 ? 0x0C00 : 0x1C00, shaped);
                 if (!v.pitch) continue;
-                if (v.phase == Phase::Off) ++work_.silent;
                 const u32 before_index = v.counter >> 12;
                 s32 last = v.samples[before_index];
                 bool crossed = false;
@@ -662,7 +682,7 @@ void Spu2::Advance(u64 now_us, const std::function<void(u32 core)>& irq) {
             capture(mix_base + 0xC00, wet_right);
             auto pcm = [&](u32 base) {
                 const u32 address = base + capture_offset;
-                CheckIrq(0, address, address + 2, irq);
+                if (irq_at(address)) CheckIrq(0, address, address + 2, irq);
                 return s32(s16(u16(ram_[address]) | u16(ram_[address + 1]) << 8));
             };
             const u32 input_base = core == 0 ? 0x4000 : 0x4800;

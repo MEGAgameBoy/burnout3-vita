@@ -33,6 +33,7 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -379,12 +380,17 @@ void FrameTimes(u64 frame) {
     using Clock = std::chrono::steady_clock;
     static Clock::time_point last = Clock::now();
     static u64 last_frame = 0, last_transfers = 0, last_lost = 0, last_idle = 0, last_worker_us = 0, last_gs_us = 0;
-    if (!g_frame_times || frame < last_frame + g_frame_times) return;
+    if (!g_frame_times) return;
+    // Every N frames - or, in real time, every ten seconds when frames come
+    // slower than that (a game crawling says so while it crawls).
+    if (frame < last_frame + g_frame_times &&
+        (VirtualClock() || Clock::now() - last < std::chrono::seconds(10)))
+        return;
     const u64 lost = LostVblanks(), idle = IdleNanoseconds(), worker_us = Vif1BusyMicroseconds();
     const u64 gs_us = GsBusyMicroseconds();
     const Clock::time_point now = Clock::now();
     const double seconds = std::chrono::duration<double>(now - last).count();
-    char job_text[1024] = "";
+    char job_text[1536] = "";
     if (seconds > 0)
         std::snprintf(job_text, sizeof job_text, "%s, GS thread busy %d%%",
                       worker_us != last_worker_us
@@ -442,6 +448,26 @@ void FrameTimes(u64 frame) {
         }
         last_iop_s = iop_s;
         last_spu2_s = spu2_s;
+    }
+    // The guest's functions called most since the last line: where a game
+    // that crawls spends its time, when it is calls (a loop's callee).
+    {
+        static std::map<u32, u64> before;
+        std::vector<std::pair<u64, u32>> hot;
+        for (const auto& [address, count] : RunStats().calls) {
+            u64& was = before[address];
+            if (count > was) hot.push_back({count - was, address});
+            was = count;
+        }
+        const std::size_t shown = std::min<std::size_t>(5, hot.size());
+        std::partial_sort(hot.begin(), hot.begin() + shown, hot.end(), std::greater<>());
+        if (shown && seconds > 0) {
+            std::size_t used = std::strlen(job_text);
+            used += std::snprintf(job_text + used, sizeof job_text - used, "; called most:");
+            for (std::size_t i = 0; i < shown && used < sizeof job_text; ++i)
+                used += std::snprintf(job_text + used, sizeof job_text - used, " %08X x%.0f/s", unsigned(hot[i].second),
+                                      double(hot[i].first) / seconds);
+        }
     }
     static u64 last_guesses = 0;
     u64 guesses = 0, wrong = 0;

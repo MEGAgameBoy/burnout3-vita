@@ -132,6 +132,7 @@ private:
 
     std::deque<std::chrono::steady_clock::time_point> presented_;
     std::atomic<double> presents_per_second_{0.0};
+    std::atomic<std::int32_t> pending_{0};      // queued for the screen, not yet shown (DisplayCallback)
 };
 
 SceGxmFragmentProgram* GxmDisplay::MakeFragment(SceGxmShaderPatcherId id, std::string* error) {
@@ -283,6 +284,9 @@ bool GxmDisplay::PresentImage(std::uint64_t image, int layout, std::uint32_t wid
 }
 
 void GxmDisplay::Show(SceGxmTexture texture, float scale_u, float scale_v) {
+    // Two pictures already wait for the screen: this one would only wait
+    // behind them (the newest goes at the next present).
+    if (pending_.load(std::memory_order_acquire) >= 2) return;
     sceGxmTextureSetMinFilter(&texture, SCE_GXM_TEXTURE_FILTER_LINEAR);
     sceGxmTextureSetMagFilter(&texture, SCE_GXM_TEXTURE_FILTER_LINEAR);
     sceGxmTextureSetUAddrMode(&texture, SCE_GXM_TEXTURE_ADDR_CLAMP);
@@ -371,7 +375,8 @@ void GxmDisplay::Show(SceGxmTexture texture, float scale_u, float scale_v) {
     }
     sceGxmEndScene(context, nullptr, nullptr);
     sceGxmPadHeartbeat(&surfaces_[back_], syncs_[back_]);
-    DisplayEntry entry{buffers_[back_], kWidth, kHeight, kPitch};
+    DisplayEntry entry{buffers_[back_], kWidth, kHeight, kPitch, &pending_};
+    pending_.fetch_add(1, std::memory_order_acq_rel);
     sceGxmDisplayQueueAddEntry(syncs_[front_], syncs_[back_], &entry);
     front_ = back_;
     back_ = (back_ + 1) % kBuffers;

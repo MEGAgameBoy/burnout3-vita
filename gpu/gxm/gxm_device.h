@@ -15,6 +15,7 @@
 #include <psp2/gxm.h>
 #include <psp2/kernel/sysmem.h>
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -40,6 +41,7 @@ void Release(Memory* memory);
 struct DisplayEntry {
     void* address;
     std::uint32_t width, height, pitch;
+    std::atomic<std::int32_t>* pending;     // the display's count of entries not yet shown (or null)
 };
 
 class Device {
