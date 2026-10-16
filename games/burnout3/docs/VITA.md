@@ -5,10 +5,11 @@ not emulated - compiled for the Vita with VitaSDK. Unofficial and fan-made,
 like the PC port: you need your own disc (NTSC-U, SLUS-21050), and nothing of
 the game is in this repository or in what it builds from it.
 
-**Where it stands (M1, 2026-10-16): no picture yet.** The Vita build runs the
-game headless - a status screen says how fast it goes, its log what it does -
-while the GXM renderer is written (M2). The plan, the measurements and the
-risks: [VITA_PLAN.md](VITA_PLAN.md).
+**Where it stands (M1, 2026-10-16): the software GS's picture.** Until the
+GXM renderer (M2), the picture is the one the engine's software GS draws -
+the CPU's work, so slow - scaled to the screen, with a line over it saying how
+fast the run goes. Its log says what it does. The plan, the measurements and
+the risks: [VITA_PLAN.md](VITA_PLAN.md).
 
 ## Installing and running
 
@@ -41,6 +42,24 @@ Triangle changes the camera (FINDINGS.md, "The race's controls").
 With no command line, a run's options go in `ux0:data/burnout3/run.args` -
 the contents of a `port/runs/*.args` file, say, with `{data}` for the data
 directory (`--memcard {data}/runcard`). Delete it to play normally.
+`--no-draw` in it runs the game with no picture at all (a status screen
+instead): what the game costs without its drawing.
+
+The line over the picture (pictures a second, the PS2's vertical blanks a
+second and how many of them the game was too busy for, the time) is the
+`fps_counter` setting, on unless `pc_settings.ini` turns it off.
+
+### In Vita3K
+
+The VPK runs in [Vita3K](https://vita3k.org) too (its Linux build, on a
+virtual display): `port/vita/tools/vita3k_run.py` installs it, runs it and
+collects the log and screenshots - the port's own checks between builds, not
+a measure of speed. Without the disc it boots the executable alone
+(`--test-disc`: an image of `extracted/SLUS_210.50`, made locally) as far as
+the PC build does without the disc - the LOADING screen, then the sound
+driver (RWA.IRX) the disc would give. Vita3K needs an audio device, or a
+dummy one (`SDL_AUDIODRIVER=dummy`, which the script sets): without one its
+sceAudioOut crashes the emulator.
 
 ## Building
 
@@ -85,8 +104,9 @@ The LiveArea's art is the port's own, drawn by
 
 ## Known issues
 
-* No picture (M2: the GXM renderer), so no menus to see. Sound goes to the
-  Vita's speaker (sceAudioOut) but is not yet heard on hardware.
+* The picture is the software GS's (M2: the GXM renderer): slow, 1x, no
+  filtering. Sound goes to the Vita's speaker (sceAudioOut) but is not yet
+  heard on hardware.
 * No settings menu for the Vita's options yet; rumble does nothing (the Vita
   has none).
 * Speed: to be measured on the hardware (VITA_PLAN.md). Expect the race to
@@ -98,5 +118,5 @@ Main memory: 365 MB for the application (param.sfo's `ATTRIBUTE2=12`), of
 which newlib's heap takes 224 MB (`VITA_HEAP_MB`) - the guest's 32 MB of RAM,
 2 MB of IOP RAM, the GS's 4 MB and its thread's ring, the SPU2, the EE's
 fiber stacks (1 MB each) - and the executable the rest. CDRAM (112 MB) will
-hold the GXM renderer's targets and textures; until then only the status
-screen's framebuffer.
+hold the GXM renderer's targets and textures; until then two framebuffers
+for the picture and one for the text screens.

@@ -60,6 +60,28 @@ std::filesystem's `absolute()` mangles `ux0:` paths; port.py ran the port
 with the checks' round-to-nearest (PS2RT_EE_ROUND_NEAREST leaked from
 cppcheck.py) - each fixed.
 
+The first run on the hardware stopped at the first std::thread ("Enable
+multithreading to use std::thread: Not owner"): libstdc++ reaches pthreads
+through weak references, which the static link left null - so no threads,
+and with pthread_cancel alone linked, a function's static (pthread_once)
+jumped to 0. All of pthreads is linked now (`--whole-archive`), and the
+early start runs after pthread-embedded's. VitaSDK's newlib has no C99
+printf formats either (`%zu` printed "zu").
+
+**Vita3K** (the emulator's Linux AppImage, on a virtual display) runs the VPK
+here: `port/vita/tools/vita3k_run.py`. With an image of the executable alone
+(`--test-disc`) the game boots there as far as the PC build does without the
+disc - its LOADING screen, then RWA.IRX, which only the disc has. It caught
+the pthread_once crash before the hardware did; it says nothing of speed.
+
+**A picture before the renderer.** The Vita's "window" is the screen: the
+software GS's picture, at the end of each frame on the GS thread, scaled to
+960 x 544 by the CPU (nearest pixel), with a line over it - pictures a
+second, blanks a second, blanks lost. Slow (the GS's rasteriser on the CPU,
+the scaling on the GS thread), but it shows the menus while the GXM renderer
+is written, and makes M1's measurements with the drawing in or out
+(`--no-draw`).
+
 ## How it will be measured
 
 * **Exactness, without a renderer** - a per-frame checksum of everything the
@@ -538,12 +560,14 @@ checks (skill `ps2-release`).
 
 ## What this workspace can and cannot do
 
-* It can: build the engine for ARMv7 with GCC (Ubuntu's arm-linux-gnueabihf)
-  and run its tests under qemu-arm; write and review every line of the port.
-* It cannot: download VitaSDK (GitHub release downloads are refused by this
-  workspace's network policy), run anything on a Vita, or generate the game's
-  code (that needs the disc). Those happen on the player's machine and Vita,
-  or VitaSDK in CI on a fork, or built from source here.
+* It can: build VitaSDK from source and the port with it; build the engine
+  for ARMv7 with GCC (Ubuntu's arm-linux-gnueabihf) and run its tests under
+  qemu-arm; generate the game's code from the player's executable; run the
+  VPK in Vita3K as far as the game goes without its disc; write and review
+  every line of the port.
+* It cannot: run anything on a Vita, measure speed, or run the game past
+  what its executable alone gives (that needs the disc). Those happen on the
+  player's Vita, with the logs sent back.
 
 ## Sources
 
