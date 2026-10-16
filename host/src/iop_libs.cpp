@@ -986,6 +986,24 @@ std::string ExportName(const std::string& library, u32 index) {
 
 void SetPcmInputVolume(u32 core, u32 percent) { S().spu.SetInputVolume(core, percent); }
 
+std::string SoundActivity(double seconds) {
+    static Spu2::Work last;
+    const Spu2::Work now = S().spu.work();
+    const Spu2::Work was = last;
+    last = now;
+    if (seconds <= 0 || now.calls == was.calls) return "";
+    const double samples = double(now.samples - was.samples);
+    char text[200];
+    std::snprintf(text, sizeof text,
+                  "SPU2 %.0f calls/s, %.0f samples/s, voices heard %.1f and running silent %.1f a sample, "
+                  "%.0f blocks decoded/s, %.0f reverb steps/s",
+                  double(now.calls - was.calls) / seconds, samples / seconds,
+                  samples > 0 ? double(now.heard - was.heard) / samples : 0.0,
+                  samples > 0 ? double(now.silent - was.silent) / samples : 0.0,
+                  double(now.decoded - was.decoded) / seconds, double(now.reverb - was.reverb) / seconds);
+    return text;
+}
+
 void EnableSound() {
     S().spu.SetOutput([](const Spu2::s16* frames, u32 count) { AudioFrames(frames, count); });
 }

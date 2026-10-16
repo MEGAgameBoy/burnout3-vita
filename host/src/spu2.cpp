@@ -44,13 +44,14 @@ void Spu2::Level::Set(u32 value) {
     reg = value & 0xFFFF;
     if (!(reg & 0x8000)) now = Volume(reg);         // fixed; a sweep goes on from where it is
     counter = 0;
+    settled = false;
 }
 
 /* A sample of a sweep, by the envelope's rules (Envelope): the rate's shift
    and step, slower near the top going up exponentially, in proportion going
    down; the phase bit makes the volume negative. Rate 0x7F holds it. */
 void Spu2::Level::Step() {
-    if (!(reg & 0x8000)) return;
+    if (!(reg & 0x8000) || settled) return;
     const u32 rate = reg & 0x7F;
     if (rate == 0x7F) return;
     const bool exponential = (reg & 0x4000) != 0, decreasing = (reg & 0x2000) != 0, negative = (reg & 0x1000) != 0;
@@ -73,6 +74,10 @@ void Spu2::Level::Step() {
     counter = 0;
     magnitude = std::min(0x7FFF, std::max(0, magnitude + step));
     now = negative ? -magnitude : magnitude;
+    // At its end a sweep stays there (a step down from 0 or up from full is
+    // clamped back): the game leaves voices faded out so, and each was a
+    // step's arithmetic a sample for nothing.
+    settled = decreasing ? magnitude == 0 : magnitude == 0x7FFF;
 }
 
 void Spu2::DecodeBlock(const u8* block, s32 out[28], s32* older, s32* old) {
@@ -343,6 +348,7 @@ inline Spu2::u32 Wrap(Spu2::u32 x, Spu2::u32 size) {
 // One step of the reverb (24 kHz): psx-spx's "SPU Reverb Formula". Offsets
 // are in 8-byte units; "-2" there is the sample before (two bytes).
 void Spu2::Reverb(Core& c, s32 in_left, s32 in_right) {
+    ++work_.reverb;
     const u16* r = c.reverb;
     const u32 size = EffectEnd(c) + 1 - c.esa;
     if (!size || size > ram_.size()) return;
@@ -415,6 +421,7 @@ void Spu2::Reverb(Core& c, s32 in_left, s32 in_right) {
 void Spu2::CheckIrq(u32 core_hint, u32 from, u32 to, const std::function<void(u32)>& irq) {
     // IRQA is shared memory: either core with interrupts on sees it.
     (void)core_hint;
+    if (!cores_[0].irq_enabled && !cores_[1].irq_enabled) return;     // (the usual case, at once)
     for (u32 core = 0; core < 2; ++core) {
         Core& c = cores_[core];
         if (!c.irq_enabled) continue;
@@ -457,7 +464,9 @@ void Spu2::NextBlock(Core& c, u32 index, const std::function<void(u32)>& irq) {
     }
     // A silent voice runs on for its addresses and flags alone: its samples
     // are never heard before a key-on (Start) decodes afresh, history and all.
+    ++work_.decoded;
     if (v.phase == Phase::Off) {
+        --work_.decoded;
         const u32 next = v.nax & kRamMask & ~15u;
         if (ram_[(next + 1) & kRamMask] & 4) v.lsax = next;     // Decode's loop start
         return;
@@ -542,6 +551,7 @@ void Spu2::Advance(u64 now_us, const std::function<void(u32 core)>& irq) {
         CheckIrq(0, pending_irqs_[i], pending_irqs_[i + 1] > pending_irqs_[i] ? pending_irqs_[i + 1] : pending_irqs_[i] + 1, irq);
     pending_irqs_.clear();
     if (!last_us_) last_us_ = now_us;
+    ++work_.calls;
     const double samples = double(now_us - last_us_) * kRate / 1e6;
     last_us_ = now_us;
     if (samples <= 0) return;
@@ -590,7 +600,12 @@ void Spu2::Advance(u64 now_us, const std::function<void(u32 core)>& irq) {
         }
     }
     mixed_.assign(std::size_t(count) * 2, 0);
+    work_.samples += count;
     const u64 whole_clock = u64(clock_);        // (a double's conversion is a runtime call on ARM: once)
+    // To hear the sound without the reverb (read once a call: a function's
+    // static is a barrier on ARM each time it is looked at).
+    static const bool no_reverb_env = std::getenv("PS2HOST_SPU_NO_REVERB") != nullptr;
+    const bool no_reverb = no_reverb_env;
     for (u32 n = 0; n < count; ++n) {
         s32 left = 0, right = 0;
         const u32 capture_offset = u32((first_sample + n) & 511) * 2;
@@ -606,10 +621,11 @@ void Spu2::Advance(u64 now_us, const std::function<void(u32 core)>& irq) {
             s32 core_left = 0, core_right = 0, wet_left = 0, wet_right = 0;
             for (u32 i = 0; i < 24; ++i) {
                 Voice& v = c.voices[i];
-                if (v.left.reg & 0x8000) v.left.Step();         // a sweep (Step's own test, without the call)
-                if (v.right.reg & 0x8000) v.right.Step();
+                if ((v.left.reg & 0x8000) && !v.left.settled) v.left.Step();     // a sweep (Step's own test, without the call)
+                if ((v.right.reg & 0x8000) && !v.right.settled) v.right.Step();
                 s32 shaped = 0;
                 if (v.pitch && v.phase != Phase::Off) {
+                    ++work_.heard;
                     const u32 index = v.counter >> 12;
                     const s32 current = v.samples[index];
                     const s32 sample = v.previous + ((current - v.previous) * s32(v.counter & 0xFFF) >> 12);
@@ -624,6 +640,7 @@ void Spu2::Advance(u64 now_us, const std::function<void(u32 core)>& irq) {
                 if (i == 1) capture(core == 0 ? 0x0800 : 0x1800, shaped);
                 if (i == 3) capture(core == 0 ? 0x0C00 : 0x1C00, shaped);
                 if (!v.pitch) continue;
+                if (v.phase == Phase::Off) ++work_.silent;
                 const u32 before_index = v.counter >> 12;
                 s32 last = v.samples[before_index];
                 bool crossed = false;
@@ -676,7 +693,6 @@ void Spu2::Advance(u64 now_us, const std::function<void(u32 core)>& irq) {
             // The reverb (SD_CORE_EFFECT_ENABLE, attr bit 2): a step every
             // other sample, on the pair's first input; its output held for
             // the pair.
-            static const bool no_reverb = std::getenv("PS2HOST_SPU_NO_REVERB") != nullptr;   // to hear without it
             if ((c.attr & 4) && !no_reverb) {
                 if ((whole_clock + n) & 1) Reverb(c, Clamp16(c.reverb_in_left), Clamp16(c.reverb_in_right));
                 else { c.reverb_in_left = wet_left; c.reverb_in_right = wet_right; }

@@ -355,7 +355,13 @@ functions it found (`engine/ps2decomp/gaps.py`). For the rest, the host records
 every call to an address with no translation whose bytes it finds in the
 executable (`--discover`), and `port.py` translates that code at the address it
 runs from and builds again, until a run finds nothing new. A call to a copy of a
-function already translated runs that translation directly.
+function already translated runs that translation directly. Where the build
+cannot run (the Vita), `engine/tools/discover_static.py --write` finds that
+code ahead from the executable alone - switch tables' cases in short gaps,
+branches out of a function to no function's entry, and the same from each
+piece found - and `port.py --target vita` runs it before generating. A piece
+is translated to its first exit, or to the next function or piece, where it
+falls through as a tail call.
 
 These translations are not verified - the interpreter never runs them - and the
 generated source says so.

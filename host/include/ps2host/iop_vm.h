@@ -76,6 +76,9 @@ void SetRunTimeCap(std::uint64_t ns);
    0x...) 81%, interrupts 9%" (empty when it ran nothing). */
 std::uint64_t Instructions();
 std::string Activity(double seconds);
+/* The SPU2's work since the last call, the same way: calls, samples, voices
+   heard and running silent, blocks decoded, reverb steps (empty if none). */
+std::string SoundActivity(double seconds);
 
 /* Log every library call a module makes (--iop-trace). */
 void SetTrace(bool on);

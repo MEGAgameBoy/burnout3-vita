@@ -17,7 +17,10 @@ extension, an overlay - and run where it was copied to. The host records each
 such call it meets with the code's source in the executable (--discover); this
 translates those at their run addresses and builds again, until a run finds
 nothing new. They are translated, not verified: nothing tests them against the
-interpreter, which never sees them run.
+interpreter, which never sees them run. A system the build cannot run (the
+Vita: --target vita) finds them ahead instead, from the executable alone
+(discover_static.py: switch cases outside their function, branches into
+other code), which port.py runs before generating for it.
 
 Nothing from the disc is built into the port: the executable is loaded at run
 time, from the game's extracted/ directory.
@@ -26,6 +29,7 @@ time, from the game's extracted/ directory.
 from __future__ import annotations
 
 import argparse
+import bisect
 import os
 import re
 import subprocess
@@ -74,7 +78,36 @@ def dispatch_source(addresses, names: dict, untranslated=(), sizes=None) -> str:
     return "\n".join(lines)
 
 
-def discovered_functions(game, path: str) -> dict:
+def lift_piece(code: bytes, run: int, limit=None):
+    """(length, C++) for code run where it lies, from `run`: to its first exit
+    no branch inside it passes, or to `limit` - the next function or piece,
+    where it falls through (a tail call) - and if cut so at a branch's delay
+    slot, to its own end past it. Raises lift.Refused (or ValueError: no
+    exit found) when no length lifts."""
+    lengths = []
+    try:
+        lengths.append(gaps.function_extent(code, run, run, limit))
+    except ValueError:
+        if limit is not None and limit > run:
+            lengths.append(limit - run)         # falls through to the next one
+    if limit is not None:                       # (cut at a branch's delay slot: run to its own end)
+        try:
+            lengths.append(gaps.function_extent(code, run, run))
+        except ValueError:
+            pass
+    lengths = [n for n in lengths if 0 < n <= len(code)]     # (a far `limit` is no fall-through)
+    if not lengths:
+        raise ValueError("no exit found after 0x%08X" % run)
+    failure = None
+    for length in lengths:
+        try:
+            return length, lift.lift_function(code, run, run, run + length)
+        except lift.Refused as exc:
+            failure = exc
+    raise failure
+
+
+def discovered_functions(game, path: str, entries=None) -> dict:
     """{run address: C++} for the code runs found copied at run time, translated
     at their run addresses from the executable's bytes."""
     if not os.path.exists(path):
@@ -90,12 +123,21 @@ def discovered_functions(game, path: str) -> dict:
     with open(path, encoding="utf-8") as handle:
         pairs = {(int(run, 16), int(source, 16)) for run, source in
                  (line.split() for line in handle if line.strip())}
+    # Code run where it lies ends where the next function or piece found
+    # begins, falling through to it there (a tail call): the cases of one
+    # switch (discover_static.py finds them ahead) are each a piece, and
+    # each running to the switch's end would translate the same code again
+    # and again.
+    starts = sorted(set(entries or ()) | {run for run, source in pairs if run == source})
     for run, source in sorted(pairs):
         offset = source - section.addr
         code = image[offset:offset + gaps.MAX_FUNCTION]
+        limit = None
+        if run == source:
+            following = bisect.bisect_right(starts, run)
+            limit = starts[following] if following < len(starts) else None
         try:
-            length = gaps.function_extent(code, run, run)
-            found[run] = (source, lift.lift_function(code, run, run, run + length))
+            found[run] = (source, lift_piece(code, run, limit)[1])
         except (ValueError, lift.Refused) as exc:
             print("  cannot translate the code at 0x%08X (from 0x%08X): %s" % (run, source, exc))
     return found
@@ -115,7 +157,8 @@ def generate(game) -> str:
     out = game.path(os.path.join(game.build, "port", "generated"))
     os.makedirs(out, exist_ok=True)
     discovered = discovered_functions(game, game.path(os.path.join(game.build, "port",
-                                                                   "discovered.txt")))
+                                                                   "discovered.txt")),
+                                      addresses + [f["addr"] for f in database["functions"]])
     # What the analysis has since found is translated - and verified - with the rest.
     discovered = {a: v for a, v in discovered.items() if a not in set(addresses)}
     copies = ['#include "ps2rt/lifted.h"', "", "using namespace generated;",
@@ -313,6 +356,10 @@ def main(argv=None) -> int:
                                             target + (".exe" if os.name == "nt" else "")))
         return run(game, executable, extra)
     if args.action == "build" or args.target == "vita":
+        if args.target == "vita":
+            # No run on this machine finds the code a run meets: found ahead.
+            import discover_static
+            discover_static.main(["--game", game.directory, "--write"])
         build(game, generate(game), args.target)
         return 0
     # Build and run until a run finds no more code copied at run time.

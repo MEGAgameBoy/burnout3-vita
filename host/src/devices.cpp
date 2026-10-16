@@ -432,12 +432,13 @@ void FrameTimes(u64 frame) {
     {
         static double last_iop_s = 0.0, last_spu2_s = 0.0;
         const double iop_s = SectionSeconds(Section::Iop), spu2_s = SectionSeconds(Section::Spu2);
-        const std::string iop = iop::Activity(seconds);
+        const std::string iop = iop::Activity(seconds), sound = iop::SoundActivity(seconds);
         if (seconds > 0 && (!iop.empty() || iop_s != last_iop_s)) {
             const std::size_t used = std::strlen(job_text);
-            std::snprintf(job_text + used, sizeof job_text - used, ", EE's thread in the IOP %d%% and the SPU2 %d%%%s%s",
+            std::snprintf(job_text + used, sizeof job_text - used, ", EE's thread in the IOP %d%% and the SPU2 %d%%%s%s%s%s",
                           int(100.0 * (iop_s - last_iop_s) / seconds + 0.5),
-                          int(100.0 * (spu2_s - last_spu2_s) / seconds + 0.5), iop.empty() ? "" : ": ", iop.c_str());
+                          int(100.0 * (spu2_s - last_spu2_s) / seconds + 0.5), iop.empty() ? "" : ": ", iop.c_str(),
+                          sound.empty() ? "" : "; ", sound.c_str());
         }
         last_iop_s = iop_s;
         last_spu2_s = spu2_s;

@@ -85,6 +85,14 @@ public:
     /* Exposed for tests: one ADPCM block decoded, with the filter history. */
     static void DecodeBlock(const u8* block, s32 out[28], s32* older, s32* old);
 
+    /* What the mixing did so far, for the frame line (where a slow host's
+       time goes): Advance's calls, output samples, voice-samples heard and
+       run silent, blocks decoded, reverb steps. */
+    struct Work {
+        u64 calls = 0, samples = 0, heard = 0, silent = 0, decoded = 0, reverb = 0;
+    };
+    const Work& work() const { return work_; }
+
 private:
     enum class Phase : u8 { Off, Attack, Decay, Sustain, Release };
     /* A volume as it is now (a voice's left or right, a core's main): set to
@@ -96,6 +104,7 @@ private:
         u32 reg = 0;
         s32 now = 0;                    // -0x7FFF to 0x7FFF
         u32 counter = 0;
+        bool settled = false;           // a sweep at its end (0 going down, full going up): no step changes it
         explicit Level(u32 value = 0) { Set(value); }
         void Set(u32 value);
         void Step();
@@ -154,6 +163,7 @@ private:
     double owed_ = 0;                // a fraction of a sample not yet produced
     Output output_;
     std::vector<s16> mixed_;
+    Work work_;
 
     static u32 CoreOf(u32 entry) { return entry & 1; }
     static u32 VoiceOf(u32 entry) { return ((entry >> 1) & 0x1F) % 24; }
