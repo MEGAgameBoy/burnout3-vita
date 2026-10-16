@@ -436,18 +436,22 @@ void FrameTimes(u64 frame) {
     // The IOP (run on the EE's thread): what it ran, and its and the SPU2's
     // share of the time - where a slow interpreter's time goes.
     {
-        static double last_iop_s = 0.0, last_spu2_s = 0.0;
+        static double last_iop_s = 0.0, last_spu2_s = 0.0, last_disc_s = 0.0;
         const double iop_s = SectionSeconds(Section::Iop), spu2_s = SectionSeconds(Section::Spu2);
+        const double disc_s = SectionSeconds(Section::Disc);
         const std::string iop = iop::Activity(seconds), sound = iop::SoundActivity(seconds);
         if (seconds > 0 && (!iop.empty() || iop_s != last_iop_s)) {
             const std::size_t used = std::strlen(job_text);
-            std::snprintf(job_text + used, sizeof job_text - used, ", EE's thread in the IOP %d%% and the SPU2 %d%%%s%s%s%s",
+            std::snprintf(job_text + used, sizeof job_text - used,
+                          ", EE's thread in the IOP %d%%, the SPU2 %d%%, disc reads %d%%%s%s%s%s",
                           int(100.0 * (iop_s - last_iop_s) / seconds + 0.5),
-                          int(100.0 * (spu2_s - last_spu2_s) / seconds + 0.5), iop.empty() ? "" : ": ", iop.c_str(),
+                          int(100.0 * (spu2_s - last_spu2_s) / seconds + 0.5),
+                          int(100.0 * (disc_s - last_disc_s) / seconds + 0.5), iop.empty() ? "" : ": ", iop.c_str(),
                           sound.empty() ? "" : "; ", sound.c_str());
         }
         last_iop_s = iop_s;
         last_spu2_s = spu2_s;
+        last_disc_s = disc_s;
     }
     // The guest's functions called most since the last line: where a game
     // that crawls spends its time, when it is calls (a loop's callee).

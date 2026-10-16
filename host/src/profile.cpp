@@ -88,7 +88,7 @@ double Elapsed(Clock::time_point from, Clock::time_point to) {
 
 const char* const kSectionNames[] = {"GS drawing", "GS image transfers", "VU1", "VU0",
                                      "GPU bookkeeping", "GPU drawing", "GPU and memory in step",
-                                     "DMA and VIF", "IOP", "SPU2", "waiting for the GS thread"};
+                                     "DMA and VIF", "IOP", "SPU2", "waiting for the GS thread", "disc reads"};
 
 Timed::Timed(Section section) : section_(section) {
     ThreadTicks& t = t_ticks;

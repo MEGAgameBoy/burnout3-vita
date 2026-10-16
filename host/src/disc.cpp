@@ -1,4 +1,5 @@
 #include "ps2host/disc.h"
+#include "ps2host/profile.h"
 
 #include <cctype>
 #include <cstring>
@@ -106,6 +107,7 @@ bool Disc::ReadBytes(u64 offset, u64 length, u8* out) {
         std::memcpy(out, memory_.data() + offset, size_t(length));
         return true;
     }
+    Timed timed(Section::Disc);         // (the time a read waits for the card, in the frame line)
     return file_.ReadAt(offset, out, std::size_t(length));
 }
 
