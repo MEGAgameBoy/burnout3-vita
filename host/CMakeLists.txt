@@ -170,6 +170,15 @@ if(VITA)
     target_compile_definitions(ps2host_tests PRIVATE PS2HOST_TESTS_NO_MAIN=1)
     ps2_vita_package(ps2host_tests TITLE "PS2 port engine tests" TITLE_ID PTEN00001 VERSION 01.00
                      SCE_SYS ${PS2_ENGINE_DIR}/platform/vita/tests_sce_sys)
+    # The GS renderer's tests on the Vita's GPU (ps2gxm_tests.vpk): the
+    # Vulkan renderer's own, run on the GXM one.
+    add_executable(ps2gxm_tests ${PS2_ENGINE_DIR}/gpu/tests/renderer_tests.cpp
+                                ${CMAKE_CURRENT_LIST_DIR}/tests/gxm_tests_main.cpp)
+    target_compile_definitions(ps2gxm_tests PRIVATE PS2GPU_TESTS_NO_MAIN=1)
+    target_include_directories(ps2gxm_tests PRIVATE ${PS2_ENGINE_DIR}/gpu/include)
+    target_link_libraries(ps2gxm_tests PRIVATE ps2host)
+    ps2_vita_package(ps2gxm_tests TITLE "GXM renderer tests" TITLE_ID PTEN00005 VERSION 01.00
+                     SCE_SYS ${PS2_ENGINE_DIR}/platform/vita/tests_sce_sys)
 endif()
 
 # ps2_add_port(<target>

@@ -5,17 +5,22 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <string>
+#include <vector>
 
 #include "ps2gpu/gs_renderer.h"
 
 namespace {
 
 int g_failures = 0;
+bool g_say_passes = false;      // RunRendererTests' caller asks for every check, not the failures alone
 
 void Check(bool ok, const char* what) {
     if (!ok) {
         std::printf("FAIL: %s\n", what);
         ++g_failures;
+    } else if (g_say_passes) {
+        std::printf("ok:   %s\n", what);
     }
 }
 
@@ -412,18 +417,12 @@ void Fogged(ps2gpu::GsRenderer& renderer) {
 
 }  // namespace
 
-int main() {
-    std::string error;
-    auto gpu = ps2gpu::CreateGpu(&error);
-    if (!gpu) {
-        std::printf("no GPU: %s (skipped)\n", error.c_str());
-        return 0;
-    }
-    auto renderer = ps2gpu::CreateGsRenderer(*gpu, &error);
-    if (!renderer) {
-        std::printf("FAIL: renderer: %s\n", error.c_str());
-        return 1;
-    }
+/* Every test on `renderer`; the number that failed. (The Vita's GXM
+   renderer runs them from engine/host/tests/gxm_tests_main.cpp.) */
+int RunRendererTests(ps2gpu::GsRenderer& renderer_, bool say_passes) {
+    ps2gpu::GsRenderer* renderer = &renderer_;
+    g_failures = 0;
+    g_say_passes = say_passes;
     Untextured(*renderer);
     Textured(*renderer);
     Blended(*renderer);
@@ -438,7 +437,25 @@ int main() {
     RenderToTexture(*renderer);
     TargetFromMemory(*renderer);
     PartlyMaskedChannels(*renderer);
-    if (g_failures) std::printf("gpu renderer tests: %d failed\n", g_failures);
-    else std::printf("gpu renderer tests: all passed (%s)\n", gpu->Describe().c_str());
-    return g_failures ? EXIT_FAILURE : EXIT_SUCCESS;
+    return g_failures;
 }
+
+#ifndef PS2GPU_TESTS_NO_MAIN
+int main() {
+    std::string error;
+    auto gpu = ps2gpu::CreateGpu(&error);
+    if (!gpu) {
+        std::printf("no GPU: %s (skipped)\n", error.c_str());
+        return 0;
+    }
+    auto renderer = ps2gpu::CreateGsRenderer(*gpu, &error);
+    if (!renderer) {
+        std::printf("FAIL: renderer: %s\n", error.c_str());
+        return 1;
+    }
+    const int failures = RunRendererTests(*renderer, false);
+    if (failures) std::printf("gpu renderer tests: %d failed\n", failures);
+    else std::printf("gpu renderer tests: all passed (%s)\n", gpu->Describe().c_str());
+    return failures ? EXIT_FAILURE : EXIT_SUCCESS;
+}
+#endif
