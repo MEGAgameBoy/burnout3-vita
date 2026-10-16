@@ -57,6 +57,7 @@ struct Thread {
     u32 entry = 0, stack = 0, stack_size = 0;
     RpcRequest serving;             // the RPC request its server function is running
     u32 rpc_queue = 0;              // the queue it serves (sceSifRpcLoop)
+    u64 executed = 0;               // instructions it ran (Activity)
 };
 
 struct Semaphore {

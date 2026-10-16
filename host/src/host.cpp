@@ -487,7 +487,13 @@ void Report(const Options& options, const std::string& outcome) {
 
 namespace {
 
-// Stops a run that goes on too long, so it ends with a report rather than being
+// RequestReportStop's: why the player stopped the run (empty: they did not).
+std::mutex g_report_stop_lock;
+std::string g_report_stop_why;
+std::atomic<bool> g_report_stop{false};     // the watchdog stops the run (and reports a host that does not stop)
+
+// Stops a run that goes on too long - or that the player stopped
+// (RequestReportStop) -, so it ends with a report rather than being
 // killed without one: the running context's loop budget is exhausted, and the
 // translated code stops at its next loop head (lifted::Tick) with the guest call
 // stack intact.
@@ -495,8 +501,14 @@ class Watchdog {
 public:
     explicit Watchdog(int seconds) : thread_([this, seconds] {
         std::unique_lock<std::mutex> lock(mutex_);
-        if (!done_.wait_for(lock, std::chrono::seconds(seconds), [this] { return finished_; })) {
-            fired = true;
+        // Looked at twice a second for the player's stop (its flag is not
+        // under this lock: a wake-up could be missed).
+        const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+        while (!finished_ && !g_report_stop.load() && std::chrono::steady_clock::now() < limit)
+            done_.wait_for(lock, std::min<std::chrono::steady_clock::duration>(
+                                     std::chrono::milliseconds(500), limit - std::chrono::steady_clock::now()));
+        if (!finished_) {
+            fired = !g_report_stop.load();
             StopRequested() = true;
             ForEachContext([](lifted::Context& each) {
                 reinterpret_cast<std::atomic<s64>*>(&each.budget)->store(-1);
@@ -507,8 +519,9 @@ public:
             if (!done_.wait_for(lock, std::chrono::seconds(20), [this] { return finished_; })) {
                 u32 calls[32];
                 const int n = GuestCallsNow(calls, 32);
-                std::fprintf(stderr, "\n=== host report ===\nstuck: the run did not stop 20 s after its time "
-                                     "limit - the host is in a loop of its own\nguest call stack (innermost first):");
+                std::fprintf(stderr, "\n=== host report ===\nstuck: the run did not stop 20 s after %s "
+                                     "- the host is in a loop of its own\nguest call stack (innermost first):",
+                             fired ? "its time limit" : "the player stopped it");
                 for (int i = 0; i < n; ++i) std::fprintf(stderr, " 0x%08X", unsigned(calls[i]));
                 std::fprintf(stderr, "\n");
                 std::fflush(nullptr);
@@ -545,6 +558,13 @@ private:
 };
 
 }  // namespace
+
+void RequestReportStop(const std::string& why) {
+    std::lock_guard<std::mutex> hold(g_report_stop_lock);
+    if (g_report_stop.exchange(true)) return;
+    g_report_stop_why = why;
+    std::fprintf(stderr, "[host] stopping: %s - the report follows\n", why.c_str());
+}
 
 int Run(const Options& options) {
     SetVirtualClock(options.virtual_time);  // before anything reads the clock
@@ -597,6 +617,7 @@ int Run(const Options& options) {
     Vu1().fast = options.vu_fast;
     SetUntilFrame(options.until_frame);
     SetFrameTimes(options.frame_times);
+    SetIopShare(options.iop_share);
     if (options.gpu || options.gpu_shadow) {
         std::string error;
         const GpuMode mode = options.gpu ? GpuMode::Primary : options.gpu_shadow_rtt ? GpuMode::ShadowRtt : GpuMode::Shadow;
@@ -653,11 +674,20 @@ int Run(const Options& options) {
         static const char* reasons[] = {"", "a trap", "a loop that did not finish within the budget",
                                         "a callee that failed", "a memory fault", "a COP2 operation"};
         const char* reason = abort.reason < 6 ? reasons[abort.reason] : "an abort";
+        std::string player;
+        if (g_report_stop.load()) {
+            std::lock_guard<std::mutex> hold(g_report_stop_lock);
+            player = g_report_stop_why;
+        }
         if (abort.reason == 2 && watchdog.fired)
             reason = "the time limit, in the loop";
+        if (abort.reason == 2 && !player.empty()) reason = "in the loop";
         outcome = std::string("stopped: ") + reason + " at " + Hex(abort.address);
         if (abort.reason == 2 && watchdog.fired && abort.address == 0)
             outcome = "stopped: the time limit, between threads (no thread was in a loop)";
+        if (abort.reason == 2 && !player.empty())
+            outcome = "stopped: " + player + (abort.address ? ", in the loop at " + Hex(abort.address)
+                                                            : ", between threads (no thread was in a loop)");
         if (abort.reason == 2 && UntilFrameReached())
             outcome = "stopped: frame " + std::to_string(options.until_frame) + " reached (--until-frame)";
     }
@@ -689,6 +719,7 @@ int Main(int argc, char** argv) {
         else if (arg == "--virtual-time") options.virtual_time = true;
         else if (arg == "--until-frame" && i + 1 < argc) options.until_frame = std::stoull(argv[++i]);
         else if (arg == "--frame-times" && i + 1 < argc) options.frame_times = unsigned(std::stoul(argv[++i]));
+        else if (arg == "--iop-share" && i + 1 < argc) options.iop_share = unsigned(std::stoul(argv[++i]));
         else if (arg == "--gs-inline") options.gs_inline = true;
         else if (arg == "--gs-trace-frame" && i + 1 < argc) options.gs_trace_frame = std::stoll(argv[++i]);
         else if (arg == "--gs-dump-frame" && i + 1 < argc) options.gs_dump_frame = std::stoll(argv[++i]);

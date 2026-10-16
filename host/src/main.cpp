@@ -157,8 +157,10 @@ std::vector<std::string> PlayArguments(const char* self) {
     // The screen (window.cpp's OpenScreen), the GS drawn by the GPU (GXM;
     // the software GS where it cannot be had - no libshacccg - or the
     // "renderer" setting is "software"), the log (--frame-times every ten
-    // seconds) saying how fast. run.args's --no-draw: headless.
-    for (const char* arg : {"--window", "--frame-times", "600"}) args.push_back(arg);
+    // seconds) saying how fast. run.args's --no-draw: headless. The IOP's
+    // interpreter is slower here than the console's IOP: a quarter of the
+    // EE's thread at most for it at each frame (--iop-share).
+    for (const char* arg : {"--window", "--frame-times", "600", "--iop-share", "25"}) args.push_back(arg);
     if (ps2host::Setting("renderer", "gpu") != "software") args.push_back("--gpu");
 #else
     for (const char* arg : {"--window", "--gpu"}) args.push_back(arg);

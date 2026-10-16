@@ -1106,6 +1106,7 @@ void GxmGsRenderer::UploadDepth(u32 zbp, u32 width, u32 height, const u32* z) {
 }
 
 bool GxmGsRenderer::ReadTarget(u32 fbp, u32 fbw, u32 psm, std::vector<u32>* pixels, u32* width, u32* height) {
+    Flush();        // a draw still recorded may be the one that makes the target
     auto found = targets_.find(Key(fbp, fbw, psm));
     if (found == targets_.end()) return false;
     Idle();
@@ -1119,6 +1120,7 @@ bool GxmGsRenderer::ReadTarget(u32 fbp, u32 fbw, u32 psm, std::vector<u32>* pixe
 }
 
 bool GxmGsRenderer::ReadDepth(u32 zbp, u32 width, u32 height, std::vector<u32>* z) {
+    Flush();
     auto found = depths_.find(DepthKey{zbp, width, height});
     if (found == depths_.end()) return false;
     Idle();
@@ -1133,11 +1135,11 @@ bool GxmGsRenderer::ReadDepth(u32 zbp, u32 width, u32 height, std::vector<u32>* 
 }
 
 bool GxmGsRenderer::DisplayTarget(u32 fbp, u32 fbw, u32 psm, u64* image, int* layout, u32* width, u32* height) {
-    auto found = targets_.find(Key(fbp, fbw, psm));
-    if (found == targets_.end()) return false;
     // What is recorded goes first: the display's scene comes after it, and
     // the GPU takes scenes in order.
     Flush();
+    auto found = targets_.find(Key(fbp, fbw, psm));
+    if (found == targets_.end()) return false;
     CloseScene();
     *image = u64(reinterpret_cast<std::uintptr_t>(&found->second.texture));
     *layout = 0;
@@ -1167,6 +1169,7 @@ void GxmGsRenderer::MemoryPatch(const u32* words, std::size_t count) {
 }
 
 bool GxmGsRenderer::TargetToMemory(u32 fbp, u32 fbw, u32 psm, u32 cols, u32 rows, u32 first_row) {
+    Flush();
     auto found = targets_.find(Key(fbp, fbw, psm));
     if (found == targets_.end()) return false;
     Idle();
@@ -1212,6 +1215,7 @@ void GxmGsRenderer::TargetFromMemory(u32 fbp, u32 fbw, u32 psm, u32 width, u32 h
 
 bool GxmGsRenderer::DepthToMemory(u32 zbp, u32 width, u32 height, u32 fbw, u32 zpsm, u32 cols, u32 rows,
                                   u32 first_row) {
+    Flush();
     auto found = depths_.find(DepthKey{zbp, width, height});
     if (found == depths_.end()) return false;
     Idle();

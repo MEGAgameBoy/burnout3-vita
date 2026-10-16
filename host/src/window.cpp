@@ -445,6 +445,24 @@ bool HostPad(HostPadState* state) {
 }
 
 void StatusFrame(u64 frame) {
+#ifdef __vita__
+    // L, R, SELECT and START held for three seconds: the run stops with its
+    // report in the log (RequestReportStop) - where a game that seems stuck
+    // is, its threads, the IOP's.
+    {
+        static std::chrono::steady_clock::time_point held_since{};
+        constexpr std::uint16_t kCombo = (1u << 0) | (1u << 3) | (1u << 10) | (1u << 11);
+        ps2plat::ControllerState pad;
+        if (ps2plat::ReadController(&pad) && (pad.buttons & kCombo) == kCombo) {
+            const auto now = std::chrono::steady_clock::now();
+            if (held_since == std::chrono::steady_clock::time_point{}) held_since = now;
+            else if (now - held_since >= std::chrono::seconds(3))
+                RequestReportStop("L, R, SELECT and START held - the player stopped the run");
+        } else {
+            held_since = {};
+        }
+    }
+#endif
 #ifdef PS2HOST_VULKAN
     if (g_display) return;
 #endif
@@ -464,7 +482,14 @@ void StatusFrame(u64 frame) {
     const u64 lost = LostVblanks();
     char line[160];
 #ifndef _WIN32
-    if (g_window && gs::TheGs().rasterize) {
+    bool picture = g_window && gs::TheGs().rasterize;
+#ifdef PS2HOST_GXM
+    // The GPU drawing the GS (--gpu): its pictures go to the display (the
+    // bridge's frame handler), never the text screen - which, put up over
+    // them once a second, made the screen flicker between the two.
+    if (g_window && g_screen_display && GpuPrimary()) picture = true;
+#endif
+    if (picture) {
         // The screen's picture (OpenScreen): the speed in a line over it.
         static u64 pictures_then = 0;
         const u64 pictures = g_screen_pictures.load();

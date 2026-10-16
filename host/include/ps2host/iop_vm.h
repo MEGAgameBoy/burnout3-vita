@@ -60,8 +60,20 @@ void RpcCall(std::uint32_t server, std::uint32_t procedure, std::uint32_t size,
 
 /* Runs the IOP until every thread waits, or it has run `instructions` (a
    busy IOP can't hang the EE; the EE's idle wait gives it a short slice, so
-   a vertical blank is never kept waiting). */
-void Run(std::uint64_t instructions = 20'000'000);
+   a vertical blank is never kept waiting), or - `max_ns` not 0, in real
+   time only - that many nanoseconds have gone by. */
+void Run(std::uint64_t instructions = 20'000'000, std::uint64_t max_ns = 0);
+/* In real time, a run given no time of its own (max_ns 0) ends after this
+   many nanoseconds too (0, the default: none) - an RPC's or a command's run,
+   which a module that never waits held for its whole slice. What it leaves
+   undone runs at the next frame or the EE's next wait. */
+void SetRunTimeCap(std::uint64_t ns);
+
+/* Instructions the IOP has run in all, and since the last call a line of
+   what ran them: "IOP 12.3M instructions/s, thread 28 (entry 0x..., at
+   0x...) 81%, interrupts 9%" (empty when it ran nothing). */
+std::uint64_t Instructions();
+std::string Activity(double seconds);
 
 /* Log every library call a module makes (--iop-trace). */
 void SetTrace(bool on);

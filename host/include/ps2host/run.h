@@ -212,6 +212,19 @@ void SetVif1Worker(bool on);
    screen counting frames while it loads (a game's hook turns it on and
    off). */
 void SetFastForward(unsigned factor);
+/* Stops the run where it is, with its report (the guest's call stack, the
+   threads, the IOP's, the functions called most) as a time limit would:
+   the player's way to say where a game that seems stuck is (the Vita: L,
+   R, SELECT and START held for three seconds). `why` heads the report. */
+void RequestReportStop(const std::string& why);
+/* --iop-share PERCENT: in real time, the IOP's runs at each frame take at
+   most this share of the EE's thread (0, the default: a slice of
+   instructions only) - for a host whose interpreter is slower than the
+   console's IOP (the Vita's), where a module that never waits held the EE
+   through its whole slice every frame - and every RPC's run (2 ms at most
+   each, with a share). The EE's idle waits still give it the rest of their
+   time. */
+void SetIopShare(unsigned percent);
 /* --fast-until N[:F]: in real time, the blanks F times as fast (8 unless
    said) until frame N - a scripted run's way to what is to be measured -
    then at their rate. Faster than the EE keeps up with, the game falls

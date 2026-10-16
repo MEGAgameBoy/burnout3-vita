@@ -27,6 +27,9 @@ private:
 
 /* "GS drawing 61.2%, ..." of the run's wall time so far. */
 std::string ProfileSummary();
+/* The seconds spent in a section so far, every thread's (a section still
+   open counts from when it was last entered or resumed, when it ends). */
+double SectionSeconds(Section section);
 
 /* --sample: a sampling profiler on the calling thread (the EE's, which runs
    the translated code, the host's devices and the GPU bridge): a thousand

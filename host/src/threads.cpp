@@ -285,6 +285,36 @@ u64 g_real_time_from = 0;               // SetRealTimeFrom
 // main loop ran five times a frame, its clocks with it.
 std::atomic<u32> g_intc_stat{0};
 
+// The IOP's share of the EE's thread at the frames (SetIopShare): where the
+// interpreter is slower than the console's IOP (the Vita's), a module that
+// never waits - a poll - held the EE's thread through its whole slice at
+// every frame, and the game crawled. Its runs at the frames then have a
+// budget of real time, refilled at `share` percent of the time going by
+// (at most 50 ms of it saved up); the EE's idle waits give it the rest, as
+// they always did. 0: no budget (the PC's: a slice of instructions only).
+std::atomic<unsigned> g_iop_share{0};
+struct IopBudget {
+    std::chrono::steady_clock::time_point last{};
+    s64 ns = 0;                     // may go below 0: a run that overran pays it back
+};
+IopBudget g_iop_budget;             // the EE's thread's alone
+
+u64 IopFrameBudgetNs(std::chrono::steady_clock::time_point now) {
+    const unsigned share = g_iop_share.load(std::memory_order_relaxed);
+    if (!share || VirtualClock()) return 0;
+    IopBudget& b = g_iop_budget;
+    if (b.last != std::chrono::steady_clock::time_point{}) {
+        const s64 gone = s64(std::chrono::duration_cast<std::chrono::nanoseconds>(now - b.last).count());
+        b.ns = std::min<s64>(b.ns + gone / 100 * s64(share), 50'000'000);
+    }
+    b.last = now;
+    return u64(std::max<s64>(b.ns, 200'000));       // its interrupts and a little more, always
+}
+
+void IopFrameSpent(std::chrono::steady_clock::duration spent) {
+    g_iop_budget.ns -= s64(std::chrono::duration_cast<std::chrono::nanoseconds>(spent).count());
+}
+
 // One frame's interrupts, delivered to the handlers registered for them.
 bool DeliverFrame() {
     Scheduler& s = S();
@@ -293,7 +323,10 @@ bool DeliverFrame() {
     if (s.virtual_time && g_real_time_from && s.frames >= g_real_time_from) StartRealTime();
     {
         Timed timed(Section::Iop);
-        iop::Run();                         // the IOP's timers and sound interrupts
+        const auto began = std::chrono::steady_clock::now();
+        const u64 budget_ns = IopFrameBudgetNs(began);
+        iop::Run(20'000'000, budget_ns);    // the IOP's timers and sound interrupts
+        if (budget_ns) IopFrameSpent(std::chrono::steady_clock::now() - began);
     }
     FrameDone(s.frames);
     bool ran = false;
@@ -1118,6 +1151,11 @@ bool ThreadSyscall(lifted::Context& c, s32 number, u64& result) {
         default:
             return false;
     }
+}
+
+void SetIopShare(unsigned percent) {
+    g_iop_share = std::min(percent, 100u);
+    iop::SetRunTimeCap(percent ? 2'000'000 : 0);    // an RPC's or command's run: 2 ms at most, too
 }
 
 u64 LostVblanks() { return g_lost_vblanks.load(std::memory_order_relaxed); }

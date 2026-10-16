@@ -372,10 +372,20 @@ u32 Vm::Call(u32 function, std::vector<u32> args) {
 
 // ---------------------------------------------------------------- scheduling
 
-void Run(u64 slice) {
+namespace {
+u64 g_run_cap_ns = 0;           // SetRunTimeCap
+}  // namespace
+
+void SetRunTimeCap(u64 ns) { g_run_cap_ns = ns; }
+
+void Run(u64 slice, u64 max_ns) {
+    if (!max_ns) max_ns = g_run_cap_ns;
     Vm& vm = TheVm();
     if (vm.threads.empty() && vm.alarms.empty() && vm.completions.empty()) return;
     const u64 start = vm.instructions;
+    using Clock = std::chrono::steady_clock;
+    const bool timed = max_ns && !VirtualClock();       // a scripted run's IOP goes by instructions alone
+    const Clock::time_point until = timed ? Clock::now() + std::chrono::nanoseconds(max_ns) : Clock::time_point{};
     for (;;) {
         SoundInterrupts(vm);
         // Completion callbacks of finished SIF DMA (sceSifSetDmaIntr), as interrupts.
@@ -403,10 +413,13 @@ void Run(u64 slice) {
                             (t.priority == best->priority && t.queued < best->queued)))
                 best = &t;
         if (!best || vm.instructions - start > slice) return;
+        if (timed && Clock::now() >= until) return;
         vm.current = best->id;
         vm.reschedule = false;
         bool stopped = false;
+        const u64 before = vm.instructions;
         const Outcome outcome = Execute(vm, best->c, kReturnFromCall, kQuantum, &stopped);
+        best->executed += vm.instructions - before;
         if (best->c.pc == kRpcReturn) {                      // a server function returned
             const RpcRequest& done = best->serving;
             Memory& ee = GuestMemory();
@@ -651,6 +664,37 @@ void Command(u32 command, const std::vector<u8>& packet) {
     Run();
 }
 
+u64 Instructions() { return TheVm().instructions; }
+
+std::string Activity(double seconds) {
+    Vm& vm = TheVm();
+    static u64 last_total = 0;
+    static std::map<u32, u64> last;
+    const u64 total = vm.instructions - last_total;
+    last_total = vm.instructions;
+    u32 busiest = 0;
+    u64 most = 0, by_threads = 0;
+    for (auto& [id, t] : vm.threads) {
+        const u64 ran = t.executed - last[id];
+        last[id] = t.executed;
+        by_threads += ran;
+        if (ran > most) most = ran, busiest = id;
+    }
+    if (!total || seconds <= 0) return "";
+    char text[200];
+    int used = std::snprintf(text, sizeof text, "IOP %.2fM instructions/s", double(total) / seconds / 1e6);
+    if (busiest) {
+        const Thread& t = vm.threads[busiest];
+        used += std::snprintf(text + used, sizeof text - used, ", thread %u (entry 0x%08X, at 0x%08X) %d%%",
+                              unsigned(busiest), unsigned(t.entry), unsigned(t.c.pc),
+                              int(100.0 * double(most) / double(total) + 0.5));
+    }
+    if (total > by_threads)
+        std::snprintf(text + used, sizeof text - used, ", interrupts %d%%",
+                      int(100.0 * double(total - by_threads) / double(total) + 0.5));
+    return text;
+}
+
 std::string Report() {
     Vm& vm = TheVm();
     std::string out;
@@ -671,8 +715,9 @@ std::string Report() {
                                   "sleeping", "delayed", "dormant", "serving RPC"};
     for (auto& [id, t] : vm.threads) {
         char line[160];
-        std::snprintf(line, sizeof line, "  IOP thread %u: %s, priority %d, entry 0x%08X, at 0x%08X\n",
-                      id, t.ready ? "ready" : waits[int(t.wait)], t.priority, t.entry, t.c.pc);
+        std::snprintf(line, sizeof line, "  IOP thread %u: %s, priority %d, entry 0x%08X, at 0x%08X, %llu instructions\n",
+                      id, t.ready ? "ready" : waits[int(t.wait)], t.priority, t.entry, t.c.pc,
+                      static_cast<unsigned long long>(t.executed));
         out += line;
     }
     return out;

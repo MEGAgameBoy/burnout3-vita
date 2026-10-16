@@ -111,6 +111,12 @@ Timed::~Timed() {
     t.since = now;
 }
 
+double SectionSeconds(Section section) {
+    const double total = Elapsed(g_start, Clock::now());
+    const double seconds_per_tick = total / double(std::max<std::uint64_t>(1, Ticks() - g_start_ticks));
+    return double(SectionTicks(int(section))) * seconds_per_tick;
+}
+
 std::string ProfileSummary() {
     const char* const* kNames = kSectionNames;
     const double total = Elapsed(g_start, Clock::now());
