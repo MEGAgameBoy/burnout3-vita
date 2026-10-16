@@ -282,7 +282,7 @@ void ShowStatus() {
     if (!count) lines.push_back("  (no HUD drawn)");
     g_editor.shown = count;
     char title[96];
-    std::snprintf(title, sizeof title, "HUD EDIT %zu/%zu", index, count);
+    std::snprintf(title, sizeof title, "HUD EDIT %llu/%llu", (unsigned long long)index, (unsigned long long)count);
     ps2host::SetWindowStatus(title);
     ps2host::SetWindowOverlay(lines);
 }
