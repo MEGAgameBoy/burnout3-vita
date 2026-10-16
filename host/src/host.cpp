@@ -506,9 +506,21 @@ public:
         // under this lock: a wake-up could be missed).
         const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
         std::chrono::steady_clock::time_point held_since{};
+        u64 said_at = 0;
         while (!finished_ && !g_report_stop.load() && std::chrono::steady_clock::now() < limit) {
             done_.wait_for(lock, std::min<std::chrono::steady_clock::duration>(
                                      std::chrono::milliseconds(500), limit - std::chrono::steady_clock::now()));
+            // No frame for ten seconds (in real time): where the host's
+            // threads are, then every thirty seconds - a run that stopped
+            // making frames says where it is while it is there.
+            const u64 last = LastFrameNs(), now = ClockNs();
+            if (!VirtualClock() && last && now > last + 10'000'000'000ull &&
+                (!said_at || said_at < last || now > said_at + 30'000'000'000ull)) {
+                said_at = now;
+                std::fprintf(stderr, "[host] no frame for %.0f s; the host's threads: %s\n", double(now - last) / 1e9,
+                             Activities().c_str());
+                std::fflush(stderr);
+            }
 #ifdef __vita__
             // L, R, SELECT and START held three seconds: the player's stop
             // (RequestReportStop). Looked at here, on the watchdog's own
@@ -587,7 +599,10 @@ void RequestReportStop(const std::string& why) {
     std::lock_guard<std::mutex> hold(g_report_stop_lock);
     if (g_report_stop.exchange(true)) return;
     g_report_stop_why = why;
-    std::fprintf(stderr, "[host] stopping: %s - the report follows\n", why.c_str());
+    // Where the host's threads are now, before the stop moves them (the EE's
+    // thread says "-" in the report: it is past what it was doing by then).
+    std::fprintf(stderr, "[host] stopping: %s - the report follows; the host's threads now: %s\n", why.c_str(),
+                 Activities().c_str());
 }
 
 int Run(const Options& options) {

@@ -442,17 +442,22 @@ std::atomic<u64> g_last_vblank_ns{0};       // LastVblankNs
 void VblankTimer() {
     using clock = std::chrono::steady_clock;
     const auto period = std::chrono::microseconds(16683);      // NTSC, 59.94 Hz
-#if defined(__vita__)
     // No spin on the Vita: this thread shares the EE's core above it, and a
     // yield there gives way to threads of its own priority alone - a blank
     // the EE had not yet taken kept it spinning (the retry below), and the
     // EE never ran again (the third run on the hardware: a black screen
     // before the game's first line). Its sleep is precise enough alone.
-    const auto margin = std::chrono::microseconds(0);
+    // PS2HOST_TIMER_NO_SPIN=1 makes a PC's the same, to look at it above the
+    // EE on one core (engine/host/tests/timer_priority_test.cpp).
+#if defined(__vita__)
+    const bool no_spin = true;
 #else
-    const auto margin = std::chrono::microseconds(700);    // the precise sleep's (SleepUntil), then a spin
+    const bool no_spin = std::getenv("PS2HOST_TIMER_NO_SPIN") != nullptr;
 #endif
+    const auto margin = no_spin ? std::chrono::microseconds(0)
+                                : std::chrono::microseconds(700);  // the precise sleep's (SleepUntil), then a spin
     auto next = clock::now() + period;
+    bool slept_last = true;
     while (!StopRequested() && !g_timer_stop) {
         // Sleep to the next vertical blank, or to an EE timer's interrupt if that
         // comes first.
@@ -461,9 +466,18 @@ void VblankTimer() {
         s64 timer = NanosToNextTimerEvent();
         const s64 alarm = NanosToNextAlarm();
         if (alarm >= 0 && (timer < 0 || alarm < timer)) timer = alarm;
-        const auto timer_at = timer >= 0 ? clock::now() + std::chrono::nanoseconds(timer) : clock::time_point::max();
+        // An alarm already due (NanosToNextAlarm's 0) that the EE has yet to
+        // take is not waited for again: its wake was now, every pass, and the
+        // thread spun - on the Vita above the EE on its core, so the EE never
+        // ran to take it (the ninth run on the hardware: the race's loading
+        // asleep on its first SetAlarm, two minutes until the player's stop
+        // ended this thread). The retry below looks again.
+        const bool timer_untaken = s.timer_due.load();
+        const auto timer_at = timer >= 0 && !(timer_untaken && timer == 0)
+                                  ? clock::now() + std::chrono::nanoseconds(timer)
+                                  : clock::time_point::max();
         wake = std::min(wake, timer_at);
-        const bool untaken = s.vblank_due.load() || s.timer_due.load();
+        const bool untaken = s.vblank_due.load() || timer_untaken;
         const auto retry_at = clock::now() + std::chrono::microseconds(500);
         const bool retrying = untaken && retry_at < wake;
         if (retrying) wake = retry_at;
@@ -480,14 +494,17 @@ void VblankTimer() {
             TimerTick();
             continue;
         }
-        if (wake - clock::now() > margin) SleepUntil(wake - margin);
+        const auto pass_from = clock::now();
+        if (wake - pass_from > margin) SleepUntil(wake - margin);
         while (clock::now() < wake && !StopRequested() && !g_timer_stop) {
-#if defined(__vita__)
-            SleepUntil(wake);           // (woken a little early: asleep again, never spinning)
-#else
-            std::this_thread::yield();
-#endif
+            if (no_spin) SleepUntil(wake);     // (woken a little early: asleep again, never spinning)
+            else std::this_thread::yield();
         }
+        // Never two passes without a sleep between them: whatever else is due
+        // at once, the EE below this thread on its core must get to run.
+        const bool slept = wake > pass_from;
+        if (no_spin && !slept && !slept_last) SleepUntil(clock::now() + std::chrono::microseconds(100));
+        slept_last = slept;
         if (clock::now() >= next) {
             const auto late = clock::now() - next;
             if (late > std::chrono::milliseconds(1) && timeline::On())
@@ -864,19 +881,29 @@ void RunThreads(const lifted::Context& initial, u32 entry, s64 loop_budget) {
                 // An answer it sends wakes the EE at once.
                 const auto idle_from = std::chrono::steady_clock::now();
                 Activity activity(HostLane::kEe, "idle: every guest thread waits (the IOP runs meanwhile)");
+                // An alarm (SetAlarm) is taken here when due, not when the
+                // timer next looks: it sleeps to the next blank, the alarm
+                // set since unknown to it - a game asleep a few horizontal
+                // blanks at a time (Burnout 3's race loading) slept half a
+                // millisecond for each 190 us.
+                bool alarm_due = false;
                 while (!s.vblank_due && !s.timer_due && !StopRequested()) {
                     {
                         Timed timed(Section::Iop);
                         iop::Run(50'000);           // a short slice: the blank may come meanwhile
                     }
                     if (IopReplyPending()) break;
-                    SleepUntil(std::chrono::steady_clock::now() + std::chrono::microseconds(200));    // (precise: SleepUntil)
+                    const s64 alarm = NanosToNextAlarm();
+                    if ((alarm_due = alarm == 0)) break;
+                    auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(200);
+                    if (alarm > 0) until = std::min(until, std::chrono::steady_clock::now() + std::chrono::nanoseconds(alarm));
+                    SleepUntil(until);              // (precise: SleepUntil)
                 }
                 g_idle_ns.fetch_add(u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                             std::chrono::steady_clock::now() - idle_from).count()),
                                     std::memory_order_relaxed);
                 IdleSpan(idle_from);
-                if (s.timer_due.exchange(false)) {
+                if (s.timer_due.exchange(false) || alarm_due) {
                     DeliverTimers();
                     DeliverAlarms();
                 }

@@ -162,6 +162,12 @@ if(PS2HOST_VULKAN)
 endif()
 # The IOP interpreter's internals, for its instruction tests.
 target_include_directories(ps2host_tests PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src)
+# The vertical blank timer above the EE on one core, as on the Vita (Linux,
+# run as root: tests/timer_priority_test.cpp).
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(ps2host_timer_priority_test ${CMAKE_CURRENT_LIST_DIR}/tests/timer_priority_test.cpp)
+    target_link_libraries(ps2host_timer_priority_test PRIVATE ps2host)
+endif()
 # On the Vita the tests are an application of their own (ps2host_tests.vpk):
 # results on the screen and in ux0:data/ps2host_tests/results.txt.
 include(${PS2_ENGINE_DIR}/cmake/vita.cmake)

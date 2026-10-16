@@ -78,6 +78,7 @@ Options for finding out why boot stops, passed after `run --`:
 | `--vu-fast` | compiled VU1 programs leave out the MAC and STATUS flags no instruction of theirs can read ("Fast mode" below): exact but for those flags, ~15% less VU1 time; exact is the default |
 | `--audio-wav FILE` | the same output recorded to a WAV file, for checking sound without listening |
 | `PS2HOST_AUDIO_LOG=1`, `PS2HOST_AUDIO_MUTE=1`, `PS2HOST_SPU_LOG=1`, `PS2HOST_SPU_NO_REVERB=1` | sound, looked into: every two seconds how the SPU2's samples came (the longest wait between batches) and what the device made of them (ran out, dropped, fewest buffers queued); the device played unheard; once a second the voices sounding, their volumes fixed or sweeping, the main volumes; the reverb left out |
+| `PS2HOST_TIMER_NO_SPIN=1` | the vertical blank timer's thread as the Vita's: asleep to each event, never spinning to it (the Vita's thread shares the EE's core above it; `ps2host_timer_priority_test` puts that arrangement on one Linux core) |
 | `--watch-write ADDR` | every store to a guest address, with the function making it and four of its callers |
 | `--iop-trace` | every IOP library call the game's own modules make |
 | `--timeout S` | the time limit (30 s); `--budget N` makes a run deterministic |

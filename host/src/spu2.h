@@ -90,7 +90,14 @@ public:
        run silent, blocks decoded, reverb steps. */
     struct Work {
         u64 calls = 0, samples = 0, heard = 0, silent = 0, decoded = 0, reverb = 0;
+        // Time (ns): Advance in all, its interrupts' handlers, its output;
+        // the longest call and its samples, the longest gap between calls
+        // (us), calls cut to a second's worth.
+        u64 advance_ns = 0, irq_ns = 0, output_ns = 0, irqs = 0;
+        u64 longest_ns = 0, longest_samples = 0, longest_gap_us = 0, capped = 0;
     };
+    /* The longest call and gap since the last look, for the frame line. */
+    void ResetLongest() { work_.longest_ns = work_.longest_samples = work_.longest_gap_us = 0; }
     const Work& work() const { return work_; }
 
 private:

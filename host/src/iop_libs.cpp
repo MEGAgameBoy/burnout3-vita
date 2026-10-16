@@ -991,16 +991,23 @@ std::string SoundActivity(double seconds) {
     const Spu2::Work now = S().spu.work();
     const Spu2::Work was = last;
     last = now;
+    S().spu.ResetLongest();
     if (seconds <= 0 || now.calls == was.calls) return "";
     const double samples = double(now.samples - was.samples);
-    char text[200];
+    auto ms_per_s = [&](u64 a, u64 b) { return double(a - b) / 1e6 / seconds; };
+    char text[400];
     std::snprintf(text, sizeof text,
                   "SPU2 %.0f calls/s, %.0f samples/s, voices heard %.1f and running silent %.1f a sample, "
-                  "%.0f blocks decoded/s, %.0f reverb steps/s",
+                  "%.0f blocks decoded/s, %.0f reverb steps/s; its time %.0f ms/s: interrupts %.0f ms/s (%.0f/s), "
+                  "output %.0f ms/s; longest call %.1f ms (%llu samples), longest gap %.1f ms, %llu cut to a second",
                   double(now.calls - was.calls) / seconds, samples / seconds,
                   samples > 0 ? double(now.heard - was.heard) / samples : 0.0,
                   samples > 0 ? double(now.silent - was.silent) / samples : 0.0,
-                  double(now.decoded - was.decoded) / seconds, double(now.reverb - was.reverb) / seconds);
+                  double(now.decoded - was.decoded) / seconds, double(now.reverb - was.reverb) / seconds,
+                  ms_per_s(now.advance_ns, was.advance_ns), ms_per_s(now.irq_ns, was.irq_ns),
+                  double(now.irqs - was.irqs) / seconds, ms_per_s(now.output_ns, was.output_ns),
+                  double(now.longest_ns) / 1e6, static_cast<unsigned long long>(now.longest_samples),
+                  double(now.longest_gap_us) / 1e3, static_cast<unsigned long long>(now.capped - was.capped));
     return text;
 }
 
@@ -1030,6 +1037,7 @@ void SoundInterrupts(Vm& vm) {
     }
     // The SPU2's own interrupt: playback (or a transfer) reached IRQA.
     Timed timed(Section::Spu2);
+    Activity activity(HostLane::kEe, "the SPU2 mixing (and its interrupts' handlers)");
     s.spu.Advance(now, [&](u32 core) {
         if (s.spu2.function) vm.Call(s.spu2.function, {1u << core, s.spu2.arg});
         else if (s.irq_callback) vm.Call(s.irq_callback, {0});

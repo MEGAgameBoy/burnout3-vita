@@ -314,6 +314,9 @@ void SetGsTraceFrame(long long frame);
    GPU has it) - to set beside another run's (engine/tools/gsmem.py). */
 void SetGsDumpFrame(long long frame);
 void FrameDone(u64 frame);
+/* When the last frame was done (ClockNs), 0 before the first: the watchdog's
+   look at a run that stopped making frames. */
+u64 LastFrameNs();
 /* The window (window.cpp): opened with --window, presented each frame. */
 bool OpenWindow(const wchar_t* title, int width, int height);
 /* The game's name, for the window's title (instead of the host's own, "PS2

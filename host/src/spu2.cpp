@@ -6,6 +6,7 @@
 #include "spu2.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -424,7 +425,11 @@ void Spu2::CheckIrq(u32 core_hint, u32 from, u32 to, const std::function<void(u3
         if (!c.irq_enabled) continue;
         if (c.irqa >= from && c.irqa < to) {
             c.irq_enabled = false;              // fires once; the driver re-arms it
+            const auto began = std::chrono::steady_clock::now();
             irq(core);
+            ++work_.irqs;
+            work_.irq_ns += u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - began).count());
         }
     }
 }
@@ -543,6 +548,19 @@ void Spu2::Envelope(Voice& v) {
 }
 
 void Spu2::Advance(u64 now_us, const std::function<void(u32 core)>& irq) {
+    // Where its time goes, for the frame line (Work).
+    const auto began = std::chrono::steady_clock::now();
+    struct Clocked {
+        Work& w;
+        std::chrono::steady_clock::time_point began;
+        u64 samples = 0;
+        ~Clocked() {
+            const u64 ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now() - began).count());
+            w.advance_ns += ns;
+            if (ns > w.longest_ns) w.longest_ns = ns, w.longest_samples = samples;
+        }
+    } clocked{work_, began};
     // Transfers that touched IRQA.
     for (std::size_t i = 0; i + 1 < pending_irqs_.size(); i += 2)
         CheckIrq(0, pending_irqs_[i], pending_irqs_[i + 1] > pending_irqs_[i] ? pending_irqs_[i + 1] : pending_irqs_[i] + 1, irq);
@@ -550,6 +568,7 @@ void Spu2::Advance(u64 now_us, const std::function<void(u32 core)>& irq) {
     if (!last_us_) last_us_ = now_us;
     ++work_.calls;
     const double samples = double(now_us - last_us_) * kRate / 1e6;
+    if (now_us > last_us_) work_.longest_gap_us = std::max<u64>(work_.longest_gap_us, now_us - last_us_);
     last_us_ = now_us;
     if (samples <= 0) return;
     // Capture buffers are 512 signed samples each, written on the same
@@ -562,7 +581,9 @@ void Spu2::Advance(u64 now_us, const std::function<void(u32 core)>& irq) {
     owed_ += samples;
     u32 count = u32(owed_);
     owed_ -= count;
+    if (count > u32(kRate)) ++work_.capped;
     count = std::min<u32>(count, u32(kRate));
+    clocked.samples = count;
     // PS2HOST_SPU_LOG=1: once a second, the voices sounding and how their
     // volumes are set (fixed, or a sweep), and the cores' main volumes.
     static const bool log = std::getenv("PS2HOST_SPU_LOG") != nullptr;
@@ -733,7 +754,12 @@ void Spu2::Advance(u64 now_us, const std::function<void(u32 core)>& irq) {
         mixed_[2 * n] = s16(Clamp16(left));
         mixed_[2 * n + 1] = s16(Clamp16(right));
     }
-    if (output_ && count) output_(mixed_.data(), count);
+    if (output_ && count) {
+        const auto out = std::chrono::steady_clock::now();
+        output_(mixed_.data(), count);
+        work_.output_ns += u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now() - out).count());
+    }
 }
 
 }  // namespace iop
