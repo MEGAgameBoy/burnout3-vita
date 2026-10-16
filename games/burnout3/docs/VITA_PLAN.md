@@ -154,6 +154,20 @@ RWA's), the SPU2 still 41-50% after the reverb's fix - the next thing to
 make cheaper, once the new counters say what it spends on (voices heard,
 voices running silent, blocks decoded).
 
+**The seventh run (2026-10-16): the boot's load done, the next one slow.**
+The memory-card worker ran (it made the card's folder), the boot's load
+finished in 29.4 s (163 steps; stage 23), and the main loop went on to
+0x0019A950, the frontend world's load a phase a frame - at 7.9 blanks a
+second, the EE busy, still on the LOADING picture when the player stopped
+at 0:54. No frame line was printed after the load: 600 frames took longer
+than that (now also every ten seconds). The SPU2's counters named its
+cost: no voice heard, 42 running silent, core 0's reverb, 46-49% of the
+EE's thread - the silent voices' sample-before bookkeeping, now skipped
+(identical output; -43% under qemu-arm). The display drew 320 pictures a
+second in fast-forward (now paced by the screen: two waiting, the next is
+dropped). Next: the frame line's new parts (functions called most, disc
+reads) on the frontend's load, and the structured code.
+
 The GPU tests on the hardware (sixth run of them: 6 failures left, all
 REGION_CLAMP/REPEAT and FBMSK within a channel): every depth surface the probe tried (DF32,
 DF32 + S8, S8D24; linear or tiled; CDRAM or LPDDR) keeps depth across scenes
