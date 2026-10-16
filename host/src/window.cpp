@@ -468,8 +468,12 @@ void StatusFrame(u64 frame) {
         // The screen's picture (OpenScreen): the speed in a line over it.
         static u64 pictures_then = 0;
         const u64 pictures = g_screen_pictures.load();
-        std::snprintf(line, sizeof line, "%.1f pictures/s   blanks %.1f/s, %llu lost   %ld:%02ld",
-                      seconds > 0 ? double(pictures - pictures_then) / seconds : 0.0,
+        double rate = seconds > 0 ? double(pictures - pictures_then) / seconds : 0.0;
+#ifdef PS2HOST_GXM
+        // The GPU drawing (--gpu): every frame's end shown, as the display counts.
+        if (g_screen_display && GpuPrimary()) rate = g_screen_display->PresentsPerSecond();
+#endif
+        std::snprintf(line, sizeof line, "%.1f pictures/s   blanks %.1f/s, %llu lost   %ld:%02ld", rate,
                       seconds > 0 ? double(frame - frame_then) / seconds : 0.0,
                       (unsigned long long)(lost - lost_then), running / 60, running % 60);
         {
@@ -477,6 +481,13 @@ void StatusFrame(u64 frame) {
             Status().caption = SettingOn("fps_counter", true) ? line : "";     // the PC's F1 counter, on here
             Status().aspect = SettingAspect();
         }
+#ifdef PS2HOST_GXM
+        // The GPU drawing: no OpenScreen handler to carry these over.
+        if (g_screen_display && GpuPrimary()) {
+            ScreenCaption(SettingOn("fps_counter", true) ? line : "");
+            g_screen_display->SetAspect(SettingAspect());
+        }
+#endif
         shown = now;
         frame_then = frame;
         lost_then = lost;
@@ -732,6 +743,8 @@ bool WindowFullscreen() {
 ps2gpu::Display* WindowDisplay() {
 #ifdef PS2HOST_VULKAN
     return g_display.get();
+#elif defined(PS2HOST_GXM)
+    return g_screen_display.get();         // the Vita's screen through GXM, when it could be had
 #else
     return nullptr;
 #endif

@@ -112,9 +112,12 @@ endif()
 # The Vita: its display through GXM (engine/gpu/gxm). PRIVATE: what links
 # ps2host - the game's generated code - compiles without its headers (a
 # change of flags would rebuild all of it).
+# Its GS renderer is compiled into the host: it reads GS local memory with
+# the host's gs::Memory.
 if(VITA)
     add_subdirectory(${PS2_ENGINE_DIR}/gpu/gxm ${CMAKE_BINARY_DIR}/ps2gxm)
     target_link_libraries(ps2host PRIVATE ps2gxm)
+    target_sources(ps2host PRIVATE ${PS2_ENGINE_DIR}/gpu/gxm/gxm_gs_renderer.cpp)
     target_compile_definitions(ps2host PRIVATE PS2HOST_GXM=1)
 endif()
 

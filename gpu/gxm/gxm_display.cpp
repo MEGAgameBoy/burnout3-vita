@@ -74,6 +74,7 @@ public:
     bool Start(std::string* error);
 
     bool Present(const std::uint32_t* pixels, std::uint32_t width, std::uint32_t height) override;
+    bool PresentImage(std::uint64_t image, int layout, std::uint32_t width, std::uint32_t height) override;
     bool Pump() override { return true; }
     bool Focused() const override { return true; }
     bool KeyDown(int) const override { return false; }
@@ -98,6 +99,10 @@ public:
 
 private:
     SceGxmFragmentProgram* MakeFragment(SceGxmShaderPatcherId id, std::string* error);
+    /* A texture onto the screen: the part of it scale_u, scale_v across and
+       down, at the aspect asked for, the overlay over it; then queued for
+       the display. */
+    void Show(SceGxmTexture texture, float scale_u, float scale_v);
 
     Device* device_ = nullptr;
     SceGxmRenderTarget* target_ = nullptr;
@@ -241,8 +246,8 @@ bool GxmDisplay::Start(std::string* error) {
         *error = "no memory for the display's textures";
         return false;
     }
-    vertices_ = static_cast<Vertex*>(vertex_memory_.base);
-    indices_ = reinterpret_cast<std::uint16_t*>(vertices_ + 8);
+    vertices_ = static_cast<Vertex*>(vertex_memory_.base);          // 8 a buffer: the picture's, the overlay's
+    indices_ = reinterpret_cast<std::uint16_t*>(vertices_ + 8 * kBuffers);
     for (std::uint16_t i = 0; i < 8; ++i) indices_[i] = i;
     std::fprintf(stderr, "[gxm] display: 960 x 544, %d buffers\n", kBuffers);
     return true;
@@ -250,27 +255,45 @@ bool GxmDisplay::Start(std::string* error) {
 
 bool GxmDisplay::Present(const std::uint32_t* pixels, std::uint32_t width, std::uint32_t height) {
     if (!pixels || width == 0 || height == 0 || width > kTextureSide || height > kTextureSide) return true;
-    // What the GPU drew last is done before its textures are written over
-    // (a picture's quad: well under a millisecond).
+    // What the GPU drew last is done before the picture's texture is written
+    // over (a picture's quad: well under a millisecond).
+    device_->CloseOpenScene();
     sceGxmFinish(device_->context());
-
     // The picture, its rows 8 texels apart (a linear texture's stride).
     const std::uint32_t stride = (width + 7) & ~7u;
     std::uint32_t* texels = static_cast<std::uint32_t*>(texture_memory_.base);
     for (std::uint32_t y = 0; y < height; ++y)
         std::memcpy(texels + std::size_t(y) * stride, pixels + std::size_t(y) * width, width * 4);
     sceGxmTextureInitLinear(&texture_, texels, SCE_GXM_TEXTURE_FORMAT_A8R8G8B8, stride, height, 0);
-    sceGxmTextureSetMinFilter(&texture_, SCE_GXM_TEXTURE_FILTER_LINEAR);
-    sceGxmTextureSetMagFilter(&texture_, SCE_GXM_TEXTURE_FILTER_LINEAR);
-    sceGxmTextureSetUAddrMode(&texture_, SCE_GXM_TEXTURE_ADDR_CLAMP);
-    sceGxmTextureSetVAddrMode(&texture_, SCE_GXM_TEXTURE_ADDR_CLAMP);
+    Show(texture_, float(width) / float(stride), 1.0f);
+    return true;
+}
 
+bool GxmDisplay::PresentImage(std::uint64_t image, int layout, std::uint32_t width, std::uint32_t height) {
+    (void)layout;
+    if (!image || !width || !height) return false;
+    // A GS renderer's target (gxm_gs_renderer.cpp's DisplayTarget): its
+    // pixels as a texture, drawn after what drew them - the GPU takes scenes
+    // in order.
+    device_->CloseOpenScene();
+    SceGxmTexture texture = *reinterpret_cast<const SceGxmTexture*>(std::uintptr_t(image));
+    const float tw = float(sceGxmTextureGetWidth(&texture)), th = float(sceGxmTextureGetHeight(&texture));
+    Show(texture, std::min(1.0f, float(width) / tw), std::min(1.0f, float(height) / th));
+    return true;
+}
+
+void GxmDisplay::Show(SceGxmTexture texture, float scale_u, float scale_v) {
+    sceGxmTextureSetMinFilter(&texture, SCE_GXM_TEXTURE_FILTER_LINEAR);
+    sceGxmTextureSetMagFilter(&texture, SCE_GXM_TEXTURE_FILTER_LINEAR);
+    sceGxmTextureSetUAddrMode(&texture, SCE_GXM_TEXTURE_ADDR_CLAMP);
+    sceGxmTextureSetVAddrMode(&texture, SCE_GXM_TEXTURE_ADDR_CLAMP);
     float aspect;
     {
         std::lock_guard<std::mutex> hold(lock_);
         aspect = aspect_;
         if (overlay_dirty_) {
             overlay_dirty_ = false;
+            sceGxmFinish(device_->context());       // the last overlay drawn, done with
             overlay_shown_w_ = overlay_width_;
             overlay_shown_h_ = overlay_height_;
             if (overlay_shown_w_ && overlay_shown_h_) {
@@ -301,43 +324,49 @@ bool GxmDisplay::Present(const std::uint32_t* pixels, std::uint32_t width, std::
     const float left = (kWidth - shown_w) / 2, top = (kHeight - shown_h) / 2;
     const float u0 = -left / shown_w, u1 = (kWidth - left) / shown_w;
     const float v0 = -top / shown_h, v1 = (kHeight - top) / shown_h;
-    // Clip space, y up; the strip's order: top left, bottom left, top right, bottom right.
-    vertices_[0] = {-1.0f, 1.0f, u0, v0};
-    vertices_[1] = {-1.0f, -1.0f, u0, v1};
-    vertices_[2] = {1.0f, 1.0f, u1, v0};
-    vertices_[3] = {1.0f, -1.0f, u1, v1};
+    // This buffer's vertices (the GPU may still read the others'). Clip
+    // space, y up; the strip's order: top left, bottom left, top right,
+    // bottom right.
+    Vertex* v = vertices_ + 8 * back_;
+    v[0] = {-1.0f, 1.0f, u0, v0};
+    v[1] = {-1.0f, -1.0f, u0, v1};
+    v[2] = {1.0f, 1.0f, u1, v0};
+    v[3] = {1.0f, -1.0f, u1, v1};
     const bool overlay = overlay_shown_w_ && overlay_shown_h_;
     if (overlay) {
         const float x0 = -1.0f + 2.0f * 4 / kWidth, y0 = 1.0f - 2.0f * 2 / kHeight;
         const float x1 = x0 + 2.0f * overlay_shown_w_ / kWidth, y1 = y0 - 2.0f * overlay_shown_h_ / kHeight;
         const float u = float(overlay_shown_w_) / float((overlay_shown_w_ + 7) & ~7u);
-        vertices_[4] = {x0, y0, 0.0f, 0.0f};
-        vertices_[5] = {x0, y1, 0.0f, 1.0f};
-        vertices_[6] = {x1, y0, u, 0.0f};
-        vertices_[7] = {x1, y1, u, 1.0f};
+        v[4] = {x0, y0, 0.0f, 0.0f};
+        v[5] = {x0, y1, 0.0f, 1.0f};
+        v[6] = {x1, y0, u, 0.0f};
+        v[7] = {x1, y1, u, 1.0f};
     }
 
     SceGxmContext* context = device_->context();
     int r = sceGxmBeginScene(context, 0, target_, nullptr, nullptr, syncs_[back_], &surfaces_[back_], &depth_);
     if (r < 0) {
         std::fprintf(stderr, "[gxm] sceGxmBeginScene %s\n", Hex(r).c_str());
-        return true;
+        return;
     }
+    sceGxmSetViewportEnable(context, SCE_GXM_VIEWPORT_ENABLED);
+    sceGxmSetViewport(context, kWidth / 2.0f, kWidth / 2.0f, kHeight / 2.0f, -(kHeight / 2.0f), 0.5f, 0.5f);
+    sceGxmSetRegionClip(context, SCE_GXM_REGION_CLIP_OUTSIDE, 0, 0, kWidth - 1, kHeight - 1);
     sceGxmSetFrontDepthFunc(context, SCE_GXM_DEPTH_FUNC_ALWAYS);
     sceGxmSetFrontDepthWriteEnable(context, SCE_GXM_DEPTH_WRITE_DISABLED);
     sceGxmSetVertexProgram(context, vertex_program_);
     sceGxmSetFragmentProgram(context, picture_program_);
     void* uniforms = nullptr;
     sceGxmReserveFragmentDefaultUniformBuffer(context, &uniforms);
-    const float scale[2] = {float(width) / float(stride), 1.0f};
+    const float scale[2] = {scale_u, scale_v};
     sceGxmSetUniformDataF(uniforms, scale_, 0, 2, scale);
-    sceGxmSetFragmentTexture(context, 0, &texture_);
-    sceGxmSetVertexStream(context, 0, vertices_);
+    sceGxmSetFragmentTexture(context, 0, &texture);
+    sceGxmSetVertexStream(context, 0, v);
     sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLE_STRIP, SCE_GXM_INDEX_FORMAT_U16, indices_, 4);
     if (overlay) {
         sceGxmSetFragmentProgram(context, overlay_program_);
         sceGxmSetFragmentTexture(context, 0, &overlay_texture_);
-        sceGxmSetVertexStream(context, 0, vertices_);
+        sceGxmSetVertexStream(context, 0, v);
         sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLE_STRIP, SCE_GXM_INDEX_FORMAT_U16, indices_ + 4, 4);
     }
     sceGxmEndScene(context, nullptr, nullptr);
@@ -352,7 +381,6 @@ bool GxmDisplay::Present(const std::uint32_t* pixels, std::uint32_t width, std::
     presented_.push_back(now);
     while (!presented_.empty() && now - presented_.front() > std::chrono::seconds(1)) presented_.pop_front();
     presents_per_second_.store(double(presented_.size()));
-    return true;
 }
 
 }  // namespace

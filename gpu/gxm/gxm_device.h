@@ -16,6 +16,7 @@
 #include <psp2/kernel/sysmem.h>
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <string>
 
@@ -61,6 +62,14 @@ public:
     /* Whether libshacccg could be loaded (tried once, by the first compile). */
     bool compiler() const { return compiler_ > 0; }
 
+    /* GXM has one scene open at a time: the GS renderer's, while it draws
+       into a target. What else begins one (the display) closes it first,
+       through what the renderer set here. */
+    void SetSceneCloser(std::function<void()> closer) { closer_ = std::move(closer); }
+    void CloseOpenScene() {
+        if (closer_) closer_();
+    }
+
 private:
     bool LoadCompiler(std::string* error);
 
@@ -74,6 +83,7 @@ private:
         SceGxmShaderPatcherId id;
     };
     std::map<std::string, Kept> programs_;
+    std::function<void()> closer_;
 };
 
 /* The process's device (GXM has one context to give). */

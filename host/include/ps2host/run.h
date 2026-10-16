@@ -344,7 +344,8 @@ void QuitGame();
    it. A copy - the guest's packets stay as the game wrote them - on the EE
    thread, in order. Widescreen: a port places its HUD in a wider picture. */
 void SetPath2Filter(std::function<void(u32* words, u32 count, u32 from)> filter);
-/* The window's display, null when there is none (or no Vulkan one). */
+/* The window's display, null when there is none (or no Vulkan one; the
+   Vita's GXM one there). */
 ps2gpu::Display* WindowDisplay();
 /* What the window shows instead of the software GS's picture (BGRA, as
    Gs::Picture gives it); false falls back to the software picture. */

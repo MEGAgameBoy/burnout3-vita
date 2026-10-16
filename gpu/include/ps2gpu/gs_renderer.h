@@ -297,6 +297,9 @@ public:
     }
 };
 std::unique_ptr<GsRenderer> CreateGsRenderer(Gpu& gpu, std::string* error);
+/* The Vita's (engine/gpu/gxm): GXM, on the device the GXM display shares;
+   null, with `error` saying why, without it (no libshacccg). */
+std::unique_ptr<GsRenderer> CreateGxmGsRenderer(std::string* error);
 
 /* How often the CPU has waited for the GPU to finish what was submitted, and
    for how long in all: "N submissions, S s waiting". */

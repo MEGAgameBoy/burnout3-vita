@@ -39,7 +39,8 @@
  * blended pixel can be 1 brighter (invisible; in shadow runs, Burnout 3's frame
  * copy doubles it into the 16-bit display buffer).
  *
- * Without PS2HOST_VULKAN the options report that they are unavailable.
+ * Without PS2HOST_VULKAN (or the Vita's PS2HOST_GXM) the options report that
+ * they are unavailable.
  */
 
 #include <algorithm>
@@ -66,16 +67,18 @@
 #include "ps2host/settings.h"
 #include "ps2host/texture_pack.h"
 
-#if PS2HOST_VULKAN
+#if PS2HOST_VULKAN || PS2HOST_GXM
 #include "ps2gpu/display.h"
 #include "ps2gpu/gs_renderer.h"
 #endif
 
 namespace ps2host {
 
-#if PS2HOST_VULKAN
+#if PS2HOST_VULKAN || PS2HOST_GXM
 
+#if PS2HOST_VULKAN
 ps2gpu::Gpu* WindowGpu();       // window.cpp: the window's device, when there is one
+#endif
 
 namespace {
 
@@ -1530,7 +1533,12 @@ u32 ResolutionScale(const ps2gpu::Display* display) {
     return 1;
 }
 u32 WantedScale(const ps2gpu::Display* display) {
+#if PS2HOST_GXM
+    (void)display;
+    return 1;           // the Vita's renderer draws at the native resolution alone (so far)
+#else
     return std::min(8u, ResolutionScale(display) * SupersamplingFactor());
+#endif
 }
 
 /* A new internal resolution: what the GPU drew goes to its local memory
@@ -1605,6 +1613,10 @@ void OpenTexturePack() {
 
 bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
     static Bridge bridge;
+#if PS2HOST_GXM
+    // The Vita's GPU: one GXM device, the display's too.
+    bridge.renderer = ps2gpu::CreateGxmGsRenderer(error);
+#else
     // On the window's device when there is a window: one Vulkan device for both.
     ps2gpu::Gpu* device = WindowGpu();
     if (!device) {
@@ -1613,6 +1625,7 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
         device = bridge.gpu.get();
     }
     bridge.renderer = ps2gpu::CreateGsRenderer(*device, error);
+#endif
     if (!bridge.renderer) return false;
     g_bridge = &bridge;
     OpenTexturePack();
@@ -1679,7 +1692,12 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
             }
         });
     }
-    std::fprintf(stderr, "gpu: drawing on %s %s\n", device->Describe().c_str(),
+#if PS2HOST_GXM
+    const std::string described = "GXM, the Vita's GPU";
+#else
+    const std::string described = device->Describe();
+#endif
+    std::fprintf(stderr, "gpu: drawing on %s %s\n", described.c_str(),
                  bridge.primary ? "instead of the software GS" : "beside the software GS");
     return true;
 }
