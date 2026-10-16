@@ -82,6 +82,29 @@ the scaling on the GS thread), but it shows the menus while the GXM renderer
 is written, and makes M1's measurements with the drawing in or out
 (`--no-draw`).
 
+**M2 begun (2026-10-16), ahead of M1's measurements.** The software GS
+cannot draw a race on this processor whatever the gate decides, and the
+renderer's round trips go through the player's Vita (Vita3K has no
+libshacccg), so it is started while M1's numbers come in:
+
+* `engine/gpu/gxm`: the device (GXM, the shader patcher, Cg compiled by
+  libshacccg on the Vita and kept as GXP in `ux0:data/burnout3/shaders/`),
+  a `ps2gpu::Display` (the picture or a target drawn onto the screen,
+  filtered, at the aspect asked for, three buffers through the display
+  queue) and `gxm_gs_renderer.cpp`, a `GsRenderer` the bridge drives as it
+  drives the Vulkan one (`--gpu`, the Vita's default).
+* First version: targets linear RGBA8 in CDRAM, depth linear DF32 + S8
+  force-loaded and stored, a scene per target switch; fragment programs by
+  what a batch needs; the fixed-function blender with the GS's factor as
+  the fragment's alpha (alpha written in a second pass where it is); the
+  alpha test by discard, AFAIL's writes in a second pass; GS local memory
+  "on the GPU" a copy the CPU keeps, swizzled and decoded by the CPU after
+  the GPU has finished, and the GPU finished at each frame's end.
+* `ps2gxm_tests.vpk`: the Vulkan renderer's tests (gpu/tests) run on it.
+* Next, by what the hardware says: DATE (stencil, as on the PC), PABE,
+  PSMT8H through the CLUT, the frame pipelined (notifications rather than
+  a finish), fragment passes for the swizzles that cost.
+
 ## How it will be measured
 
 * **Exactness, without a renderer** - a per-frame checksum of everything the

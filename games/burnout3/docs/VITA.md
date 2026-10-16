@@ -5,24 +5,30 @@ not emulated - compiled for the Vita with VitaSDK. Unofficial and fan-made,
 like the PC port: you need your own disc (NTSC-U, SLUS-21050), and nothing of
 the game is in this repository or in what it builds from it.
 
-**Where it stands (M1, 2026-10-16): the software GS's picture.** Until the
-GXM renderer (M2), the picture is the one the engine's software GS draws -
-the CPU's work, so slow - scaled to the screen, with a line over it saying how
-fast the run goes. Its log says what it does. The plan, the measurements and
-the risks: [VITA_PLAN.md](VITA_PLAN.md).
+**Where it stands (M2 begun, 2026-10-16): the GPU draws, untested.** The
+GS is drawn by the Vita's GPU (GXM) in a first version written without the
+hardware at hand; where it cannot start (no libshacccg) or the `renderer`
+setting says `software`, the engine's software GS draws instead - the CPU's
+work, so slow. Either way the picture is scaled to the screen with a line
+over it saying how fast the run goes, and the log says what the game does.
+The plan, the measurements and the risks: [VITA_PLAN.md](VITA_PLAN.md).
 
 ## Installing and running
 
 1. A Vita with HENkaku/Ensō (or h-encore) and VitaShell.
 2. Install `burnout3.vpk` with VitaShell. Its data directory is
    `ux0:data/burnout3/` (made at the first start).
-3. Put the image of your own disc in that directory, as an `.iso` (or a
+3. Install libshacccg (`ur0:data/libshacccg.suprx`, extracted from your
+   Vita's own firmware as most vitaGL homebrew asks): the GPU's shaders are
+   compiled with it at the first start and kept in `ux0:data/burnout3/shaders/`.
+   Without it the game runs, drawn by the CPU.
+4. Put the image of your own disc in that directory, as an `.iso` (or a
    `.cue` with its `.bin`):
    `ux0:data/burnout3/Burnout 3 - Takedown.iso`. The port also looks in
    `data/burnout3/` on `uma0:`, `imc0:`, `grw0:` and `xmc0:` (memory cards and
    SD adapters) and takes the first image that is the game's disc; any other
    image is refused.
-4. Start it from its bubble.
+5. Start it from its bubble.
 
 What it writes, all in `ux0:data/burnout3/`: `burnout3.log` (send it with any
 report), `pc_settings.ini` (the disc chosen, the settings), `memcard/` (the
@@ -48,6 +54,19 @@ instead): what the game costs without its drawing.
 The line over the picture (pictures a second, the PS2's vertical blanks a
 second and how many of them the game was too busy for, the time) is the
 `fps_counter` setting, on unless `pc_settings.ini` turns it off.
+
+`pc_settings.ini` also takes, a `key=value` a line:
+
+| setting | |
+| --- | --- |
+| `renderer=software` | the software GS draws (the CPU), not the GPU |
+| `gpu_display=off` | the picture scaled by the CPU rather than the GPU (software GS only) |
+| `aspect=16:9` | the picture's shape: `4:3` (the default), `16:9`, `auto` (the screen's) |
+| `fps_counter=off` | no line over the picture |
+
+`ps2gxm_tests.vpk` (engine/host/tests/gxm_tests_main.cpp) runs the GPU
+renderer's tests on the hardware: each check on the screen and in
+`ux0:data/ps2gxm_tests/results.txt`.
 
 ### In Vita3K
 
@@ -104,9 +123,11 @@ The LiveArea's art is the port's own, drawn by
 
 ## Known issues
 
-* The picture is the software GS's (M2: the GXM renderer): slow, 1x, no
-  filtering. Sound goes to the Vita's speaker (sceAudioOut) but is not yet
-  heard on hardware.
+* The GPU renderer is a first version (VITA_PLAN.md, "M2"): native
+  resolution, the GPU finished at every frame's end, local memory's swizzles
+  and decodes on the CPU; the destination alpha test, PABE and FBMSK within a
+  channel not yet drawn. Sound goes to the Vita's speaker (sceAudioOut) but
+  is not yet heard on hardware.
 * No settings menu for the Vita's options yet; rumble does nothing (the Vita
   has none).
 * Speed: to be measured on the hardware (VITA_PLAN.md). Expect the race to
@@ -117,6 +138,6 @@ The LiveArea's art is the port's own, drawn by
 Main memory: 365 MB for the application (param.sfo's `ATTRIBUTE2=12`), of
 which newlib's heap takes 224 MB (`VITA_HEAP_MB`) - the guest's 32 MB of RAM,
 2 MB of IOP RAM, the GS's 4 MB and its thread's ring, the SPU2, the EE's
-fiber stacks (1 MB each) - and the executable the rest. CDRAM (112 MB) will
-hold the GXM renderer's targets and textures; until then two framebuffers
-for the picture and one for the text screens.
+fiber stacks (1 MB each) - and the executable the rest. CDRAM (112 MB):
+96 MB for the GPU renderer's targets, depth buffers and textures, three
+display buffers, the picture's texture, the text screen's framebuffer.
