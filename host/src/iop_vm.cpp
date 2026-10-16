@@ -378,14 +378,17 @@ u64 g_run_cap_ns = 0;           // SetRunTimeCap
 
 void SetRunTimeCap(u64 ns) { g_run_cap_ns = ns; }
 
-void Run(u64 slice, u64 max_ns) {
+u64 Run(u64 slice, u64 max_ns) {
     if (!max_ns) max_ns = g_run_cap_ns;
     Vm& vm = TheVm();
-    if (vm.threads.empty() && vm.alarms.empty() && vm.completions.empty()) return;
+    if (vm.threads.empty() && vm.alarms.empty() && vm.completions.empty()) return 0;
     const u64 start = vm.instructions;
     using Clock = std::chrono::steady_clock;
+    // The limit is the threads' time alone: the interrupts (the SPU2's
+    // mixing, its handlers) are owed whatever they take - counted in, they
+    // left the threads nothing, and the IOP stood still (the fifth run).
     const bool timed = max_ns && !VirtualClock();       // a scripted run's IOP goes by instructions alone
-    const Clock::time_point until = timed ? Clock::now() + std::chrono::nanoseconds(max_ns) : Clock::time_point{};
+    u64 threads_ns = 0;
     for (;;) {
         SoundInterrupts(vm);
         // Completion callbacks of finished SIF DMA (sceSifSetDmaIntr), as interrupts.
@@ -412,13 +415,15 @@ void Run(u64 slice, u64 max_ns) {
             if (t.ready && (!best || t.priority < best->priority ||
                             (t.priority == best->priority && t.queued < best->queued)))
                 best = &t;
-        if (!best || vm.instructions - start > slice) return;
-        if (timed && Clock::now() >= until) return;
+        if (!best || vm.instructions - start > slice) return threads_ns;
+        if (timed && threads_ns >= max_ns) return threads_ns;
         vm.current = best->id;
         vm.reschedule = false;
         bool stopped = false;
         const u64 before = vm.instructions;
+        const Clock::time_point began = timed ? Clock::now() : Clock::time_point{};
         const Outcome outcome = Execute(vm, best->c, kReturnFromCall, kQuantum, &stopped);
+        if (timed) threads_ns += u64(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count());
         best->executed += vm.instructions - before;
         if (best->c.pc == kRpcReturn) {                      // a server function returned
             const RpcRequest& done = best->serving;

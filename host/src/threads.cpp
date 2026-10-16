@@ -292,6 +292,7 @@ std::atomic<u32> g_intc_stat{0};
 // budget of real time, refilled at `share` percent of the time going by
 // (at most 50 ms of it saved up); the EE's idle waits give it the rest, as
 // they always did. 0: no budget (the PC's: a slice of instructions only).
+// Its threads' time only: the interrupts - the SPU2's mixing - always run.
 std::atomic<unsigned> g_iop_share{0};
 struct IopBudget {
     std::chrono::steady_clock::time_point last{};
@@ -323,10 +324,9 @@ bool DeliverFrame() {
     if (s.virtual_time && g_real_time_from && s.frames >= g_real_time_from) StartRealTime();
     {
         Timed timed(Section::Iop);
-        const auto began = std::chrono::steady_clock::now();
-        const u64 budget_ns = IopFrameBudgetNs(began);
-        iop::Run(20'000'000, budget_ns);    // the IOP's timers and sound interrupts
-        if (budget_ns) IopFrameSpent(std::chrono::steady_clock::now() - began);
+        const u64 budget_ns = IopFrameBudgetNs(std::chrono::steady_clock::now());
+        const u64 spent_ns = iop::Run(20'000'000, budget_ns);     // the IOP's timers and sound interrupts
+        if (budget_ns) IopFrameSpent(std::chrono::nanoseconds(spent_ns));
     }
     FrameDone(s.frames);
     bool ran = false;

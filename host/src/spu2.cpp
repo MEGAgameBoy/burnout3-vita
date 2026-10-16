@@ -332,21 +332,34 @@ Spu2::u32 Spu2::EffectEnd(const Core& c) const {
     return c.eea ? c.eea : (&c == &cores_[1] ? 0x1FFFFFu : 0x1DFFFFu);
 }
 
+// x mod size, by a subtraction where that is enough: the Vita's processor
+// has no divider, and a `%` is a call into the runtime's division.
+inline Spu2::u32 Wrap(Spu2::u32 x, Spu2::u32 size) {
+    if (x < size) return x;
+    x -= size;
+    return x < size ? x : x % size;
+}
+
 // One step of the reverb (24 kHz): psx-spx's "SPU Reverb Formula". Offsets
 // are in 8-byte units; "-2" there is the sample before (two bytes).
 void Spu2::Reverb(Core& c, s32 in_left, s32 in_right) {
     const u16* r = c.reverb;
     const u32 size = EffectEnd(c) + 1 - c.esa;
     if (!size || size > ram_.size()) return;
+    // The registers' offsets within the work area, reduced once and again
+    // only when the registers or the area change: reduced at every step,
+    // they were some forty divisions a step - on the Vita, which divides in
+    // software, most of the SPU2's time (a third of the EE's thread).
+    if (c.reverb_size != size || std::memcmp(c.reverb_seen, r, sizeof c.reverb_seen) != 0) {
+        c.reverb_size = size;
+        std::memcpy(c.reverb_seen, r, sizeof c.reverb_seen);
+        for (int i = 0; i < 32; ++i) c.reverb_at[i] = (u32(r[i]) * 8) % size;
+    }
     // A sample of the work area `offset` bytes past where the reverb is now,
     // wrapping within [ESA, EEA].
     const u32 position = c.reverb_position, esa = c.esa;
     u8* ram = ram_.data();
-    auto place = [&](u32 offset) {
-        u32 a = position + offset;
-        if (a >= size) a = a - size < size ? a - size : a % size;
-        return (esa + a) & kRamMask & ~1u;
-    };
+    auto place = [&](u32 offset) { return (esa + Wrap(position + offset, size)) & kRamMask & ~1u; };
     auto ReverbRead = [&](const Core&, u32 offset) {
         const u32 a = place(offset);
         return s32(s16(u16(ram[a] | (ram[a + 1] << 8))));
@@ -357,8 +370,9 @@ void Spu2::Reverb(Core& c, s32 in_left, s32 in_right) {
         ram[a] = u8(v);
         ram[a + 1] = u8(v >> 8);
     };
-    auto at = [&](int reg) { return (u32(r[reg]) * 8) % size; };
-    auto before = [&](int reg) { return (at(reg) + size - 2) % size; };
+    const u32* reduced = c.reverb_at;
+    auto at = [&](int reg) { return reduced[reg]; };
+    auto before = [&](int reg) { return Wrap(at(reg) + size - 2, size); };
     const s32 lin = Mul(in_left, r[kVLIn]), rin = Mul(in_right, r[kVRIn]);
     // Same side, then the other side's reflection.
     const s32 lsame = Mul(lin + Mul(ReverbRead(c, at(kDLSame)), r[kVWall]) - ReverbRead(c, before(kMLSame)),
@@ -380,7 +394,7 @@ void Spu2::Reverb(Core& c, s32 in_left, s32 in_right) {
                Mul(ReverbRead(c, at(kMRComb3)), r[kVComb3]) + Mul(ReverbRead(c, at(kMRComb4)), r[kVComb4]);
     // Late reverb: two all-pass filters.
     const u32 apf1 = at(kDApf1), apf2 = at(kDApf2);
-    auto delayed = [&](int reg, u32 by) { return (at(reg) + size - by % size) % size; };
+    auto delayed = [&](int reg, u32 by) { return Wrap(at(reg) + size - by, size); };    // by: an at(), below size
     lout = Clamp16(lout - Mul(ReverbRead(c, delayed(kMLApf1, apf1)), r[kVApf1]));
     ReverbWrite(c, at(kMLApf1), lout);
     lout = Mul(lout, r[kVApf1]) + ReverbRead(c, delayed(kMLApf1, apf1));
@@ -395,7 +409,7 @@ void Spu2::Reverb(Core& c, s32 in_left, s32 in_right) {
     rout = Mul(rout, r[kVApf2]) + ReverbRead(c, delayed(kMRApf2, apf2));
     c.reverb_out_left = Clamp16(lout);
     c.reverb_out_right = Clamp16(rout);
-    c.reverb_position = (c.reverb_position + 2) % size;
+    c.reverb_position = Wrap(c.reverb_position + 2, size);
 }
 
 void Spu2::CheckIrq(u32 core_hint, u32 from, u32 to, const std::function<void(u32)>& irq) {
@@ -440,6 +454,13 @@ void Spu2::NextBlock(Core& c, u32 index, const std::function<void(u32)>& irq) {
         v.nax = v.lsax;
     } else {
         v.nax = (block + kBlockBytes) & kRamMask;
+    }
+    // A silent voice runs on for its addresses and flags alone: its samples
+    // are never heard before a key-on (Start) decodes afresh, history and all.
+    if (v.phase == Phase::Off) {
+        const u32 next = v.nax & kRamMask & ~15u;
+        if (ram_[(next + 1) & kRamMask] & 4) v.lsax = next;     // Decode's loop start
+        return;
     }
     Decode(v);
 }
@@ -569,6 +590,7 @@ void Spu2::Advance(u64 now_us, const std::function<void(u32 core)>& irq) {
         }
     }
     mixed_.assign(std::size_t(count) * 2, 0);
+    const u64 whole_clock = u64(clock_);        // (a double's conversion is a runtime call on ARM: once)
     for (u32 n = 0; n < count; ++n) {
         s32 left = 0, right = 0;
         const u32 capture_offset = u32((first_sample + n) & 511) * 2;
@@ -584,8 +606,8 @@ void Spu2::Advance(u64 now_us, const std::function<void(u32 core)>& irq) {
             s32 core_left = 0, core_right = 0, wet_left = 0, wet_right = 0;
             for (u32 i = 0; i < 24; ++i) {
                 Voice& v = c.voices[i];
-                v.left.Step();
-                v.right.Step();
+                if (v.left.reg & 0x8000) v.left.Step();         // a sweep (Step's own test, without the call)
+                if (v.right.reg & 0x8000) v.right.Step();
                 s32 shaped = 0;
                 if (v.pitch && v.phase != Phase::Off) {
                     const u32 index = v.counter >> 12;
@@ -656,7 +678,7 @@ void Spu2::Advance(u64 now_us, const std::function<void(u32 core)>& irq) {
             // the pair.
             static const bool no_reverb = std::getenv("PS2HOST_SPU_NO_REVERB") != nullptr;   // to hear without it
             if ((c.attr & 4) && !no_reverb) {
-                if ((u64(clock_) + n) & 1) Reverb(c, Clamp16(c.reverb_in_left), Clamp16(c.reverb_in_right));
+                if ((whole_clock + n) & 1) Reverb(c, Clamp16(c.reverb_in_left), Clamp16(c.reverb_in_right));
                 else { c.reverb_in_left = wet_left; c.reverb_in_right = wet_right; }
                 core_left += (c.reverb_out_left * Volume(c.evoll)) >> 15;
                 core_right += (c.reverb_out_right * Volume(c.evolr)) >> 15;

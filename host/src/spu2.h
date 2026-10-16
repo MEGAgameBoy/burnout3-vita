@@ -141,6 +141,11 @@ private:
         u32 reverb_position = 0;        // bytes into the work area
         s32 reverb_in_left = 0, reverb_in_right = 0;     // the first of each pair of samples
         s32 reverb_out_left = 0, reverb_out_right = 0;   // held for the pair
+        // The registers' offsets reduced to the work area (Reverb), kept
+        // while the registers and the area's size stay what they were.
+        u16 reverb_seen[32] = {};
+        u32 reverb_size = 0;
+        u32 reverb_at[32] = {};
     };
     Core cores_[2];
     std::vector<u8> ram_;
