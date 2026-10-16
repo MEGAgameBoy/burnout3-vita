@@ -142,8 +142,8 @@ The LiveArea's art is the port's own, drawn by
 * The boot's load is slow (above): the game's code is still the plain lifted
   form (every EE register through memory) until the structured form's
   verification has finished, and the IOP's modules run in an interpreter on
-  the EE's core. The IOP gets at most a quarter of that core at each frame
-  (`--iop-share 25`, the Vita's default; `run.args` can say otherwise).
+  the EE's core. The IOP's threads get at most half of that core at each
+  frame (`--iop-share 50`, the Vita's default; `run.args` can say otherwise).
 * No settings menu for the Vita's options yet; rumble does nothing (the Vita
   has none).
 * Speed: to be measured on the hardware (VITA_PLAN.md). Expect the race to

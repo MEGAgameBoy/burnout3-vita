@@ -121,14 +121,28 @@ on the order of a second a frame. So:
 * `[frames]` says the IOP's and the SPU2's share of the EE's thread, the
   IOP's instructions a second and its busiest thread; `[load]` and
   `[frontend]` say how far the load is (port/overrides.cpp).
-* `--iop-share 25` (the Vita's default): the IOP's runs at frames take at
-  most a quarter of the EE's thread in real time, an RPC's 2 ms (iop_vm.cpp's
-  Run, threads.cpp's IopFrameBudgetNs). Scripted runs (virtual time) are
-  unchanged.
+* `--iop-share` (the Vita's default, 25 then 50): the IOP's threads at
+  frames take at most that share of the EE's thread in real time, an RPC's
+  2 ms (iop_vm.cpp's Run, threads.cpp's IopFrameBudgetNs). Scripted runs
+  (virtual time) are unchanged.
 * L, R, SELECT and START held three seconds stop the run with its report
   (RequestReportStop): where a stuck game is, without a debugger.
 
-The GPU tests on the hardware: every depth surface the probe tried (DF32,
+**The fifth run (2026-10-16)** stood still at the LOADING screen, the EE
+spinning (no idle time, no blank lost), and its [frames] lines named two
+things: the IOP running next to nothing, and **the SPU2 taking 40% of the
+EE's thread**. The first was the share's own bug - its time limit counted
+the interrupts, so the SPU2's mixing, which runs first, spent the budget
+and no IOP thread ran (an RPC went unanswered). The second was there in
+every run: the reverb reduced its register offsets modulo the work area's
+size at every step, ~2 million divisions a second of sound, and the
+Cortex-A9 has no divider (a runtime call each). Both fixed (engine
+0f04948): the limit counts the IOP's threads alone, the offsets are
+reduced once - output identical sample for sample on x86-64 and ARMv7,
+divisions 10 million to 167 for 5 s of sound. The share is 50 now.
+
+The GPU tests on the hardware (sixth run of them: 6 failures left, all
+REGION_CLAMP/REPEAT and FBMSK within a channel): every depth surface the probe tried (DF32,
 DF32 + S8, S8D24; linear or tiled; CDRAM or LPDDR) keeps depth across scenes
 with force load and store - the renderer's DF32 + S8 linear in CDRAM is
 right. The 20 failures left were mostly the renderer's own bug: ReadTarget
