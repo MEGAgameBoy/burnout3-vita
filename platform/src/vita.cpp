@@ -394,15 +394,19 @@ Screen& S() {
     return screen;
 }
 
-void Glyph(int column, int line, char ch, std::uint32_t colour) {
-    Screen& s = S();
+// A character at x0, y0 of a 960-pixel-wide framebuffer, on `background`.
+void DrawGlyph(std::uint32_t* pixels, int x0, int y0, char ch, std::uint32_t colour, std::uint32_t background) {
     const int index = (ch < 32 || ch > 126) ? '?' - 32 : ch - 32;
-    const int x0 = kMarginX + column * kConsoleGlyphWidth, y0 = kMarginY + line * kConsoleGlyphHeight;
     for (int y = 0; y < kConsoleGlyphHeight; ++y) {
         const std::uint16_t row = kConsoleFont[index][y];
-        std::uint32_t* p = s.pixels + std::size_t(y0 + y) * kPitch + x0;
-        for (int x = 0; x < kConsoleGlyphWidth; ++x) p[x] = (row & (0x8000u >> x)) ? colour : kBackground;
+        std::uint32_t* p = pixels + std::size_t(y0 + y) * kPitch + x0;
+        for (int x = 0; x < kConsoleGlyphWidth; ++x) p[x] = (row & (0x8000u >> x)) ? colour : background;
     }
+}
+
+void Glyph(int column, int line, char ch, std::uint32_t colour) {
+    DrawGlyph(S().pixels, kMarginX + column * kConsoleGlyphWidth, kMarginY + line * kConsoleGlyphHeight, ch, colour,
+              kBackground);
 }
 
 void NewLine() {
@@ -475,5 +479,100 @@ std::uint32_t ConsoleWaitButtons(std::uint32_t buttons) {
 }
 
 }  // namespace vita
+
+// ------------------------------------------------------------ the picture
+
+namespace {
+
+/* Two framebuffers in CDRAM, drawn in turn: the display takes the one just
+   drawn at the next refresh while the next picture goes into the other. */
+struct PictureScreen {
+    SceUID block = -1;
+    std::uint32_t* buffers[2] = {};
+    int next = 0;
+    // The placement each buffer's borders were last made black for (4:3 is
+    // pillarboxed): once, not every picture.
+    int left[2] = {-1, -1}, top[2] = {-1, -1}, width[2] = {}, height[2] = {};
+    std::vector<std::uint16_t> columns;     // the source column of each column shown
+    unsigned source_width = 0;
+};
+
+PictureScreen& Picture() {
+    static PictureScreen picture;
+    return picture;
+}
+
+constexpr int kScreenWidth = 960, kScreenHeight = 544, kScreenPitch = 960;
+constexpr int kCaptionColumns = 64;         // the caption's band, whatever its text: the last one covered
+constexpr std::uint32_t kCaptionBackground = 0xFF000000u;
+
+}  // namespace
+
+bool ShowPicture(const std::uint32_t* pixels, unsigned width, unsigned height, float aspect,
+                 const std::string& caption) {
+    if (!pixels || width == 0 || height == 0 || width > 0xFFFF) return false;
+    PictureScreen& p = Picture();
+    if (p.block < 0) {
+        const SceSize one = SceSize(kScreenPitch) * kScreenHeight * 4;
+        const SceSize size = (2 * one + 0x3FFFF) & ~0x3FFFFu;       // CDRAM: in 256 KB
+        const SceUID block = sceKernelAllocMemBlock("ps2plat picture", SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW, size,
+                                                    nullptr);
+        if (block < 0) return false;
+        void* base = nullptr;
+        if (sceKernelGetMemBlockBase(block, &base) < 0) return false;
+        p.block = block;
+        p.buffers[0] = static_cast<std::uint32_t*>(base);
+        p.buffers[1] = p.buffers[0] + std::size_t(kScreenPitch) * kScreenHeight;
+    }
+    // The screen's height at `aspect`, or its width where that is wider.
+    int w = kScreenWidth, h = kScreenHeight;
+    if (aspect > 0.0f) {
+        w = int(std::lround(kScreenHeight * aspect));
+        if (w > kScreenWidth) {
+            w = kScreenWidth;
+            h = int(std::lround(kScreenWidth / aspect));
+        }
+    }
+    const int left = (kScreenWidth - w) / 2, top = (kScreenHeight - h) / 2;
+    const int b = p.next;
+    std::uint32_t* out = p.buffers[b];
+    if (p.left[b] != left || p.top[b] != top || p.width[b] != w || p.height[b] != h) {
+        std::fill(out, out + std::size_t(kScreenPitch) * kScreenHeight, 0xFF000000u);
+        p.left[b] = left, p.top[b] = top, p.width[b] = w, p.height[b] = h;
+    }
+    if (p.source_width != width || p.columns.size() != std::size_t(w)) {
+        p.columns.resize(std::size_t(w));
+        for (int x = 0; x < w; ++x) p.columns[std::size_t(x)] = std::uint16_t((2u * x + 1) * width / (2u * w));
+        p.source_width = width;
+    }
+    // Nearest pixel (the column and row whose centre is nearest), BGRA to
+    // the display's RGBA.
+    const std::uint16_t* columns = p.columns.data();
+    for (int y = 0; y < h; ++y) {
+        const unsigned source_y = (2u * y + 1) * height / (2u * h);
+        const std::uint32_t* in = pixels + std::size_t(source_y) * width;
+        std::uint32_t* row = out + std::size_t(top + y) * kScreenPitch + left;
+        for (int x = 0; x < w; ++x) {
+            const std::uint32_t c = in[columns[x]];
+            row[x] = 0xFF000000u | (c & 0x0000FF00u) | ((c & 0xFFu) << 16) | ((c >> 16) & 0xFFu);
+        }
+    }
+    if (!caption.empty()) {
+        for (int i = 0; i < kCaptionColumns; ++i)
+            vita::DrawGlyph(out, 4 + i * kConsoleGlyphWidth, 2,
+                            std::size_t(i) < caption.size() ? caption[std::size_t(i)] : ' ', vita::kYellow,
+                            kCaptionBackground);
+    }
+    SceDisplayFrameBuf frame{};
+    frame.size = sizeof frame;
+    frame.base = out;
+    frame.pitch = kScreenPitch;
+    frame.pixelformat = SCE_DISPLAY_PIXELFORMAT_A8B8G8R8;
+    frame.width = kScreenWidth;
+    frame.height = kScreenHeight;
+    if (sceDisplaySetFrameBuf(&frame, SCE_DISPLAY_SETBUF_NEXTFRAME) < 0) return false;
+    p.next = b ^ 1;
+    return true;
+}
 
 }  // namespace ps2plat

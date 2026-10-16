@@ -11,9 +11,11 @@
 
 #include "ps2plat/keys.h"       // windows.h on Windows; the virtual keys elsewhere
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <functional>
 #include <vector>
@@ -135,10 +137,12 @@ void PresentGdi() {
 bool GdiFocused() { return g_window && GetForegroundWindow() == g_window; }
 bool GdiKeyDown(int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; }
 #else
-// No GDI: the window is a display's (ps2gpu), or there is none.
-bool OpenGdiWindow(const wchar_t*, int, int) { return false; }
+// No GDI: the window is a display's (ps2gpu); on the Vita, until it has one,
+// the screen itself (OpenScreen); elsewhere there is none.
+bool OpenScreen();
+bool OpenGdiWindow(const wchar_t*, int, int) { return OpenScreen(); }
 void PresentGdi() {}
-bool GdiFocused() { return false; }
+bool GdiFocused() { return g_window != nullptr; }
 bool GdiKeyDown(int) { return false; }
 #endif
 
@@ -159,6 +163,63 @@ float SettingAspect() {
     if (aspect == "auto") return 0.0f;
     return 4.0f / 3.0f;
 }
+
+#ifndef _WIN32
+/* The Vita's screen as the window, until a display of ps2gpu's draws there:
+   at the end of each frame, on the GS thread (the EE goes on), the software
+   GS's picture - when it can have changed - scaled to the screen by the
+   platform layer, the run's speed over it (StatusFrame's caption). */
+struct ScreenStatus {
+    std::mutex lock;
+    std::string caption;
+    float aspect = 4.0f / 3.0f;
+};
+ScreenStatus& Status() {
+    static ScreenStatus status;
+    return status;
+}
+std::atomic<u64> g_screen_pictures{0};      // pictures shown, for the caption
+
+bool OpenScreen() {
+#ifdef __vita__
+    static int screen;
+    g_window = &screen;                     // open: never closed
+    Status().aspect = SettingAspect();
+    SetGsFrameHandler([](u64) {
+        gs::Gs& g = gs::TheGs();
+        if (!g.rasterize) return;           // --no-draw: the status screen instead (StatusFrame)
+        std::string caption;
+        float aspect;
+        {
+            std::lock_guard<std::mutex> hold(Status().lock);
+            caption = Status().caption;
+            aspect = Status().aspect;
+        }
+        // Nothing drawn, written or flipped since the last picture, and the
+        // same caption: the same picture.
+        static u64 primitives = ~0ull, uploads = ~0ull;
+        static u32 shown = ~0u;
+        static std::string shown_caption;
+        static float shown_aspect = 0.0f;
+        u32 fbp = 0, fbw = 0, psm = 0;
+        g.Displayed(&fbp, &fbw, &psm);
+        if (g.primitives() == primitives && g.uploads() == uploads && fbp == shown && caption == shown_caption &&
+            aspect == shown_aspect)
+            return;
+        static std::vector<u32> pixels;
+        u32 w = 0, h = 0;
+        if (!g.Picture(&pixels, &w, &h)) return;
+        const bool same = g.primitives() == primitives && g.uploads() == uploads && fbp == shown;
+        primitives = g.primitives(), uploads = g.uploads(), shown = fbp;
+        shown_caption = caption, shown_aspect = aspect;
+        if (ps2plat::ShowPicture(pixels.data(), w, h, aspect, caption) && !same) ++g_screen_pictures;
+    });
+    return true;
+#else
+    return false;
+#endif
+}
+#endif
 
 }  // namespace
 
@@ -342,7 +403,9 @@ void StatusFrame(u64 frame) {
 #ifdef PS2HOST_VULKAN
     if (g_display) return;
 #endif
+#ifdef _WIN32
     if (g_window) return;
+#endif
     using Clock = std::chrono::steady_clock;
     static const Clock::time_point started = Clock::now();
     static Clock::time_point shown{};
@@ -355,6 +418,27 @@ void StatusFrame(u64 frame) {
     const long running = long(std::chrono::duration_cast<std::chrono::seconds>(now - started).count());
     const u64 lost = LostVblanks();
     char line[160];
+#ifndef _WIN32
+    if (g_window && gs::TheGs().rasterize) {
+        // The screen's picture (OpenScreen): the speed in a line over it.
+        static u64 pictures_then = 0;
+        const u64 pictures = g_screen_pictures.load();
+        std::snprintf(line, sizeof line, "%.1f pictures/s   blanks %.1f/s, %llu lost   %ld:%02ld",
+                      seconds > 0 ? double(pictures - pictures_then) / seconds : 0.0,
+                      seconds > 0 ? double(frame - frame_then) / seconds : 0.0,
+                      (unsigned long long)(lost - lost_then), running / 60, running % 60);
+        {
+            std::lock_guard<std::mutex> hold(Status().lock);
+            Status().caption = SettingOn("fps_counter", true) ? line : "";     // the PC's F1 counter, on here
+            Status().aspect = SettingAspect();
+        }
+        shown = now;
+        frame_then = frame;
+        lost_then = lost;
+        pictures_then = pictures;
+        return;
+    }
+#endif
     std::vector<std::string> lines;
     lines.push_back(GameTitle().empty() ? std::string("PS2 port") : GameTitle());
     lines.push_back("");

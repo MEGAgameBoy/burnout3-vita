@@ -102,6 +102,17 @@ bool ReadController(ControllerState* state);
    screen. Cheap enough for once a second. */
 bool ShowStatus(const std::vector<std::string>& lines);
 
+// ------------------------------------------------------------ the picture
+/* The game's picture where the screen is the system's own and no display of
+   ps2gpu's draws it (the Vita, until its GXM renderer): 32-bit pixels, BGRA
+   in memory (B first), rows top-down, scaled to the screen at `aspect`
+   (width over height; 0 fills the screen), shown at the next refresh.
+   `caption`, when not empty, is a line of text over its top left (how fast
+   the run goes). False where there is no such screen: a window shows the
+   picture there. */
+bool ShowPicture(const std::uint32_t* pixels, unsigned width, unsigned height, float aspect,
+                 const std::string& caption);
+
 // ------------------------------------------------------------ files
 /* A file read at offsets, past 4 GB too (a DVD image is up to 8.5). */
 class ReadOnlyFile {

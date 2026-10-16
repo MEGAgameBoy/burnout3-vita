@@ -157,6 +157,11 @@ bool ShowStatus(const std::vector<std::string>& lines) {
     (void)lines;
     return false;
 }
+bool ShowPicture(const std::uint32_t* pixels, unsigned width, unsigned height, float aspect,
+                 const std::string& caption) {
+    (void)pixels, (void)width, (void)height, (void)aspect, (void)caption;
+    return false;
+}
 
 // ------------------------------------------------------------ files
 

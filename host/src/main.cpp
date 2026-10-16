@@ -154,9 +154,10 @@ std::vector<std::string> PlayArguments(const char* self) {
     std::vector<std::string> args = {self ? self : "port", "--disc", disc, "--memcard", ps2plat::JoinPath(here, "memcard"),
                                      "--audio", "--timeout", "315360000"};     // ten years
 #ifdef __vita__
-    // The Vita has no renderer yet: the game runs headless, the status screen
-    // and the log (--frame-times every ten seconds) saying how fast.
-    for (const char* arg : {"--no-draw", "--frame-times", "600"}) args.push_back(arg);
+    // The Vita has no GPU renderer yet: the software GS's picture on the
+    // screen (window.cpp's OpenScreen), the log (--frame-times every ten
+    // seconds) saying how fast. run.args's --no-draw: headless.
+    for (const char* arg : {"--window", "--frame-times", "600"}) args.push_back(arg);
 #else
     for (const char* arg : {"--window", "--gpu"}) args.push_back(arg);
 #endif
