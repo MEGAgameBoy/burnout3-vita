@@ -177,6 +177,10 @@ public:
    no Vulkan device or window to be had. */
 std::unique_ptr<Display> CreateVulkanDisplay(const char* title, int width, int height, std::string* error);
 
+/* The Vita's screen through GXM (engine/gpu/gxm); null, with `error` saying
+   why, when GXM or the display's programs cannot be had (no libshacccg). */
+std::unique_ptr<Display> CreateGxmDisplay(std::string* error);
+
 }  // namespace ps2gpu
 
 #endif  /* PS2GPU_DISPLAY_H */

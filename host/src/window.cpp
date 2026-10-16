@@ -32,6 +32,11 @@
 
 #include "ps2gpu/display.h"
 #endif
+#ifdef PS2HOST_GXM
+#include <algorithm>
+
+#include "ps2gpu/display.h"
+#endif
 
 namespace ps2host {
 
@@ -165,10 +170,11 @@ float SettingAspect() {
 }
 
 #ifndef _WIN32
-/* The Vita's screen as the window, until a display of ps2gpu's draws there:
-   at the end of each frame, on the GS thread (the EE goes on), the software
-   GS's picture - when it can have changed - scaled to the screen by the
-   platform layer, the run's speed over it (StatusFrame's caption). */
+/* The Vita's screen as the window: at the end of each frame, on the GS
+   thread (the EE goes on), the software GS's picture - when it can have
+   changed - drawn by the GPU (the GXM display, scaled and filtered) or,
+   without libshacccg, scaled by the CPU (ps2plat::ShowPicture); the run's
+   speed over it (StatusFrame's caption). */
 struct ScreenStatus {
     std::mutex lock;
     std::string caption;
@@ -179,12 +185,41 @@ ScreenStatus& Status() {
     return status;
 }
 std::atomic<u64> g_screen_pictures{0};      // pictures shown, for the caption
+#ifdef PS2HOST_GXM
+std::unique_ptr<ps2gpu::Display> g_screen_display;     // the GXM display, when it could be had
+#endif
+
+// The caption as the GXM display's overlay: yellow on black, as wide as 64
+// characters whatever its text.
+void ScreenCaption(const std::string& caption) {
+#ifdef PS2HOST_GXM
+    if (!g_screen_display) return;
+    if (caption.empty()) {
+        g_screen_display->SetOverlay({}, 0, 0);
+        return;
+    }
+    unsigned w = 0, h = 0;
+    std::vector<std::uint32_t> pixels = ps2plat::TextPixels(caption + std::string(64 - std::min<std::size_t>(64, caption.size()), ' '),
+                                                            0xFFFFD23Cu, 0xFF000000u, &w, &h);
+    g_screen_display->SetOverlay(std::move(pixels), w, h);
+#else
+    (void)caption;
+#endif
+}
 
 bool OpenScreen() {
 #ifdef __vita__
     static int screen;
     g_window = &screen;                     // open: never closed
     Status().aspect = SettingAspect();
+#ifdef PS2HOST_GXM
+    // gpu_display=off (pc_settings.ini): the CPU's picture even where the
+    // GPU's could be had.
+    std::string error = "off in the settings";
+    if (SettingOn("gpu_display", true)) g_screen_display = ps2gpu::CreateGxmDisplay(&error);
+    if (g_screen_display) Note("window", "window: " + g_screen_display->Describe());
+    else Note("window", "window: no GXM display (" + error + "); the CPU scales the picture");
+#endif
     SetGsFrameHandler([](u64) {
         gs::Gs& g = gs::TheGs();
         if (!g.rasterize) return;           // --no-draw: the status screen instead (StatusFrame)
@@ -211,6 +246,16 @@ bool OpenScreen() {
         if (!g.Picture(&pixels, &w, &h)) return;
         const bool same = g.primitives() == primitives && g.uploads() == uploads && fbp == shown;
         primitives = g.primitives(), uploads = g.uploads(), shown = fbp;
+#ifdef PS2HOST_GXM
+        if (g_screen_display) {
+            if (caption != shown_caption) ScreenCaption(caption);
+            if (aspect != shown_aspect) g_screen_display->SetAspect(aspect);
+            shown_caption = caption, shown_aspect = aspect;
+            g_screen_display->Present(pixels.data(), w, h);
+            if (!same) ++g_screen_pictures;
+            return;
+        }
+#endif
         shown_caption = caption, shown_aspect = aspect;
         if (ps2plat::ShowPicture(pixels.data(), w, h, aspect, caption) && !same) ++g_screen_pictures;
     });

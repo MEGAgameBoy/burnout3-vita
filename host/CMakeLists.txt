@@ -109,6 +109,14 @@ if(PS2HOST_VULKAN)
     target_link_libraries(ps2host PUBLIC ps2gpu)
     target_compile_definitions(ps2host PRIVATE PS2HOST_VULKAN=1)
 endif()
+# The Vita: its display through GXM (engine/gpu/gxm). PRIVATE: what links
+# ps2host - the game's generated code - compiles without its headers (a
+# change of flags would rebuild all of it).
+if(VITA)
+    add_subdirectory(${PS2_ENGINE_DIR}/gpu/gxm ${CMAKE_BINARY_DIR}/ps2gxm)
+    target_link_libraries(ps2host PRIVATE ps2gxm)
+    target_compile_definitions(ps2host PRIVATE PS2HOST_GXM=1)
+endif()
 
 if(MSVC)
     # Translated code throws lifted::Abort; its chunks are large.

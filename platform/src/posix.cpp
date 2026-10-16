@@ -71,6 +71,12 @@ bool ShowPicture(const std::uint32_t* pixels, unsigned width, unsigned height, f
     (void)pixels, (void)width, (void)height, (void)aspect, (void)caption;
     return false;
 }
+std::vector<std::uint32_t> TextPixels(const std::string& text, std::uint32_t colour, std::uint32_t background,
+                                      unsigned* width, unsigned* height) {
+    (void)text, (void)colour, (void)background;
+    *width = *height = 0;
+    return {};
+}
 
 // ------------------------------------------------------------ files
 

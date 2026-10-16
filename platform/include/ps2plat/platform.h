@@ -112,6 +112,11 @@ bool ShowStatus(const std::vector<std::string>& lines);
    picture there. */
 bool ShowPicture(const std::uint32_t* pixels, unsigned width, unsigned height, float aspect,
                  const std::string& caption);
+/* A line of text as pixels, BGRA (B first) rows top-down, in the platform's
+   own font - the Vita's text screen's, 10 x 20 - for an overlay; colours as
+   0xAARRGGBB. Empty where the platform has no font of its own. */
+std::vector<std::uint32_t> TextPixels(const std::string& text, std::uint32_t colour, std::uint32_t background,
+                                      unsigned* width, unsigned* height);
 
 // ------------------------------------------------------------ files
 /* A file read at offsets, past 4 GB too (a DVD image is up to 8.5). */

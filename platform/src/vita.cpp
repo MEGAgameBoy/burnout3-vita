@@ -575,4 +575,22 @@ bool ShowPicture(const std::uint32_t* pixels, unsigned width, unsigned height, f
     return true;
 }
 
+std::vector<std::uint32_t> TextPixels(const std::string& text, std::uint32_t colour, std::uint32_t background,
+                                      unsigned* width, unsigned* height) {
+    *width = unsigned(text.size()) * kConsoleGlyphWidth;
+    *height = kConsoleGlyphHeight;
+    std::vector<std::uint32_t> pixels(std::size_t(*width) * *height, background);
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        const char ch = text[i];
+        const int index = (ch < 32 || ch > 126) ? '?' - 32 : ch - 32;
+        for (int y = 0; y < kConsoleGlyphHeight; ++y) {
+            const std::uint16_t row = kConsoleFont[index][y];
+            std::uint32_t* out = pixels.data() + std::size_t(y) * *width + i * kConsoleGlyphWidth;
+            for (int x = 0; x < kConsoleGlyphWidth; ++x)
+                if (row & (0x8000u >> x)) out[x] = colour;
+        }
+    }
+    return pixels;
+}
+
 }  // namespace ps2plat
