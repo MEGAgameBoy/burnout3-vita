@@ -116,10 +116,16 @@ ninja -C games/burnout3/build/port/vita
 ```
 
 `derive.py` (the readable tier) is not needed to build: the port compiles
-the lifted code. `discovered.txt` and `vu_programs.txt` from a PC build of
-your own (`build/port/`, `build/`) go in the same places here: the code
-the game copies at run time, and its VU1 microprograms compiled ahead of
-time (without them VU1 runs interpreted, about 1.5x slower).
+the lifted code. The code a run meets that no function covers - a switch's
+cases laid out past their function, branches into other code - a PC build
+finds by running (`--discover`, one stop a run); the Vita's build finds it
+ahead, from the executable alone (`engine/tools/discover_static.py`, which
+`port.py --target vita` runs into `build/port/discovered.txt`). Without it
+the memory-card worker stopped the fifth run on the hardware. A PC build's
+own `discovered.txt` and `vu_programs.txt` (`build/port/`, `build/`) can go
+in the same places here: the code it found copied at run time, and the VU1
+microprograms compiled ahead of time (without them VU1 runs interpreted,
+about 1.5x slower).
 
 **VitaSDK's compiler.** VitaSDK's build scripts configure GCC with empty
 `CFLAGS`/`CXXFLAGS`, which builds the compiler itself unoptimised; on the

@@ -141,6 +141,19 @@ Cortex-A9 has no divider (a runtime call each). Both fixed (engine
 reduced once - output identical sample for sample on x86-64 and ARMv7,
 divisions 10 million to 167 for 5 s of sound. The share is 50 now.
 
+**The sixth run (2026-10-16): through the boot's load.** The frontend's
+start-up sequence went from stage 4 to 11 in 19 s, the load at 2.8 steps a
+second (0.4 before), the blanks eight times as fast - then the game stopped
+on a call to 0x00242AD8, code no function covers: the memory-card worker's
+switch cases, laid out past its function (FINDINGS, "memory card"). A PC
+build finds such code by running, one stop a run; the Vita cannot run the
+build, so `discover_static.py` finds it ahead (652 pieces, 88 KB), and
+`port.py --target vita` runs it. The run's [frames] lines: the IOP's
+threads 11-31% of the EE's thread (its busiest, thread 32 at 0x00011720:
+RWA's), the SPU2 still 41-50% after the reverb's fix - the next thing to
+make cheaper, once the new counters say what it spends on (voices heard,
+voices running silent, blocks decoded).
+
 The GPU tests on the hardware (sixth run of them: 6 failures left, all
 REGION_CLAMP/REPEAT and FBMSK within a channel): every depth surface the probe tried (DF32,
 DF32 + S8, S8D24; linear or tiled; CDRAM or LPDDR) keeps depth across scenes
