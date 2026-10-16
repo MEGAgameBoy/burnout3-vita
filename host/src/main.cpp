@@ -46,14 +46,16 @@ namespace {
 #if defined(PS2HOST_APP_NAME) && defined(__GNUC__)
 /* The application's name and the environment (the Vita's env.txt: it has
    no environment of its own) before any other static object is made: some
-   read their PS2HOST_* variable as they are. */
+   read their PS2HOST_* variable as they are. But after the libraries' own
+   start (priority 101): the Vita's pthreads start in a constructor of that
+   priority, and a function's static (AppName's) is guarded by their locks. */
 struct EarlyStart {
     EarlyStart() {
         ps2plat::SetAppName(PS2HOST_APP_NAME);
         ps2plat::LoadEnvironment();
     }
 };
-EarlyStart g_early_start __attribute__((init_priority(101)));
+EarlyStart g_early_start __attribute__((init_priority(110)));
 #endif
 
 /* The port is built for AVX2 (engine/host/CMakeLists.txt; the VU's lanes and

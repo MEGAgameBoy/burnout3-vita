@@ -9,9 +9,15 @@ elseif(VITA)
         ${CMAKE_CURRENT_LIST_DIR}/src/vita.cpp
         ${CMAKE_CURRENT_LIST_DIR}/src/fibers.cpp
         ${CMAKE_CURRENT_LIST_DIR}/src/fiber_arm.S)
+    # All of pthreads (pthread-embedded), not what is referenced: libstdc++
+    # calls them through weak references (gthr-posix.h), which a static link
+    # leaves null - without pthread_cancel it thinks there are no threads
+    # (std::thread throws EPERM, "Not owner"), without pthread_once or
+    # pthread_cond_* a function's static or a condition variable jumps to 0.
     target_link_libraries(ps2plat PUBLIC
         SceAudio_stub SceCtrl_stub SceTouch_stub ScePower_stub SceAppUtil_stub SceAppMgr_stub
-        SceSysmodule_stub SceDisplay_stub SceCommonDialog_stub SceLibKernel_stub pthread)
+        SceSysmodule_stub SceDisplay_stub SceCommonDialog_stub SceLibKernel_stub
+        -Wl,--whole-archive pthread -Wl,--no-whole-archive)
 else()
     set(ps2plat_sources
         ${CMAKE_CURRENT_LIST_DIR}/src/posix.cpp

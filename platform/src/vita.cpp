@@ -20,7 +20,6 @@
 #include <psp2/power.h>
 #include <psp2/touch.h>
 
-#include <pthread.h>
 #include <strings.h>
 
 #include <algorithm>
@@ -44,16 +43,6 @@ extern "C" {
    sound - which get what the EE's fibers get. */
 unsigned int _pthread_stack_default_user = 1024u * 1024u;
 }
-
-namespace {
-/* libstdc++ decides whether there are threads (gthr-posix.h's
-   __gthread_active_p) by a weak reference to pthread_cancel. In a static
-   link nothing else pulls it in, so it stayed null: every std::thread threw
-   EPERM ("Enable multithreading to use std::thread: Not owner" - the first
-   build on the hardware) and std::mutex locked nothing. A reference of our
-   own links it in. */
-__attribute__((used)) int (*const g_pthread_cancel)(pthread_t) = &pthread_cancel;
-}  // namespace
 
 namespace ps2plat {
 
