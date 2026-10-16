@@ -215,36 +215,40 @@ std::string FragmentSource(Variant v) {
                   "#define FAILING %u\n#define ALPHA_OUT %u\n#define TEX_FORMAT %u\n#define PABE %u\n",
                   v & 1u, (v >> kTfxShift) & 3u, (v >> 3) & 1u, (v >> 4) & 1u, int((v >> kAtstShift) & 15u) - 1,
                   (v >> 9) & 1u, (v >> kAlphaOutShift) & 3u, (v >> kTexFormatShift) & 3u, (v >> kPabeShift) & 3u);
-    // Colours in the GS's terms: a byte 0-255 is 0-1 here, and the GS's
-    // 0x80 = 1.0 where it multiplies is 128/255.
+    // In the GS's terms: bytes, its arithmetic on them - products shifted
+    // right by 7 (0x80 is 1.0), fog's by 8 - floored as it truncates. Read
+    // in from the varyings and textures as 0-1 (rounded back to bytes), out
+    // as a byte plus a quarter over 255: the hardware's conversion to 8 bits
+    // truncates (an untextured 0x11 came back 0x10), a quarter clears that
+    // and rounds to the byte too. (The first version, in 0-1 floats, came
+    // out a step off: MODULATE by 0x40, fog.)
     static const char body[] =
         "float4 main(float4 vColor : COLOR0, float3 vStq : TEXCOORD0, float vFog : TEXCOORD1,\n"
         "            uniform sampler2D uTexture : TEXUNIT0,\n"
         "#if TEX_FORMAT == 3\n"
         "            uniform sampler2D uClut : TEXUNIT1,\n"
         "#endif\n"
-        "            uniform float4 uParams,      // AREF, the FIX factor, TA0, TA1 (all over 255)\n"
-        "            uniform float4 uFog,         // FOGCOL's R, G, B over 255; AEM\n"
+        "            uniform float4 uParams,      // AREF, the FIX factor (over 255), TA0, TA1 - bytes but the factor\n"
+        "            uniform float4 uFog,         // FOGCOL's R, G, B (bytes); AEM\n"
         "            uniform float2 uTexScale) : COLOR {\n"
-        "    float3 rgb = vColor.rgb;\n"
-        "    float a = vColor.a;\n"
+        "    float4 v = floor(vColor * 255.0f + 0.5f);\n"
+        "    float3 rgb = v.rgb;\n"
+        "    float a = v.a;\n"
         "#if TEXTURED\n"
-        "    float4 t = tex2D(uTexture, vStq.xy / vStq.z * uTexScale);\n"
+        "    float4 t = floor(tex2D(uTexture, vStq.xy / vStq.z * uTexScale) * 255.0f + 0.5f);\n"
         "#if TEX_FORMAT == 1\n"
-        "    t.a = (uFog.w > 0.5f && dot(t.rgb, float3(1.0f, 1.0f, 1.0f)) == 0.0f) ? 0.0f : uParams.z;\n"
+        "    t.a = (uFog.w > 0.5f && t.r + t.g + t.b == 0.0f) ? 0.0f : uParams.z;\n"
         "#elif TEX_FORMAT == 2\n"
-        "    float bit = t.a >= (127.5f / 255.0f) ? 1.0f : 0.0f;\n"
-        "    t.rgb = floor(t.rgb * (255.0f / 8.0f) + 0.001f) * (8.0f / 255.0f);\n"
-        "    float black = dot(t.rgb, float3(1.0f, 1.0f, 1.0f)) == 0.0f ? 1.0f : 0.0f;\n"
-        "    t.a = bit > 0.5f ? uParams.w : ((uFog.w > 0.5f && black > 0.5f) ? 0.0f : uParams.z);\n"
+        "    float bit = t.a >= 128.0f ? 1.0f : 0.0f;\n"
+        "    t.rgb = floor(t.rgb / 8.0f) * 8.0f;\n"
+        "    t.a = bit > 0.5f ? uParams.w : ((uFog.w > 0.5f && t.r + t.g + t.b == 0.0f) ? 0.0f : uParams.z);\n"
         "#elif TEX_FORMAT == 3\n"
-        "    t = tex2D(uClut, float2((floor(t.a * 255.0f + 0.5f) + 0.5f) / 256.0f, 0.5f));\n"
+        "    t = floor(tex2D(uClut, float2((t.a + 0.5f) / 256.0f, 0.5f)) * 255.0f + 0.5f);\n"
         "#endif\n"
-        "    const float k = 255.0f / 128.0f;\n"
         "#if TFX == 0\n"
-        "    rgb = min(t.rgb * rgb * k, 1.0f);\n"
+        "    rgb = min(floor(t.rgb * v.rgb / 128.0f), 255.0f);\n"
         "#if TCC\n"
-        "    a = min(t.a * a * k, 1.0f);\n"
+        "    a = min(floor(t.a * v.a / 128.0f), 255.0f);\n"
         "#endif\n"
         "#elif TFX == 1\n"
         "    rgb = t.rgb;\n"
@@ -252,52 +256,53 @@ std::string FragmentSource(Variant v) {
         "    a = t.a;\n"
         "#endif\n"
         "#else\n"
-        "    rgb = min(t.rgb * rgb * k + a, 1.0f);\n"
+        "    rgb = min(floor(t.rgb * v.rgb / 128.0f) + v.a, 255.0f);\n"
         "#if TCC && TFX == 2\n"
-        "    a = min(t.a + a, 1.0f);\n"
+        "    a = min(t.a + v.a, 255.0f);\n"
         "#elif TCC\n"
         "    a = t.a;\n"
         "#endif\n"
         "#endif\n"
         "#endif\n"
         "#if FOG\n"
-        "    rgb = (vFog * rgb + (1.0f - vFog) * uFog.rgb) * (255.0f / 256.0f);\n"
+        "    float f = floor(vFog * 255.0f + 0.5f);\n"
+        "    rgb = floor((f * rgb + (255.0f - f) * uFog.rgb) / 256.0f);\n"
         "#endif\n"
         "#if ATST >= 0\n"
-        "    float a8 = floor(a * 255.0f + 0.5f), ref = floor(uParams.x * 255.0f + 0.5f);\n"
-        "    bool pass = true;\n"
+        "    bool passed = true;\n"
         "#if ATST == 0\n"
-        "    pass = false;\n"
+        "    passed = false;\n"
         "#elif ATST == 2\n"
-        "    pass = a8 < ref;\n"
+        "    passed = a < uParams.x;\n"
         "#elif ATST == 3\n"
-        "    pass = a8 <= ref;\n"
+        "    passed = a <= uParams.x;\n"
         "#elif ATST == 4\n"
-        "    pass = a8 == ref;\n"
+        "    passed = a == uParams.x;\n"
         "#elif ATST == 5\n"
-        "    pass = a8 >= ref;\n"
+        "    passed = a >= uParams.x;\n"
         "#elif ATST == 6\n"
-        "    pass = a8 > ref;\n"
+        "    passed = a > uParams.x;\n"
         "#elif ATST == 7\n"
-        "    pass = a8 != ref;\n"
+        "    passed = a != uParams.x;\n"
         "#endif\n"
         "#if FAILING\n"
-        "    if (pass) discard;\n"
+        "    if (passed) discard;\n"
         "#else\n"
-        "    if (!pass) discard;\n"
+        "    if (!passed) discard;\n"
         "#endif\n"
         "#endif\n"
         "#if PABE == 1\n"
-        "    if (a < (127.5f / 255.0f)) discard;\n"
+        "    if (a < 128.0f) discard;\n"
         "#elif PABE == 2\n"
-        "    if (a >= (127.5f / 255.0f)) discard;\n"
+        "    if (a >= 128.0f) discard;\n"
         "#endif\n"
+        "    float4 out_ = float4((rgb + 0.25f) / 255.0f, (a + 0.25f) / 255.0f);\n"
         "#if ALPHA_OUT == 1\n"
-        "    a = min(a * (255.0f / 128.0f), 1.0f);\n"
+        "    out_.a = (min(floor(a * (255.0f / 128.0f) + 0.5f), 255.0f) + 0.25f) / 255.0f;   // the factor As / 0x80\n"
         "#elif ALPHA_OUT == 2\n"
-        "    a = uParams.y;\n"
+        "    out_.a = uParams.y;\n"
         "#endif\n"
-        "    return float4(rgb, a);\n"
+        "    return out_;\n"
         "}\n";
     return std::string(defines) + body;
 }
@@ -844,10 +849,11 @@ void GxmGsRenderer::Pass(Variant variant, const SceGxmBlendInfo& blend, const Gs
     if (params->params || params->fog || params->tex_scale) {
         void* uniforms = nullptr;
         sceGxmReserveFragmentDefaultUniformBuffer(ctx, &uniforms);
-        const float fix = std::min(1.0f, float(s.fix) / 128.0f);
-        const float p[4] = {float(s.aref) / 255.0f, fix, float(s.ta0) / 255.0f, float(s.ta1) / 255.0f};
-        const float fog[4] = {float(s.fogcol & 0xFF) / 255.0f, float((s.fogcol >> 8) & 0xFF) / 255.0f,
-                              float((s.fogcol >> 16) & 0xFF) / 255.0f, s.aem ? 1.0f : 0.0f};
+        // FIX / 0x80 as the blender reads a byte, a quarter on (the output's truncation).
+        const float fix = (std::min(std::floor(float(s.fix) * 255.0f / 128.0f + 0.5f), 255.0f) + 0.25f) / 255.0f;
+        const float p[4] = {float(s.aref), fix, float(s.ta0), float(s.ta1)};
+        const float fog[4] = {float(s.fogcol & 0xFF), float((s.fogcol >> 8) & 0xFF), float((s.fogcol >> 16) & 0xFF),
+                              s.aem ? 1.0f : 0.0f};
         if (params->params) sceGxmSetUniformDataF(uniforms, params->params, 0, 4, p);
         if (params->fog) sceGxmSetUniformDataF(uniforms, params->fog, 0, 4, fog);
         if (params->tex_scale) sceGxmSetUniformDataF(uniforms, params->tex_scale, 0, 2, tex_scale);

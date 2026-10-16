@@ -18,6 +18,7 @@
 #include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/power.h>
+#include <psp2/sysmodule.h>
 #include <psp2/touch.h>
 
 #include <strings.h>
@@ -293,6 +294,7 @@ void StartUp() {
     scePowerSetGpuXbarClockFrequency(166);
     sceIoMkdir("ux0:data", 0777);
     sceIoMkdir(DataDirectory().c_str(), 0777);
+    sceSysmoduleLoadModule(SCE_SYSMODULE_FIBER);           // the EE's fibers (fibers.cpp), loaded before they are needed
     sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG_WIDE);
     sceTouchSetSamplingState(SCE_TOUCH_PORT_BACK, SCE_TOUCH_SAMPLING_STATE_START);   // L2, R2 (ReadController)
 }

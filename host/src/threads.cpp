@@ -405,7 +405,16 @@ std::atomic<u64> g_last_vblank_ns{0};       // LastVblankNs
 void VblankTimer() {
     using clock = std::chrono::steady_clock;
     const auto period = std::chrono::microseconds(16683);      // NTSC, 59.94 Hz
+#if defined(__vita__)
+    // No spin on the Vita: this thread shares the EE's core above it, and a
+    // yield there gives way to threads of its own priority alone - a blank
+    // the EE had not yet taken kept it spinning (the retry below), and the
+    // EE never ran again (the third run on the hardware: a black screen
+    // before the game's first line). Its sleep is precise enough alone.
+    const auto margin = std::chrono::microseconds(0);
+#else
     const auto margin = std::chrono::microseconds(700);    // the precise sleep's (SleepUntil), then a spin
+#endif
     auto next = clock::now() + period;
     while (!StopRequested() && !g_timer_stop) {
         // Sleep to the next vertical blank, or to an EE timer's interrupt if that
@@ -435,7 +444,13 @@ void VblankTimer() {
             continue;
         }
         if (wake - clock::now() > margin) SleepUntil(wake - margin);
-        while (clock::now() < wake && !StopRequested() && !g_timer_stop) std::this_thread::yield();
+        while (clock::now() < wake && !StopRequested() && !g_timer_stop) {
+#if defined(__vita__)
+            SleepUntil(wake);           // (woken a little early: asleep again, never spinning)
+#else
+            std::this_thread::yield();
+#endif
+        }
         if (clock::now() >= next) {
             const auto late = clock::now() - next;
             if (late > std::chrono::milliseconds(1) && timeline::On())

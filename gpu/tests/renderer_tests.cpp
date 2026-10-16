@@ -15,9 +15,11 @@ namespace {
 int g_failures = 0;
 bool g_say_passes = false;      // RunRendererTests' caller asks for every check, not the failures alone
 
+std::uint32_t g_last_pixel = 0;     // the last Pixel read, for a failure's message
+
 void Check(bool ok, const char* what) {
     if (!ok) {
-        std::printf("FAIL: %s\n", what);
+        std::printf("FAIL: %s (the last pixel read: %08X, ABGR)\n", what, unsigned(g_last_pixel));
         ++g_failures;
     } else if (g_say_passes) {
         std::printf("ok:   %s\n", what);
@@ -63,8 +65,8 @@ void Rect(ps2gpu::GsRenderer& r, const ps2gpu::GsDrawState& state, float x0, flo
 std::uint32_t Pixel(ps2gpu::GsRenderer& r, std::uint32_t fbp, int x, int y) {
     std::vector<std::uint32_t> pixels;
     std::uint32_t w = 0, h = 0;
-    if (!r.ReadTarget(fbp, 1, 0, &pixels, &w, &h) || pixels.size() != std::size_t(w) * h) return 0xDEADBEEF;
-    return pixels[std::size_t(y) * w + x];
+    if (!r.ReadTarget(fbp, 1, 0, &pixels, &w, &h) || pixels.size() != std::size_t(w) * h) return g_last_pixel = 0xDEADBEEF;
+    return g_last_pixel = pixels[std::size_t(y) * w + x];
 }
 
 void Untextured(ps2gpu::GsRenderer& renderer) {
