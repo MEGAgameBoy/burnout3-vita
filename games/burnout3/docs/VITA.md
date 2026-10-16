@@ -38,8 +38,10 @@ game's saves, slot 1).
 
 **If it seems stuck**, hold **L, R, SELECT and START** together for three
 seconds: the game stops and the log ends with where it was - the game's
-call stack, its threads and the IOP's, the functions it called most - then
-the error screen comes up. Send that log. Meanwhile the log says, every 600
+call stack, its threads and the IOP's, what the host's own threads wait on,
+the functions it called most - then the error screen comes up (or, if the
+host itself is stuck, the game closes about ten seconds later, the log
+written first). Send that log. Meanwhile the log says, every 600
 of the PS2's vertical blanks, how fast it ran and where the EE's thread went
 (`[frames]`: the IOP's and the SPU2's shares, the IOP's busiest thread), and
 for a load how long it has gone on (`[load]`) and which stage of the

@@ -168,6 +168,15 @@ second in fast-forward (now paced by the screen: two waiting, the next is
 dropped). Next: the frame line's new parts (functions called most, disc
 reads) on the frontend's load, and the structured code.
 
+**The eighth run (2026-10-17): a hang where the fast-forward ends.** The
+boot's load took 21.8 s (29.4 before: the SPU2 at 35-38% of the EE's
+thread now), then the caption's clock stopped at 0:40 - the EE stuck in
+host code right after the frontend's first SetAlarm, where the seventh
+run had gone on at 7.9 blanks a second. That build's one change near it:
+the display queue's callback waiting for the refresh; taken back, and the
+host's threads now say what they wait on in a hang's report, which the
+stop buttons can ask for even then (they are watched off the EE's thread).
+
 The GPU tests on the hardware (sixth run of them: 6 failures left, all
 REGION_CLAMP/REPEAT and FBMSK within a channel): every depth surface the probe tried (DF32,
 DF32 + S8, S8D24; linear or tiled; CDRAM or LPDDR) keeps depth across scenes
