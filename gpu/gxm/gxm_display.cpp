@@ -33,7 +33,7 @@ using namespace gxm;
 
 constexpr std::uint32_t kWidth = 960, kHeight = 544, kPitch = 960;
 constexpr int kBuffers = 3;
-constexpr std::uint32_t kTextureSide = 1024;         // the largest picture taken (the GS's are 640 x 512 at most)
+constexpr std::uint32_t kTextureWidth = 1024, kTextureHeight = 576;   // the largest picture taken (the GS's: 640 x 512)
 constexpr std::uint32_t kOverlayWidth = 1024, kOverlayHeight = 64;
 
 const char kVertexSource[] =
@@ -237,7 +237,7 @@ bool GxmDisplay::Start(std::string* error) {
         *error = "sceGxmDepthStencilSurfaceInit " + Hex(r);
         return false;
     }
-    if (!Allocate(&texture_memory_, SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW, kTextureSide * kTextureSide * 4,
+    if (!Allocate(&texture_memory_, SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW, kTextureWidth * kTextureHeight * 4,
                   SCE_GXM_MEMORY_ATTRIB_READ, "gxm display picture") ||
         !Allocate(&overlay_memory_, SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW, kOverlayWidth * kOverlayHeight * 4,
                   SCE_GXM_MEMORY_ATTRIB_READ, "gxm display overlay") ||
@@ -254,7 +254,7 @@ bool GxmDisplay::Start(std::string* error) {
 }
 
 bool GxmDisplay::Present(const std::uint32_t* pixels, std::uint32_t width, std::uint32_t height) {
-    if (!pixels || width == 0 || height == 0 || width > kTextureSide || height > kTextureSide) return true;
+    if (!pixels || width == 0 || height == 0 || width > kTextureWidth || height > kTextureHeight) return true;
     // What the GPU drew last is done before the picture's texture is written
     // over (a picture's quad: well under a millisecond).
     device_->CloseOpenScene();

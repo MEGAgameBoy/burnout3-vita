@@ -424,7 +424,7 @@ u32 From16(u32 c) {
 }
 
 constexpr u32 kVertexRing = 4u << 20;           // 131,072 vertices a frame before the GPU is waited for
-constexpr u32 kHeapSize = 96u << 20;            // CDRAM: targets, depth buffers, textures
+constexpr u32 kHeapSize = 80u << 20;            // CDRAM: targets, depth buffers, textures (at most)
 constexpr u32 kMaxSide = 2048;
 
 class GxmGsRenderer final : public GsRenderer {
@@ -561,7 +561,13 @@ bool GxmGsRenderer::Init(std::string* error) {
         *error = "the GS fragment program could not be compiled";
         return false;
     }
-    if (!heap_.Init(kHeapSize, SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW, "gxm gs heap")) {
+    // As much CDRAM as there is, up to kHeapSize: the application's 112 MB
+    // less GXM's parameter buffer (16) and the display's (~10) left 85.75 on
+    // the first run on the hardware, where 96 could not be had.
+    u32 heap_size = kHeapSize;
+    while (heap_size >= (16u << 20) && !heap_.Init(heap_size, SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW, "gxm gs heap"))
+        heap_size -= 8u << 20;
+    if (heap_size < (16u << 20)) {
         *error = "no CDRAM for the GS's targets and textures";
         return false;
     }
@@ -580,7 +586,7 @@ bool GxmGsRenderer::Init(std::string* error) {
         Flush();
         CloseScene();
     });
-    std::fprintf(stderr, "[gxm] GS renderer: %u MB of CDRAM for targets and textures\n", unsigned(kHeapSize >> 20));
+    std::fprintf(stderr, "[gxm] GS renderer: %u MB of CDRAM for targets and textures\n", unsigned(heap_size >> 20));
     return true;
 }
 
