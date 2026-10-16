@@ -20,7 +20,7 @@ int RunHostTests(void (*observe)(const char* name, double ms, int failures));
 
 extern "C" {
 unsigned int _newlib_heap_size_user = 160u * 1024u * 1024u;
-const unsigned int sceUserMainThreadStackSize = 2u * 1024u * 1024u;
+unsigned int sceUserMainThreadStackSize = 2u * 1024u * 1024u;     // not const: a const has internal linkage, and the loader would not see it
 }
 
 namespace {

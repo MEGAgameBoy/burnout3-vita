@@ -37,7 +37,7 @@ extern "C" {
 #define PS2HOST_VITA_HEAP_MB 192
 #endif
 unsigned int _newlib_heap_size_user = PS2HOST_VITA_HEAP_MB * 1024u * 1024u;
-const unsigned int sceUserMainThreadStackSize = 2u * 1024u * 1024u;
+unsigned int sceUserMainThreadStackSize = 2u * 1024u * 1024u;     // not const: a const has internal linkage, and the loader would not see it
 }
 #endif
 
