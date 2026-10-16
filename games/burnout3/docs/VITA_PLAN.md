@@ -41,10 +41,24 @@ Found on the way: VitaSDK's build scripts build GCC unoptimised (empty
 at `-O3` for Ubuntu's GCC 13, and 32 min at the toolchain's default `-O3`.
 The compiler is being rebuilt with `-O2` (VITA.md, "VitaSDK's compiler").
 
-**M1 - under way.** `--no-draw`, a status screen, the Vita's controls,
-`run.args`, the LiveArea art; the game's code lifted from the player's
-executable (9,277 of 9,279 functions, as on the PC). Next: the VPK, and the
-first boot on the hardware.
+**M1 - first build on the hardware (2026-10-16).** The game's code lifted
+from the player's executable (9,277 of 9,279 functions, as on the PC); the
+code it copies into kernel memory at start-up found by a Linux build of the
+port run here without the disc (0x80076000 from 0x00485060, 0x80075000 from
+0x00484228 - it then stops where it needs the disc: RWA.IRX), and
+translated in. The Vita build: 59 MB of C++ to 25.7 MB of Thumb-2 code
+(text), in about ten minutes on two cores with the rebuilt compiler; with
+the 224 MB heap about 255 MB of the 365. `burnout3.vpk` (14.5 MB) handed
+over: headless (`--no-draw`), the status screen, sound, the log. This first
+build is from the lifted code as verification sees it - the plain form of
+every function; the structured form (smaller, faster) comes when
+verification has finished.
+
+Found on the way: VitaSDK's pthreads give std::thread 32 KB of stack
+(1 MB now); `const` hid the main thread's stack size from the loader;
+std::filesystem's `absolute()` mangles `ux0:` paths; port.py ran the port
+with the checks' round-to-nearest (PS2RT_EE_ROUND_NEAREST leaked from
+cppcheck.py) - each fixed.
 
 ## How it will be measured
 

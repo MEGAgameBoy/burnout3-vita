@@ -5,7 +5,7 @@ not emulated - compiled for the Vita with VitaSDK. Unofficial and fan-made,
 like the PC port: you need your own disc (NTSC-U, SLUS-21050), and nothing of
 the game is in this repository or in what it builds from it.
 
-**Where it stands (M1, 2026-10-15): no picture yet.** The Vita build runs the
+**Where it stands (M1, 2026-10-16): no picture yet.** The Vita build runs the
 game headless - a status screen says how fast it goes, its log what it does -
 while the GXM renderer is written (M2). The plan, the measurements and the
 risks: [VITA_PLAN.md](VITA_PLAN.md).
