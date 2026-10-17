@@ -9,9 +9,11 @@
 #include <psp2/ctrl.h>
 #include <psp2/kernel/processmgr.h>
 
+#include <chrono>
 #include <cstdio>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include <psp2/gxm.h>
 
@@ -19,6 +21,7 @@
 
 #include "../../gpu/gxm/gxm_device.h"
 #include "ps2gpu/gs_renderer.h"
+#include "ps2host/gs.h"
 #include "ps2plat/platform.h"
 #include "ps2plat/vita_console.h"
 
@@ -175,6 +178,154 @@ void DepthProbe() {
     }
 }
 
+/* GS local memory on the GPU (the GXM renderer's fragment passes): targets
+   and depth buffers swizzled into it and out of it must land where the GS
+   model puts them, byte for byte, in every format - whole, from a row on,
+   short of a 16-pixel group's end - and the CPU's writes reach it, straight
+   or through the ring. The host's GpuMemorySwizzlesAsTheGs, for the Vita;
+   and what it costs. */
+int GpuMemoryTests(ps2gpu::GsRenderer& renderer) {
+    using namespace ps2host::gs;
+    using u8 = std::uint8_t;
+    using u32 = std::uint32_t;
+    int failures = 0;
+    auto check = [&](bool ok, const std::string& what) {
+        std::printf("%s %s\n", ok ? "ok:  " : "FAIL:", what.c_str());
+        failures += !ok;
+    };
+    u32 seed = 12345;
+    auto next = [&] { seed = seed * 1664525u + 1013904223u; return seed; };
+    auto to16 = [](u32 c) {
+        return ((c >> 3) & 31) | (((c >> 11) & 31) << 5) | (((c >> 19) & 31) << 10) | ((c >> 31) << 15);
+    };
+    auto from16 = [](u32 c) {
+        return ((c & 31) << 3) | (((c >> 5) & 31) << 11) | (((c >> 10) & 31) << 19) | ((c & 0x8000) ? 0x80000000u : 0);
+    };
+    Memory reference;                               // what the GPU's copy must hold, all along
+    renderer.MemoryWrite(0, 16384, reference.data());
+    std::vector<u8> gpu_bytes(4u << 20);
+    auto differ = [&] {
+        renderer.MemoryRead(0, 16384, gpu_bytes.data());
+        u32 words = 0;
+        for (u32 i = 0; i < (4u << 20); i += 4) words += std::memcmp(gpu_bytes.data() + i, reference.data() + i, 4) != 0;
+        return words;
+    };
+    struct Format { u32 psm; bool depth; const char* name; };
+    const Format formats[] = {{PSMCT32, false, "CT32"}, {PSMCT24, false, "CT24"}, {PSMCT16, false, "CT16"},
+                              {PSMCT16S, false, "CT16S"}, {PSMZ32, true, "Z32"}, {PSMZ24, true, "Z24"},
+                              {PSMZ16, true, "Z16"}, {PSMZ16S, true, "Z16S"}};
+    struct Shape { u32 w, h, fbw, cols, first_row, rows; const char* name; };
+    const Shape shapes[] = {{128, 64, 2, 128, 0, 64, "whole"}, {128, 96, 2, 120, 5, 70, "columns 0-119, rows 5-69"},
+                            {100, 70, 2, 100, 0, 70, "100 x 70 over two pages a row"}};
+    u32 base = 0x40;
+    for (const Shape& shape : shapes)
+        for (const Format& f : formats) {
+            const bool sixteen = f.psm == PSMCT16 || f.psm == PSMCT16S || f.psm == PSMZ16 || f.psm == PSMZ16S;
+            const bool twenty_four = f.psm == PSMCT24 || f.psm == PSMZ24;
+            const u32 w = shape.w, h = shape.h, fbw = shape.fbw;
+            std::vector<u32> pixels(w * h);
+            for (u32& p : pixels) p = f.depth ? next() & (sixteen ? 0xFFFFu : 0xFFFFFFu) : next();
+            if (f.depth) {
+                renderer.UploadDepth(base, w, h, pixels.data());
+                renderer.DepthToMemory(base, w, h, fbw, f.psm, shape.cols, shape.rows, shape.first_row);
+            } else {
+                renderer.UploadTarget(base, fbw, f.psm, pixels.data(), w, h);
+                renderer.TargetToMemory(base, fbw, f.psm, shape.cols, shape.rows, shape.first_row);
+            }
+            for (u32 y = shape.first_row; y < shape.rows; ++y)
+                for (u32 x = 0; x < shape.cols; ++x) {
+                    const u32 c = pixels[y * w + x];
+                    const u32 v = !f.depth && sixteen ? to16(c) : c;
+                    const u32 as = f.depth ? PSMZ32 : PSMCT32;
+                    if (twenty_four) reference.Write(base * 32, fbw, x, y, as, (reference.Read(base * 32, fbw, x, y, as) & 0xFF000000u) | (v & 0xFFFFFFu));
+                    else reference.Write(base * 32, fbw, x, y, f.psm, v);
+                }
+            u32 wrong = differ();
+            char what[160];
+            std::snprintf(what, sizeof what, "%s, %s: into memory as the GS lays it out (%u words wrong)", f.name, shape.name, unsigned(wrong));
+            check(wrong == 0, what);
+            // Memory to image: other bytes there, from the CPU.
+            const u32 blocks = ((h + (sixteen ? 63 : 31)) / (sixteen ? 64 : 32)) * fbw * 32;
+            for (u32 i = base * 32 * 256; i < (base * 32 + blocks) * 256; ++i) reference.data()[i] = u8(next() >> 24);
+            renderer.MemoryWrite(base * 32, base * 32 + blocks, reference.data() + base * 32 * 256);
+            std::vector<u32> back;
+            u32 bw = 0, bh = 0;
+            if (f.depth) {
+                renderer.DepthFromMemory(base, w, h, fbw, f.psm);
+                renderer.ReadDepth(base, w, h, &back);
+                bw = w;
+            } else {
+                renderer.TargetFromMemory(base, fbw, f.psm, w, h);
+                renderer.ReadTarget(base, fbw, f.psm, &back, &bw, &bh);
+            }
+            wrong = 0;
+            for (u32 y = 0; y < h && back.size() >= bw * h; ++y)
+                for (u32 x = 0; x < w; ++x) {
+                    u32 raw = reference.Read(base * 32, fbw, x, y, f.psm);
+                    if (twenty_four) raw &= 0xFFFFFFu;
+                    // Depth goes through a float (Z / 2^32): exact up to 24 bits.
+                    const u32 want = f.depth ? (raw >= 0xFFFFFF80u ? 0xFFFFFFFFu : u32(float(raw))) : sixteen ? from16(raw) : raw;
+                    if (back[y * bw + x] != want) ++wrong;
+                }
+            std::snprintf(what, sizeof what, "%s, %s: out of memory as the GS reads it (%u pixels wrong)", f.name, shape.name, unsigned(wrong));
+            check(!back.empty() && wrong == 0, what);
+            base += 8;
+        }
+    // The CPU's writes over blocks a recorded pass reads: through the ring,
+    // in turn - the image reloaded before them keeps the old bytes, the one
+    // after has the new.
+    {
+        const u32 fbp = 0x180, w = 64, h = 32;
+        for (u32 i = fbp * 32 * 256; i < (fbp * 32 + 32) * 256; ++i) reference.data()[i] = u8(next() >> 24);
+        renderer.MemoryWrite(fbp * 32, fbp * 32 + 32, reference.data() + fbp * 32 * 256);
+        renderer.TargetFromMemory(fbp, 1, PSMCT32, w, h);                 // recorded, reading the blocks
+        std::vector<u32> before(w * h);
+        for (u32 y = 0; y < h; ++y) for (u32 x = 0; x < w; ++x) before[y * w + x] = reference.Read(fbp * 32, 1, x, y, PSMCT32);
+        for (u32 i = fbp * 32 * 256; i < (fbp * 32 + 32) * 256; ++i) reference.data()[i] = u8(next() >> 24);
+        renderer.MemoryWrite(fbp * 32, fbp * 32 + 32, reference.data() + fbp * 32 * 256);    // after it: the ring
+        renderer.TargetFromMemory(fbp + 1, 1, PSMCT32, w, h);             // another image, the next page: untouched
+        renderer.TargetFromMemory(fbp + 2, 1, PSMCT32, w, h);
+        std::vector<u32> back;
+        u32 bw = 0, bh = 0;
+        renderer.ReadTarget(fbp, 1, PSMCT32, &back, &bw, &bh);
+        u32 wrong = 0;
+        for (u32 i = 0; i < w * h && back.size() >= w * h; ++i) wrong += back[i] != before[i];
+        check(!back.empty() && wrong == 0, "an image loaded before the CPU's write keeps what memory held then");
+        renderer.TargetFromMemory(fbp, 1, PSMCT32, w, h);
+        renderer.ReadTarget(fbp, 1, PSMCT32, &back, &bw, &bh);
+        wrong = 0;
+        for (u32 y = 0; y < h && back.size() >= w * h; ++y)
+            for (u32 x = 0; x < w; ++x) wrong += back[y * w + x] != reference.Read(fbp * 32, 1, x, y, PSMCT32);
+        check(!back.empty() && wrong == 0, "...and one loaded after it has the new bytes");
+        check(differ() == 0, "GS memory as the CPU wrote it, after the ring");
+    }
+    // What it costs: a 640 x 448 target into memory and back, a hundred
+    // times, the GPU finishing at the end; and 1 MB back to the CPU.
+    {
+        std::vector<u32> pixels(640 * 448, 0x80402010u);
+        renderer.UploadTarget(0x100, 10, PSMCT32, pixels.data(), 640, 448);
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 100; ++i) {
+            renderer.TargetToMemory(0x100, 10, PSMCT32, 640, 448, 0);
+            renderer.TargetFromMemory(0x100, 10, PSMCT32, 640, 448);
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        renderer.Kick();
+        const auto t2 = std::chrono::steady_clock::now();
+        std::vector<u8> bytes(1u << 20);
+        renderer.TargetToMemory(0x100, 10, PSMCT32, 640, 448, 0);
+        renderer.Kick();
+        const auto t3 = std::chrono::steady_clock::now();
+        renderer.MemoryRead(0x100 * 32, 0x100 * 32 + 4096, bytes.data());
+        const auto t4 = std::chrono::steady_clock::now();
+        auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+        std::printf("cost: 100 x (640x448 into memory and back): %.1f ms to record, %.1f ms more for the GPU; "
+                    "1 MB of it back to the CPU %.1f ms\n", ms(t0, t1), ms(t1, t2), ms(t3, t4));
+        std::printf("cost: %s\n", ps2gpu::RendererCounters().c_str());
+    }
+    return failures;
+}
+
 }  // namespace
 
 extern "C" {
@@ -198,6 +349,7 @@ int main() {
         std::printf("FAIL: no GXM renderer: %s\n", error.c_str());
     } else {
         failures = RunRendererTests(*renderer, true);
+        failures += GpuMemoryTests(*renderer);
         std::printf("gxm renderer tests: %d failed\n", failures);
     }
     std::fflush(nullptr);

@@ -1745,12 +1745,20 @@ void GpuShadowFrame(u64 frame, const std::string& dump_dir) {
             Timed timed(Section::GpuRender);
             s.renderer->Kick();
         }
-        if (frame % 100 == 0)
-            std::fprintf(stderr, "[gpu] frame %llu: %llu draws, %llu write-backs, %llu reloads, %llu decodes, %llu images, %llu textures\n",
+        if (frame % 100 == 0) {
+            std::fprintf(stderr, "[gpu] frame %llu: %llu draws, %llu write-backs, %llu reloads, %llu decodes (%llu from "
+                                 "the GPU's memory), %llu CLUT loads there, %llu patches, %llu images, %llu textures\n",
                          static_cast<unsigned long long>(frame), static_cast<unsigned long long>(s.serial),
                          static_cast<unsigned long long>(s.write_backs), static_cast<unsigned long long>(s.reloads),
-                         static_cast<unsigned long long>(s.decodes), static_cast<unsigned long long>(s.owned.size()),
-                         static_cast<unsigned long long>(s.textures.size()));
+                         static_cast<unsigned long long>(s.decodes), static_cast<unsigned long long>(s.gpu_decodes),
+                         static_cast<unsigned long long>(s.gpu_clut_loads), static_cast<unsigned long long>(s.patches),
+                         static_cast<unsigned long long>(s.owned.size()), static_cast<unsigned long long>(s.textures.size()));
+#ifdef __vita__
+            // The GXM renderer's own (scenes, waits for the GPU, GS memory's
+            // passes), for these 100 frames.
+            std::fprintf(stderr, "[gpu]   GXM: %s\n", ps2gpu::RendererCounters().c_str());
+#endif
+        }
         if (frame % 300 == 0 && std::getenv("PS2HOST_GPU_PROFILE"))
             std::fprintf(stderr, "[gpu] frame %llu: %s\n", static_cast<unsigned long long>(frame),
                          ps2gpu::GpuProfileReport().c_str());

@@ -390,7 +390,7 @@ void FrameTimes(u64 frame) {
     const u64 gs_us = GsBusyMicroseconds();
     const Clock::time_point now = Clock::now();
     const double seconds = std::chrono::duration<double>(now - last).count();
-    char job_text[2048] = "";
+    char job_text[3072] = "";
     if (seconds > 0)
         std::snprintf(job_text, sizeof job_text, "%s, GS thread busy %d%%",
                       worker_us != last_worker_us
@@ -513,6 +513,29 @@ void FrameTimes(u64 frame) {
         if (!ipu.empty()) {
             const std::size_t used = std::strlen(job_text);
             std::snprintf(job_text + used, sizeof job_text - used, "; %s", ipu.c_str());
+        }
+    }
+    // The timed sections' time since the last line, every thread's (a
+    // core's worth is 100%): the GS thread's drawing and the GPU bridge's
+    // syncs next to VU1's - which of the threads' work the time went to.
+    // (The IOP's, the SPU2's and the disc's are above.)
+    {
+        static double last_s[int(Section::Count)] = {};
+        static const Section kShown[] = {Section::GsDraw, Section::GsUpload, Section::GpuBridge, Section::GpuRender,
+                                         Section::GpuSync, Section::Vu1, Section::Vu0, Section::Dma, Section::GsWait};
+        static const char* const kNames[] = {"GS drawing", "GS image transfers", "GPU bookkeeping", "GPU drawing",
+                                             "GPU syncs", "VU1", "VU0", "DMA and VIF", "the EE waiting for the GS"};
+        std::string shares;
+        for (std::size_t i = 0; i < sizeof kShown / sizeof kShown[0]; ++i) {
+            const double now_s = SectionSeconds(kShown[i]);
+            const int share = seconds > 0 ? int(100.0 * (now_s - last_s[int(kShown[i])]) / seconds + 0.5) : 0;
+            last_s[int(kShown[i])] = now_s;
+            if (share <= 0) continue;
+            shares += (shares.empty() ? "" : ", ") + std::string(kNames[i]) + " " + std::to_string(share) + "%";
+        }
+        if (!shares.empty()) {
+            const std::size_t used = std::strlen(job_text);
+            std::snprintf(job_text + used, sizeof job_text - used, "; time in sections: %s", shares.c_str());
         }
     }
     // Where the EE's thread was, sampled (--sample on the Vita, Linux: the

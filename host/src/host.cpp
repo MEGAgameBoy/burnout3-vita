@@ -5,6 +5,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -361,6 +362,20 @@ void Dispatch(lifted::Context& c, u32 address) {
 }
 
 namespace {
+
+/* --env NAME=VALUE: an environment variable for the run - the PS2HOST_*
+   switches, from run.args where there is no shell to set them (the Vita).
+   NAME alone sets it to 1. */
+void SetEnvironment(const std::string& assignment) {
+    const std::size_t eq = assignment.find('=');
+    const std::string name = assignment.substr(0, eq), value = eq == std::string::npos ? "1" : assignment.substr(eq + 1);
+    if (name.empty()) return;
+#ifdef _WIN32
+    _putenv_s(name.c_str(), value.c_str());
+#else
+    setenv(name.c_str(), value.c_str(), 1);
+#endif
+}
 
 // ELF32 little-endian, the PS2's executable format: load every PT_LOAD segment.
 u32 LoadElf(const std::string& path, std::vector<u8> data) {
@@ -771,6 +786,7 @@ int Main(int argc, char** argv) {
         else if (arg == "--until-frame" && i + 1 < argc) options.until_frame = std::stoull(argv[++i]);
         else if (arg == "--frame-times" && i + 1 < argc) options.frame_times = unsigned(std::stoul(argv[++i]));
         else if (arg == "--iop-share" && i + 1 < argc) options.iop_share = unsigned(std::stoul(argv[++i]));
+        else if (arg == "--env" && i + 1 < argc) SetEnvironment(argv[++i]);
         else if (arg == "--sound-thread") options.sound_thread = true;
         else if (arg == "--no-sound-thread") options.sound_thread = false;
         else if (arg == "--gs-inline") options.gs_inline = true;

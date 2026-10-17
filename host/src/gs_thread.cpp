@@ -197,20 +197,28 @@ struct Feed {
                 }
             }
             const auto began = std::chrono::steady_clock::now();
+            // Counted as it goes, not only when the batch ends: a batch is
+            // what the ring held when it began, which on the Vita took the
+            // GS thread tens of seconds - the frame line said 0% busy, then
+            // 288%.
             struct Busy {
                 std::chrono::steady_clock::time_point began;
-                ~Busy() {
+                void Count() {
                     const auto now = std::chrono::steady_clock::now();
                     g_gs_busy_us.fetch_add(u64(std::chrono::duration_cast<std::chrono::microseconds>(now - began).count()),
                                            std::memory_order_relaxed);
                     if (timeline::On())
                         timeline::Span("busy", u64(std::chrono::duration_cast<std::chrono::nanoseconds>(began.time_since_epoch()).count()),
                                        u64(std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count()));
+                    began = now;
                 }
+                ~Busy() { Count(); }
             } busy{began};
+            u32 entries = 0;
             SetActivity(HostLane::kGs, "drawing");
             try {
                 while (t < h) {
+                    if ((++entries & 1023) == 0) busy.Count();
                     const u32 at = u32(t % kRing);
                     const u32* e = &ring[at];
                     const u32 type = e[0] >> 28, count = e[0] & 0xFFFFFF;
@@ -242,6 +250,7 @@ struct Feed {
                                 SetActivity(HostLane::kGs, "drawing");
                                 if (g_hitch) HitchFrame(frame, took, ClockNs());
                             }
+                            busy.Count();
                             size = 3;
                             break;
                         case kWrap:
