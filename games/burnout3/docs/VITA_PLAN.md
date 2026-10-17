@@ -322,6 +322,53 @@ emulated VU1. The way there, in steps that each stand on their own:
    transform moves onto the GPU's vertex shaders, which takes the GS
    renderer drawing vertices it has not been given in the GS's terms.
 
+**The fourteenth run (2026-10-18): the race held by the GS side, not
+VU1.** The host tests all passed, the FPU's hash now the PC's (the FPSCR a
+thread starts with was RunFast, 0x83000000: cleared). The player's run:
+the car select VU1-bound as before (VIF1's worker 98% busy, VU1 1.35
+million pairs a second); but in the race VU1 ran only 0.10-0.13 million
+pairs a second while the worker was 91-97% busy, the EE 94-97% of its
+time waiting for it, and the watchdog's lines found the EE waiting for
+room in the GS thread's ring. The game made about one picture in ten
+seconds (VIF1's display lists, 0.1 a second, 1.2 million VU1 pairs each,
+as on the PC). The [gpu] lines said why: per picture some 26,000 draws,
+**~76 write-backs and ~81 reloads** - an image swizzled into GS memory or
+out of it (the race's glow, blur and depth passes, PSMT8H and PSMZ16
+reads, its targets viewed through other formats). The GXM renderer's
+first version did each on the CPU: a sceGxmFinish, then a pass over every
+pixel through gs::Memory's addressing, the target read out of CDRAM
+(which the CPU reads slowly) - ~150 of them a picture, on the GS thread's
+core, which the SPU2's thread shared at a higher priority (62-69% of it).
+The PC renderer has done this on the GPU from the start (swizzle.comp).
+And the frame line's "GS thread busy" read 0% or 288%: counted only when
+a batch of the ring ended, which took the slow thread tens of seconds.
+
+For the fifteenth run:
+* GS local memory on the GPU in the GXM renderer: 4 MB of CDRAM (a
+  1024 x 1024 RGBA8 surface, a page two rows of it); targets and depth
+  buffers swizzled into it and out of it by fragment passes, each pixel
+  finding its word (or each word its pixel) through a table of the
+  page's layout made from gs::Memory::Address; depth buffers read as an
+  F32 texture and written through an F32 colour surface over their
+  memory; the CPU's writes straight in where nothing recorded touches
+  the blocks, else through a staging ring and a copy pass, in turn; the
+  CPU's copy brought up to date only where it is read (MemoryRead, the
+  textures and CLUTs decoded on the CPU), waiting for the GPU only if a
+  recorded pass wrote the blocks. The passes' arithmetic was checked in
+  C++ against gs::Memory, every format, partial rows and columns, the
+  4 MB wrap (all exact); ps2gxm_tests now checks the GPU's own the same
+  way (the host's GpuMemorySwizzlesAsTheGs) and says what a pass costs.
+  `--env PS2HOST_GXM_CPU_MEMORY` in run.args brings the CPU's back.
+* One depth buffer a ZBP, grown to the largest target drawn with it: by
+  size, the bridge's (512 rows) and the draws' (the target's) were two
+  buffers, and the bridge's reloads never reached the draws.
+* The frame line: the GS thread's busy time counted as it goes, and the
+  timed sections' shares of the window (GS drawing, GPU bookkeeping and
+  syncs, VU1, ...); the [gpu] line every 100 frames with the GXM
+  renderer's counts (scenes, waits, the passes, time in BeginScene,
+  EndScene and Finish).
+* `--env NAME=VALUE`: the PS2HOST_* switches from run.args.
+
 The GPU tests on the hardware (sixth run of them: 6 failures left, all
 REGION_CLAMP/REPEAT and FBMSK within a channel): every depth surface the probe tried (DF32,
 DF32 + S8, S8D24; linear or tiled; CDRAM or LPDDR) keeps depth across scenes
