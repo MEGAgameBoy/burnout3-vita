@@ -170,6 +170,10 @@ std::vector<std::string> PlayArguments(const char* self) {
     // (the Vita has no recompiler at run time). Each recorded once, ever.
     args.push_back("--vu-record");
     args.push_back(ps2plat::JoinPath(here, "vu_programs.txt"));
+    // VU1 is the 3D's whole cost here (a core of its own, and short of it):
+    // compiled programs skip the MAC and STATUS flags none of their
+    // instructions read (--vu-fast; a tenth less work).
+    args.push_back("--vu-fast");
     if (ps2host::Setting("renderer", "gpu") != "software") args.push_back("--gpu");
 #else
     for (const char* arg : {"--window", "--gpu"}) args.push_back(arg);

@@ -50,6 +50,24 @@ void Check(bool ok, const char* what) {
     }
 }
 
+/* A test's folder and what is in it, gone - or as much as can be: errors are
+   not the test's. Entries are listed before any is removed (the Vita's
+   directory reads lost their place when the folder changed under them, and
+   std::filesystem::remove_all threw "Directory not empty" - the eleventh
+   run's ps2host_tests, ended by the uncaught exception). */
+void RemoveTree(const std::filesystem::path& dir) {
+    namespace fs = std::filesystem;
+    std::error_code error;
+    std::vector<fs::path> entries;
+    for (fs::directory_iterator it(dir, error), end; !error && it != end; it.increment(error))
+        entries.push_back(it->path());
+    for (const fs::path& entry : entries) {
+        if (fs::is_directory(entry, error)) RemoveTree(entry);
+        else fs::remove(entry, error);
+    }
+    fs::remove(dir, error);
+}
+
 void MirrorsReachTheSameRam() {
     ps2host::Memory& m = ps2host::GuestMemory();
     m.Write(0x00100000u, 0x11223344u, 4);
@@ -461,7 +479,7 @@ void TexturePackNamesAsPcsx2() {
     // A pack's files by name, in a folder of their own: the forms PCSX2 reads.
     namespace fs = std::filesystem;
     const fs::path dir = fs::temp_directory_path() / "ps2host_texture_pack_test";
-    fs::remove_all(dir);
+    RemoveTree(dir);
     fs::create_directories(dir / "sub");
     for (const char* file : {"c7671cbbc91ae787-c31b5682050eba5e-00005994.dds", "sub/1a2b-00001980.png",
                              "3c4d-r64x32-00001980.png", "5e6f-7a8b-r0x16-00001993.dds", "not-a-texture.png",
@@ -473,8 +491,8 @@ void TexturePackNamesAsPcsx2() {
     bool pending = false;
     texture_pack::Find(name, &pending);
     Check(pending, "a texture the pack has (TCC's bit ignored): its file read in the background");
-    fs::remove_all(dir);
-    texture_pack::Open("");
+    texture_pack::Open("");                 // the pack closed (its reader done with the files) first
+    RemoveTree(dir);
 }
 
 void GsTakesImagesInBlocks() {
@@ -898,8 +916,7 @@ void MemoryCardKeepsSaves() {
     namespace mc2 = ps2host::mc2;
     namespace fs = std::filesystem;
     const fs::path card = fs::temp_directory_path() / "ps2host_tests_memcard";
-    std::error_code error;
-    fs::remove_all(card, error);
+    RemoveTree(card);
     mc2::SetCardDirectory(card.u8string());
     auto context = std::make_unique<lifted::Context>();
     lifted::Context& c = *context;
@@ -953,7 +970,7 @@ void MemoryCardKeepsSaves() {
               generated::ReadU32(kBuffer + 8) < 8000,
           "memory card: a formatted PS2 card, its free space less the save");
     mc2::SetCardDirectory("");
-    fs::remove_all(card, error);
+    RemoveTree(card);
 }
 
 // Random microprograms (vu_corpus.cpp, from engine/tools/vurecomp.py
@@ -1864,10 +1881,11 @@ void Benchmarks() {
         std::printf("  COP2 ADD           %7.1f ns\n", ns_since(began) / 5e5);
     }
 
-    // The SPU2 as Burnout 3's menus leave it: 42 voices keyed off and running
-    // silent, core 0's reverb on, IRQA in a capture ring - a millisecond's
-    // mixing (48 samples) at a time, as its thread does.
-    {
+    // The SPU2 as Burnout 3 leaves it: its menus' 42 voices keyed off and
+    // running silent, and a race's 25 heard of 42 - core 0's reverb on,
+    // IRQA in a capture ring - a millisecond's mixing (48 samples) at a
+    // time, as its thread does.
+    for (u32 heard : {0u, 25u}) {
         using ps2host::iop::Spu2;
         auto spu = std::make_unique<Spu2>();
         u64 samples = 0;
@@ -1880,22 +1898,28 @@ void Benchmarks() {
         spu->SetEffectAttr(0, 4, 0x3000, 0x3000, 0, 0);
         spu->SetCoreAttr(0x02, 1);
         spu->SetAddr(0x1F00, 0x0800);
+        u32 n = 0;
         for (u32 core = 0; core < 2; ++core)
-            for (u32 voice = 0; voice < (core ? 18u : 24u); ++voice) {
+            for (u32 voice = 0; voice < (core ? 18u : 24u); ++voice, ++n) {
                 const u32 entry = core | voice << 1;
                 spu->SetAddr(0x2000 | entry, 0x10000);
+                spu->SetParam(0x0000 | entry, 0x3FFF);
+                spu->SetParam(0x0100 | entry, 0x3FFF);
                 spu->SetParam(0x0200 | entry, 0x1000);
                 spu->SetParam(0x0300 | entry, 0x000F);
+                spu->SetParam(0x0400 | entry, 0x1FC0);      // sustained
+                spu->SetSwitch(0x1800 | core, spu->GetSwitch(0x1800 | core) | 1u << voice);
+                spu->SetSwitch(0x1A00 | core, spu->GetSwitch(0x1A00 | core) | 1u << voice);
                 spu->SetSwitch(0x1500 | core, 1u << voice);
-                spu->SetSwitch(0x1600 | core, 1u << voice);
+                if (n >= heard) spu->SetSwitch(0x1600 | core, 1u << voice);
             }
         auto none = [](Spu2::u32) {};
         u64 now = 1000;
         spu->Advance(now, none);
         const auto began = Clock::now();
         for (int ms = 0; ms < 2000; ++ms) spu->Advance(now += 1000, none);
-        std::printf("  SPU2 mixing        %7.1f us a millisecond of sound (42 voices silent, reverb; %llu samples)\n",
-                    ns_since(began) / 1e3 / 2000.0, (unsigned long long)samples);
+        std::printf("  SPU2 mixing        %7.1f us a millisecond of sound (%u voices heard, %u silent, reverb; %llu samples)\n",
+                    ns_since(began) / 1e3 / 2000.0, unsigned(heard), unsigned(42 - heard), (unsigned long long)samples);
     }
 
     // The EE's MMI as the generated code calls it: a halfword add, an
