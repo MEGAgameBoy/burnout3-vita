@@ -252,6 +252,40 @@ Next, once measured: NEON for the MMI lane calls (scalar loops on ARM
 today; the runtime waits for the structured code's verification, whose
 cache a change there would void), and the IPU's per-command overhead.
 
+**The twelfth run (2026-10-17): into a race; VU1 is the 3D's whole cost.**
+The player reached the car select and a race's start, and sent the 67
+microprograms the run recorded (13,104 instruction pairs) and a CPU
+monitor's view: the menu at 30 pictures a second (the EE's core 99%, the
+GS's 66%), the car select at 3 and the race at 2, **VIF1's core at 100%**
+both times. The frame lines: VU1 interpreted, 0.51 million pairs a second
+- 2 us a pair, against 81 ns on x86-64 - in some 220 runs a second of
+2,300 pairs each: about 4-5 million pairs for each of the car select's
+pictures, which is most of what the PS2's VU1 has in a 30 fps frame. In
+the race the SPU2's thread took 64-69% of its core (25 voices heard).
+And ps2host_tests stopped at its texture pack test: std::filesystem's
+remove_all threw "Directory not empty" on the Vita (its directory reads
+lose their place when the folder changes under them).
+
+What the numbers say, plainly: the cycle-exact VU1 (the interpreter's
+model, whether interpreted or compiled ahead) cannot draw a race on the
+Vita at a playable rate. Compiled, the game's programs run 3.3x faster
+than interpreted on x86-64 (25 ns a pair against 81; 22.6 with
+--vu-fast): perhaps a picture every 2-3 s in the car select. A recompiler
+that drops the cycle model for NEON (the VU's interlocks make most of it
+unnecessary; Q, P and the flags' late landing are what stay) might reach
+10-20 cycles a pair, a few pictures a second. Full speed would take the
+3D's microprograms out of the CPU's hands altogether - the vertex work
+done by the GPU, game by game. Which way to go is the player's call (it
+is the port's largest piece of work by far); asked with this run's build.
+
+For the thirteenth run:
+* the 67 programs compiled ahead (vurecomp, into the build only: the
+  player's own), checked on x86-64 against the interpreter (host tests'
+  VuCompiledIsTheInterpreter, run on them: every run the same), and
+  `--vu-fast` on the Vita;
+* ps2host_tests' folders removed entry by entry, errors not the tests'
+  (RemoveTree).
+
 The GPU tests on the hardware (sixth run of them: 6 failures left, all
 REGION_CLAMP/REPEAT and FBMSK within a channel): every depth surface the probe tried (DF32,
 DF32 + S8, S8D24; linear or tiled; CDRAM or LPDDR) keeps depth across scenes
