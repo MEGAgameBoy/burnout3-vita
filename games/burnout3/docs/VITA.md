@@ -42,8 +42,11 @@ call stack, its threads and the IOP's, what the host's own threads wait on,
 the functions it called most - then the error screen comes up (or, if the
 host itself is stuck, the game closes about ten seconds later, the log
 written first). Send that log. Meanwhile the log says, every 600
-of the PS2's vertical blanks, how fast it ran and where the EE's thread went
-(`[frames]`: the IOP's and the SPU2's shares, the IOP's busiest thread), and
+of the PS2's vertical blanks (or ten seconds), how fast it ran and where the
+EE's thread went (`[frames]`: the IOP's and the SPU2's shares, the IOP's
+busiest thread, and "EE's time": what it was found doing, sampled a thousand
+times a second), a hang's `no frame for N s` with what the host's threads
+wait on, and
 for a load how long it has gone on (`[load]`) and which stage of the
 start-up sequence the game is at (`[frontend]`).
 
@@ -145,13 +148,15 @@ The LiveArea's art is the port's own, drawn by
 * The GPU renderer is a first version (VITA_PLAN.md, "M2"): native
   resolution, the GPU finished at every frame's end, local memory's swizzles
   and decodes on the CPU; REGION_CLAMP/REPEAT and FBMSK within a channel not
-  yet drawn. Sound goes to the Vita's speaker (sceAudioOut) but is not yet
-  heard on hardware.
-* The boot's load is slow (above): the game's code is still the plain lifted
-  form (every EE register through memory) until the structured form's
+  yet drawn.
+* Slow everywhere so far: the boot's load (about 20 s), the movies (their
+  pictures late, their sound repeating a stretch while it waits for the
+  next) and the menus. The game's code is still the plain lifted form
+  (every EE register through memory) until the structured form's
   verification has finished, and the IOP's modules run in an interpreter on
   the EE's core. The IOP's threads get at most half of that core at each
-  frame (`--iop-share 50`, the Vita's default; `run.args` can say otherwise).
+  frame (`--iop-share 50`, the Vita's default; `run.args` can say
+  otherwise); the SPU2 mixes on a core of its own (`--sound-thread`).
 * No settings menu for the Vita's options yet; rumble does nothing (the Vita
   has none).
 * Speed: to be measured on the hardware (VITA_PLAN.md). Expect the race to

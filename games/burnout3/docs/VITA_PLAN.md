@@ -197,6 +197,31 @@ fix. Also new: `[host] no frame for N s` with where the host's threads
 are, every 30 s of a hang, and the same at the stop buttons; the SPU2's
 time in the frame line (its handlers', its output's, its longest call).
 
+**The tenth run (2026-10-17): the movies and the menus.** Past the
+loading screen at last: the EA, Criterion and RenderWare movies, the
+intro, the main menu - fourteen minutes of play, every part slow. The
+movies' pictures come late and their sound repeats a stretch while it
+waits for the next (the stream's ring in SPU RAM played round again: the
+player feeds the sound as it decodes the pictures). The frame lines, all
+through: 54-57 blanks a second taken, the EE never idle, **the SPU2 31-35%
+of its thread** (2 voices heard, 42 silent, core 0's reverb), the IOP
+5-7%, and the functions called most libmpeg's waits on the IPU (polling
+IPU_CTRL, the host decoding as it is read). So, for the eleventh:
+* the SPU2 on a thread of its own (`--sound-thread`, the Vita's default),
+  on VIF1's core above it, a millisecond's mixing at a time; its
+  interrupts raised there and handled on the EE's thread at the IOP's next
+  run (a host test checks the hand-off; the scripted runs keep mixing on
+  the EE's thread, sample for sample as before);
+* a sampler for the Vita (`--sample`, on by default): the EE's thread
+  publishes its innermost section, its activity (idle, the IPU decoding, a
+  frame's interrupts) or else the guest function it is in, and the frame
+  line's "EE's time" gives the shares - what to make faster next, measured
+  rather than guessed;
+* the IPU's IDCT with eight sums in flight instead of one waiting on the
+  last (the A9's double additions take ~9 cycles to their result), and
+  its rounding without the library's floor: the same output bit for bit
+  (2 million random blocks, x86-64 and ARMv7), 1.8x faster on x86-64.
+
 The GPU tests on the hardware (sixth run of them: 6 failures left, all
 REGION_CLAMP/REPEAT and FBMSK within a channel): every depth surface the probe tried (DF32,
 DF32 + S8, S8D24; linear or tiled; CDRAM or LPDDR) keeps depth across scenes
