@@ -222,6 +222,36 @@ IPU_CTRL, the host decoding as it is read). So, for the eleventh:
   its rounding without the library's floor: the same output bit for bit
   (2 million random blocks, x86-64 and ARMv7), 1.8x faster on x86-64.
 
+**The eleventh run (2026-10-17): what the EE does, measured; the 3D.** A
+frame or two more a second, the movies' sound still repeating; the menu
+smooth until its movie background starts, then about 4 pictures a second;
+the car select's 3D a picture every ten seconds or so. The sampler's
+"EE's time" in the movies: the IPU decoding 19-27%, libmpeg's own code
+(motion compensation in MMI lanes - 0x001053A8, 0x001057A8, 0x00106098 -
+and its polls of IPU_CTRL and IPU_CMD around each VDEC and BDEC,
+0x00107428 and 0x00107718) most of the rest, the IOP 5-6%; the SPU2 33%
+on its own thread. In the car select the EE waits for VIF1's worker 99%
+of the time, VU1 at 96-99% of its core: 0.1 VIF1 transfers a second. The
+Vita build had no VU program compiled (the PC's come from runs recorded
+with `--vu-record`, game-derived, kept in build/ - none were ever recorded
+for this build), so VU1 ran interpreted. And the SPU2's thread shared
+VIF1's core, a third of it. So, for the twelfth:
+* the SPU2 on the GS's core instead (busy 25-30% in the movies);
+* the Vita records the microprograms the game starts, once each, into
+  `ux0:data/burnout3/vu_programs.txt` (the player's own; a run reads what
+  the file holds so nothing is written twice; recording looks at a program
+  once per change of instruction memory, not at every start): sent back,
+  the next build compiles them ahead of time;
+* the frame line gives VU1's pairs a second (and the share compiled), its
+  runs, and the IPU's commands a second and retries - the movies' cost per
+  macroblock, the 3D's per pair;
+* ps2host_tests' benchmarks on the Vita, two more: the SPU2's mixing as
+  the menus leave it (10.4 us a millisecond of sound on x86-64; the Vita's
+  thread spends 330), and the MMI calls the motion compensation is made of.
+Next, once measured: NEON for the MMI lane calls (scalar loops on ARM
+today; the runtime waits for the structured code's verification, whose
+cache a change there would void), and the IPU's per-command overhead.
+
 The GPU tests on the hardware (sixth run of them: 6 failures left, all
 REGION_CLAMP/REPEAT and FBMSK within a channel): every depth surface the probe tried (DF32,
 DF32 + S8, S8D24; linear or tiled; CDRAM or LPDDR) keeps depth across scenes

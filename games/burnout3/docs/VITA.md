@@ -34,7 +34,12 @@ The plan, the measurements and the risks: [VITA_PLAN.md](VITA_PLAN.md).
 
 What it writes, all in `ux0:data/burnout3/`: `burnout3.log` (send it with any
 report), `pc_settings.ini` (the disc chosen, the settings), `memcard/` (the
-game's saves, slot 1).
+game's saves, slot 1), and `vu_programs.txt`: the vector unit's
+microprograms the game has started so far, recorded from your disc, for a
+build to compile ahead of time (the Vita has no recompiler at run time; until
+they are compiled in, VU1 - the 3D - runs interpreted and very slowly). It
+is the game's own code: it is for your build only and never goes into the
+repository.
 
 **If it seems stuck**, hold **L, R, SELECT and START** together for three
 seconds: the game stops and the log ends with where it was - the game's
