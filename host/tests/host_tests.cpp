@@ -1229,19 +1229,33 @@ void ArithmeticIsThePcs() {
 
     // The EE's FPU (eefpu.cpp: computed in double, saturated, toward zero).
     Fnv fpu;
+    Fnv each[10];           // by operation too: which one, when the whole differs (the Vita's did)
     for (int i = 0; i < 300000; ++i) {
         const u32 a = value(), b = value(), acc = value();
-        fpu.Of(generated::FloatAdd(a, b));
-        fpu.Of(generated::FloatSub(a, b));
-        fpu.Of(generated::FloatMul(a, b));
-        fpu.Of(generated::FloatDiv(a, b));
-        fpu.Of(generated::FloatSqrt(a));
-        fpu.Of(generated::FloatMulAdd(acc, a, b));
-        fpu.Of(generated::FloatMulSub(acc, a, b));
-        fpu.Of(generated::IntFromFloat(a));
-        fpu.Of(generated::FloatFromInt(b));
-        fpu.Of(lifted::FloatRsqrt(a, b));
+        const u32 results[10] = {generated::FloatAdd(a, b),          generated::FloatSub(a, b),
+                                 generated::FloatMul(a, b),          generated::FloatDiv(a, b),
+                                 generated::FloatSqrt(a),            generated::FloatMulAdd(acc, a, b),
+                                 generated::FloatMulSub(acc, a, b),  generated::IntFromFloat(a),
+                                 generated::FloatFromInt(b),         lifted::FloatRsqrt(a, b)};
+        for (int op = 0; op < 10; ++op) {
+            fpu.Of(results[op]);
+            each[op].Of(results[op]);
+        }
     }
+    std::printf("arithmetic: the FPU's operations: add %04X sub %04X mul %04X div %04X sqrt %04X madd %04X msub %04X "
+                "cvt.w %04X cvt.s %04X rsqrt %04X\n",
+                unsigned(each[0].h & 0xFFFF), unsigned(each[1].h & 0xFFFF), unsigned(each[2].h & 0xFFFF),
+                unsigned(each[3].h & 0xFFFF), unsigned(each[4].h & 0xFFFF), unsigned(each[5].h & 0xFFFF),
+                unsigned(each[6].h & 0xFFFF), unsigned(each[7].h & 0xFFFF), unsigned(each[8].h & 0xFFFF),
+                unsigned(each[9].h & 0xFFFF));
+#if defined(__arm__)
+    {
+        unsigned fpscr = 0;
+        __asm__ __volatile__("vmrs %0, fpscr" : "=r"(fpscr));
+        std::printf("arithmetic: FPSCR %08X (rounding %u, flush to zero %u, default NaN %u)\n", fpscr,
+                    (fpscr >> 22) & 3, (fpscr >> 24) & 1, (fpscr >> 25) & 1);
+    }
+#endif
 
     // The MMI's lanes.
     Fnv mmi;

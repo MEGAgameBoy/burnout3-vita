@@ -80,6 +80,16 @@ RoleSetting Setting(ThreadRole role) {
 }  // namespace
 
 void SetThreadRole(ThreadRole role) {
+    // The thread's floating point as the PC's: rounding to nearest,
+    // denormals kept, NaNs as they come (FPSCR's RMode, FZ and DN clear) -
+    // what the EE's FPU emulation and everything else assume as they start
+    // (the VUs' and macro mode's rounding set it for themselves and put it
+    // back). A thread need not start so: the Vita's host tests found the
+    // FPU's results apart from the PC's (the thirteenth run).
+    unsigned fpscr;
+    __asm__ __volatile__("vmrs %0, fpscr" : "=r"(fpscr));
+    fpscr &= ~((3u << 22) | (1u << 24) | (1u << 25));
+    __asm__ __volatile__("vmsr fpscr, %0" : : "r"(fpscr));
     const RoleSetting s = Setting(role);
     sceKernelChangeThreadPriority(SCE_KERNEL_THREAD_ID_SELF, s.priority);
     sceKernelChangeThreadCpuAffinityMask(SCE_KERNEL_THREAD_ID_SELF, s.cores);

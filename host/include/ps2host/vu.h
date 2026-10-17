@@ -29,10 +29,12 @@
 #define PS2HOST_VU_H
 
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <map>
-#include <unordered_map>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -120,6 +122,16 @@ public:
     static int Bench(const std::string& path, int passes = 5, bool fast = false);
     /* How often each program address was started, for reports. */
     const std::map<u32, u64>& starts() const { return starts_; }
+    /* The pairs each program ran since the last call, largest first: a key
+       is the program's address (low 16 bits) and an FNV-1a hash of its first
+       four pairs (the high 32; engine/tools/vudis.py --list prints the same)
+       - two programs loaded at one address are told apart. Taken from
+       another thread (the frame line): under a lock. */
+    std::vector<std::pair<u64, u64>> TakeProgramPairs();
+    /* --vu-sample-runs: VU1 runs as they start (the --vu-snapshot format), each
+       program's 1st, 10th, 100th, 1,000th and 10,000th - what its inputs look
+       like, spread over a run, for looking into it away from the console. */
+    static void SampleRuns(const std::string& path);
 
     /* For tests: one 128-bit quadword of data memory. */
     u32* Quad(u32 address);
@@ -141,6 +153,10 @@ private:
     // (Record: once each, not at every start - a race starts thousands a frame).
     std::unordered_map<u32, u64> recorded_at_;
     void Record(u32 pc);
+    // Per program (TakeProgramPairs' key): pairs since the last take, and runs ever.
+    std::mutex program_lock_;
+    std::unordered_map<u64, u64> program_pairs_, program_runs_;
+    void WriteSnapshot(std::FILE* to, u32 pc);
 
     // Compiled code: the vector registers that may hold fields the model's
     // Clean would change (bit r for VF r) - loaded so, or not known; the FMAC

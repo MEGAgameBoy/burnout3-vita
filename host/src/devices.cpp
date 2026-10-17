@@ -499,6 +499,16 @@ void FrameTimes(u64 frame) {
         last_pairs = pairs;
         last_compiled = compiled;
         last_runs = runs;
+        // Which programs: the address and first upper word, and the share.
+        const auto programs = Vu1().TakeProgramPairs();
+        u64 all = 0;
+        for (const auto& [key, n] : programs) all += n;
+        for (std::size_t i = 0; i < programs.size() && i < 6 && all; ++i) {
+            const std::size_t used = std::strlen(job_text);
+            std::snprintf(job_text + used, sizeof job_text - used, "%s%04X/%08X %d%%", i ? ", " : "; VU1's programs: ",
+                          unsigned(programs[i].first & 0xFFFF), unsigned(programs[i].first >> 32),
+                          int(100.0 * double(programs[i].second) / double(all) + 0.5));
+        }
         const std::string ipu = IpuActivity(seconds);
         if (!ipu.empty()) {
             const std::size_t used = std::strlen(job_text);

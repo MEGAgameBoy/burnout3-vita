@@ -621,6 +621,7 @@ int Run(const Options& options) {
     InstallCrashReport();
     SetVif1Worker(!options.vif1_sync);
     SetCheckGuesses(options.check_guesses);
+    if (!options.vu_sample_runs.empty()) Vu::SampleRuns(options.vu_sample_runs);
     if (!options.vu_snapshot.empty())
         Vu::Snapshots(options.vu_snapshot, u64(options.vu_snapshot_from), options.vu_snapshot_count);
     // A scripted run (--virtual-time) draws the same pictures every time: not
@@ -797,6 +798,7 @@ int Main(int argc, char** argv) {
         else if (arg == "--vu-record" && i + 1 < argc) options.vu_record = argv[++i];
         else if (arg == "--vu-interpret") options.vu_interpret = true;
         else if (arg == "--vu-fast") options.vu_fast = true;
+        else if (arg == "--vu-sample-runs" && i + 1 < argc) options.vu_sample_runs = argv[++i];
         else if (arg == "--memcard" && i + 1 < argc) options.memcard = argv[++i];
         else if (arg == "--setting" && i + 1 < argc) options.settings.push_back(argv[++i]);
         else if (arg == "--audio") options.audio = true;

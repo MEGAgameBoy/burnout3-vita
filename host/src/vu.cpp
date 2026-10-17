@@ -635,6 +635,7 @@ struct Snapshot {
     u32 vf[32][4], vc[32], vacc[4];
 };
 std::FILE* g_snapshots = nullptr;
+std::FILE* g_samples = nullptr;         // --vu-sample-runs
 std::atomic<u64> g_snapshot_from{~u64(0)};
 std::atomic<bool> g_snapshotting{false};
 u32 g_snapshots_left = 0;
@@ -649,6 +650,35 @@ void Vu::Snapshots(const std::string& path, u64 from, u32 count) {
     }
     g_snapshot_from = from;
     g_snapshots_left = count;
+}
+
+void Vu::SampleRuns(const std::string& path) {
+    g_samples = std::fopen(path.c_str(), "wb");
+    if (!g_samples) std::fprintf(stderr, "vu: cannot write %s\n", path.c_str());
+}
+
+void Vu::WriteSnapshot(std::FILE* to, u32 pc) {
+    Snapshot s{};
+    const u32 flags[6] = {mac, status, clip, p, top, itop};
+    std::memcpy(s.flags, flags, sizeof flags);
+    std::memcpy(s.vf, regs.vf, sizeof s.vf);
+    std::memcpy(s.vc, regs.vc, sizeof s.vc);
+    std::memcpy(s.vacc, regs.vacc, sizeof s.vacc);
+    s.pc = pc;
+    std::fwrite(&s, sizeof s, 1, to);
+    std::fwrite(micro.data(), 1, 16384, to);
+    std::fwrite(data.data(), 1, 16384, to);
+}
+
+std::vector<std::pair<Vu::u64, Vu::u64>> Vu::TakeProgramPairs() {
+    std::vector<std::pair<u64, u64>> out;
+    {
+        std::lock_guard<std::mutex> hold(program_lock_);
+        out.assign(program_pairs_.begin(), program_pairs_.end());
+        program_pairs_.clear();
+    }
+    std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    return out;
 }
 
 void Vu::SnapshotFrame(u64 frame) {
@@ -845,17 +875,25 @@ Vu::u64 Vu::Run(u32 pc, u64 limit) {
     ++starts_[pc];
     ++runs_;
     if (g_record) Record(pc);
+    // The program, for the frame line's shares and --vu-sample-runs: its
+    // address and an FNV-1a hash of its first four pairs' words (as
+    // engine/tools/vudis.py --list prints it).
+    u32 code_hash = 2166136261u;
+    for (u32 i = 0; i < 32; ++i) code_hash = (code_hash ^ micro.data()[(pc + i) & u32(micro.size() - 1)]) * 16777619u;
+    const u64 program = u64(code_hash) << 32 | pc;
+    if (unit == 1 && g_samples) {
+        u64 runs;
+        {
+            std::lock_guard<std::mutex> hold(program_lock_);
+            runs = ++program_runs_[program];
+        }
+        if (runs == 1 || runs == 10 || runs == 100 || runs == 1000 || runs == 10000) {
+            WriteSnapshot(g_samples, pc);
+            std::fflush(g_samples);
+        }
+    }
     if (unit == 1 && g_snapshotting.load(std::memory_order_relaxed) && g_snapshots_left) {
-        Snapshot s{};
-        s.pc = pc;
-        const u32 flags[6] = {mac, status, clip, p, top, itop};
-        std::memcpy(s.flags, flags, sizeof flags);
-        std::memcpy(s.vf, regs.vf, sizeof s.vf);
-        std::memcpy(s.vc, regs.vc, sizeof s.vc);
-        std::memcpy(s.vacc, regs.vacc, sizeof s.vacc);
-        std::fwrite(&s, sizeof s, 1, g_snapshots);
-        std::fwrite(micro.data(), 1, 16384, g_snapshots);
-        std::fwrite(data.data(), 1, 16384, g_snapshots);
+        WriteSnapshot(g_snapshots, pc);
         if (--g_snapshots_left == 0) {
             std::fclose(g_snapshots);
             g_snapshots = nullptr;
@@ -871,6 +909,10 @@ Vu::u64 Vu::Run(u32 pc, u64 limit) {
     LandAll();
     resume = state.pc;
     pairs_ += state.count;
+    if (unit == 1) {
+        std::lock_guard<std::mutex> hold(program_lock_);
+        program_pairs_[program] += state.count;
+    }
     return state.count;
 }
 

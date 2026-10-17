@@ -106,6 +106,7 @@ struct Options {
     std::string vu_snapshot;       /* --vu-snapshot FILE FROM COUNT: VU1 runs for --vu-bench */
     long long vu_snapshot_from = 0;
     unsigned vu_snapshot_count = 0;
+    std::string vu_sample_runs;    /* --vu-sample-runs FILE: each VU1 program's 1st, 10th, ... 10,000th run */
     std::string vu_bench;          /* --vu-bench FILE: those runs, timed (and nothing else) */
     bool check_guesses = false;    /* --check-guesses: GIF_STAT guesses checked (virtual time) */
     bool vif1_sync = false;        /* --vif1-sync: VIF1 on the EE's thread in real time too */

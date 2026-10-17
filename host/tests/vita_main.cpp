@@ -58,6 +58,15 @@ int main() {
     const std::string results = ps2plat::JoinPath(here, "results.txt");
     ps2plat::RedirectOutput(results);
     std::printf("%s", clocks);
+    // The thread as the game's EE thread is (its role sets FPSCR to
+    // IEEE's rounding: the EE FPU's results as the PC's) - and FPSCR as
+    // the thread started, for the record (the thirteenth run's FPU differed).
+    {
+        unsigned fpscr = 0;
+        __asm__ __volatile__("vmrs %0, fpscr" : "=r"(fpscr));
+        std::printf("arithmetic: FPSCR at the start %08X\n", fpscr);
+    }
+    ps2plat::SetThreadRole(ps2plat::ThreadRole::kEe);
     const int code = RunHostTests(Observe);
     std::fflush(nullptr);
     // The benchmarks and the verdict, from the file, on the screen.

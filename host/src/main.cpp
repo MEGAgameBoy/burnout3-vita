@@ -174,6 +174,10 @@ std::vector<std::string> PlayArguments(const char* self) {
     // compiled programs skip the MAC and STATUS flags none of their
     // instructions read (--vu-fast; a tenth less work).
     args.push_back("--vu-fast");
+    // And what its programs are given, a few runs of each, for the work of
+    // doing their part natively (vu_runs.bin: the game's data, the player's own).
+    args.push_back("--vu-sample-runs");
+    args.push_back(ps2plat::JoinPath(here, "vu_runs.bin"));
     if (ps2host::Setting("renderer", "gpu") != "software") args.push_back("--gpu");
 #else
     for (const char* arg : {"--window", "--gpu"}) args.push_back(arg);
