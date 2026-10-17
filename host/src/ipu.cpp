@@ -127,6 +127,10 @@ void Idct(const s32 in[64], s32 out[64]) {
     // Most coefficients are zero, and a zero term adds nothing to a sum (a
     // signed zero at most, which no later sum or the rounding sees): only the
     // others are summed, in the same order - the same result, bit for bit.
+    // Eight sums at a time, each term added to all eight in turn: each sum
+    // still takes its terms in the same order (the same result again), and
+    // the processor has eight additions in flight rather than one waiting on
+    // the last (the Vita's VFP: a double's addition ~9 cycles to its result).
     double rows[64];
     int terms[8], live[8], live_rows = 0;
     for (int v = 0; v < 8; ++v) {
@@ -134,18 +138,32 @@ void Idct(const s32 in[64], s32 out[64]) {
         for (int u = 0; u < 8; ++u)
             if (in[v * 8 + u]) terms[n++] = u;
         if (n) live[live_rows++] = v;
+        double sums[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        for (int k = 0; k < n; ++k) {
+            const double f = in[v * 8 + terms[k]];
+            for (int x = 0; x < 8; ++x) sums[x] += basis[x][terms[k]] * f;
+        }
+        for (int x = 0; x < 8; ++x) rows[v * 8 + x] = sums[x];
+    }
+    for (int y = 0; y < 8; ++y) {
+        double sums[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        for (int k = 0; k < live_rows; ++k) {
+            const double b = basis[y][live[k]];
+            const double* row = rows + live[k] * 8;
+            for (int x = 0; x < 8; ++x) sums[x] += b * row[x];
+        }
         for (int x = 0; x < 8; ++x) {
-            double sum = 0;
-            for (int k = 0; k < n; ++k) sum += basis[x][terms[k]] * in[v * 8 + terms[k]];
-            rows[v * 8 + x] = sum;
+            const double sum = sums[x];
+            // floor(sum + 0.5), without the library's floor (a call on the
+            // Vita's ARMv7, which has no rounding instruction): truncated,
+            // then one less below zero - the same for any sum here (|sum| is
+            // far below 2^31).
+            const double rounded = sum + 0.5;
+            s32 whole = s32(rounded);
+            if (double(whole) > rounded) --whole;
+            out[y * 8 + x] = std::clamp(whole, -256, 255);
         }
     }
-    for (int y = 0; y < 8; ++y)
-        for (int x = 0; x < 8; ++x) {
-            double sum = 0;
-            for (int k = 0; k < live_rows; ++k) sum += basis[y][live[k]] * rows[live[k] * 8 + x];
-            out[y * 8 + x] = std::clamp(s32(std::floor(sum + 0.5)), -256, 255);
-        }
 }
 
 // ---------------------------------------------------------------- DMA
@@ -493,6 +511,8 @@ public:
         if (out.size() >= 8) return false;              // the output FIFO is full
         if (StillStalled()) return false;
         stalled = false;
+        // For the sampler (an activity: no clock read, a step a macroblock).
+        Activity activity(HostLane::kEe, "the IPU decoding");
         Reader r(*this);
         const u32 code = command >> 28;
         // A step that runs out of data is tried again from the start when

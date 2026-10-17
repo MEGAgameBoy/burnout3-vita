@@ -32,6 +32,7 @@
 #include <string>
 #include <vector>
 
+#include "ps2host/iop_vm.h"
 #include "ps2host/run.h"
 
 #pragma comment(lib, "winmm.lib")
@@ -93,7 +94,10 @@ Device& D() {
 
 }  // namespace
 
-void CloseAudio() { D().Close(); }
+void CloseAudio() {
+    iop::StopSoundThread();         // its mixing writes here
+    D().Close();
+}
 
 bool OpenAudio() {
     Device& d = D();
@@ -242,6 +246,7 @@ void AudioFrames(const short* frames, unsigned count) {
 #include <thread>
 #include <vector>
 
+#include "ps2host/iop_vm.h"
 #include "ps2host/run.h"
 #include "ps2plat/platform.h"
 
@@ -326,7 +331,10 @@ Device& D() {
 
 }  // namespace
 
-void CloseAudio() { D().Close(); }
+void CloseAudio() {
+    iop::StopSoundThread();         // its mixing writes here
+    D().Close();
+}
 
 bool OpenAudio() {
     Device& d = D();

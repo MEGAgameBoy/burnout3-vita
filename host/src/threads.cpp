@@ -1190,6 +1190,7 @@ std::atomic<const char*> g_activity[int(HostLane::kCount)] = {};
 }  // namespace
 
 void SetActivity(HostLane lane, const char* what) { g_activity[int(lane)].store(what, std::memory_order_relaxed); }
+const char* LaneActivity(HostLane lane) { return g_activity[int(lane)].load(std::memory_order_relaxed); }
 
 Activity::Activity(HostLane lane, const char* what)
     : lane_(lane), before_(g_activity[int(lane)].exchange(what, std::memory_order_relaxed)) {}

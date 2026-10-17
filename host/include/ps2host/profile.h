@@ -8,6 +8,8 @@
 #ifndef PS2HOST_PROFILE_H
 #define PS2HOST_PROFILE_H
 
+#include <atomic>
+#include <cstdint>
 #include <string>
 
 namespace ps2host {
@@ -36,8 +38,18 @@ double SectionSeconds(Section section);
    times a second, the function it is in and seven callers. At the
    end, the functions most often found running ("self"), and those most
    often on the stack at all ("total"), by name from the executable's
-   symbols. Windows only (elsewhere it reports nothing). */
+   symbols. That is Windows'. Elsewhere (the Vita, Linux) a thread cannot be
+   looked at from outside, so the EE's thread says what it is in - its
+   innermost section, its activity (run.h), else the guest function it
+   runs (g_sampled_function, kept by the calls) - and the sampler counts
+   that: SampleWindow's share of each since the last look (the frame
+   line's "EE's time"), SampleReport's for the run. */
 void StartSampler();
+/* The guest function the EE's thread is in (host.cpp's calls keep it). */
+inline std::atomic<std::uint32_t> g_sampled_function{0};
+/* The published sampler's counts since the last call, the largest `top`
+   ("SPU2 31%, 0x00107718 12%, idle 9%"); empty without it. */
+std::string SampleWindow(int top);
 /* --sample-gs: the sampler on the GS thread instead (gs_thread.cpp starts it
    there), where the GS model and the GPU bridge run. */
 void SetSampleGsThread(bool on);

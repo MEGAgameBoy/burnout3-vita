@@ -123,6 +123,7 @@ struct Options {
     unsigned long long until_frame = 0;    /* stop when this frame is done (0: never) */
     unsigned frame_times = 0;              /* every N frames, the wall-clock frame rate (0: never) */
     unsigned iop_share = 0;                /* --iop-share: the IOP's share of the EE's thread at frames (run.h) */
+    bool sound_thread = false;             /* --sound-thread: the SPU2 on a thread of its own (iop_vm.h) */
     bool gs_inline = false;                /* the GS on the EE's thread rather than its own */
     bool audio = false;            /* play the SPU2's output on the sound device */
     std::string audio_wav;         /* record the SPU2's output to this WAV file */

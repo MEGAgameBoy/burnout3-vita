@@ -159,8 +159,12 @@ std::vector<std::string> PlayArguments(const char* self) {
     // "renderer" setting is "software"), the log (--frame-times every ten
     // seconds) saying how fast. run.args's --no-draw: headless. The IOP's
     // interpreter is slower here than the console's IOP: half the EE's
-    // thread at most for its threads at each frame (--iop-share).
-    for (const char* arg : {"--window", "--frame-times", "600", "--iop-share", "50"}) args.push_back(arg);
+    // thread at most for its threads at each frame (--iop-share). The SPU2
+    // mixes on a core of its own (--sound-thread): a third of the EE's core
+    // where it shared it. The frame line says where the EE's time goes
+    // (--sample: the published sampler, a thousand looks a second).
+    for (const char* arg : {"--window", "--frame-times", "600", "--iop-share", "50", "--sound-thread", "--sample"})
+        args.push_back(arg);
     if (ps2host::Setting("renderer", "gpu") != "software") args.push_back("--gpu");
 #else
     for (const char* arg : {"--window", "--gpu"}) args.push_back(arg);

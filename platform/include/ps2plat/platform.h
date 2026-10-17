@@ -49,6 +49,8 @@ enum class ThreadRole {
     kAudio,         // the sound device's feeder
     kDisc,          // disc reads ahead
     kPresent,       // a display's present thread
+    kSound,         // the SPU2's mixing, where it has a thread of its own (the Vita)
+    kSampler,       // the EE's sampler (--sample where the thread cannot be looked at)
     kHelper,        // anything else (a texture pack's reader, the software GS's bands)
 };
 /* The calling thread's role: called first thing in the thread. */

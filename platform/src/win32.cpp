@@ -91,7 +91,12 @@ void SetThreadRole(ThreadRole role) {
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
             break;
         case ThreadRole::kPresent:
+        case ThreadRole::kSampler:
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+            break;
+        case ThreadRole::kSound:
+            NotThrottled();
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
             break;
         default:
             break;

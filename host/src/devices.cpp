@@ -390,7 +390,7 @@ void FrameTimes(u64 frame) {
     const u64 gs_us = GsBusyMicroseconds();
     const Clock::time_point now = Clock::now();
     const double seconds = std::chrono::duration<double>(now - last).count();
-    char job_text[1536] = "";
+    char job_text[2048] = "";
     if (seconds > 0)
         std::snprintf(job_text, sizeof job_text, "%s, GS thread busy %d%%",
                       worker_us != last_worker_us
@@ -443,8 +443,9 @@ void FrameTimes(u64 frame) {
         if (seconds > 0 && (!iop.empty() || iop_s != last_iop_s)) {
             const std::size_t used = std::strlen(job_text);
             std::snprintf(job_text + used, sizeof job_text - used,
-                          ", EE's thread in the IOP %d%%, the SPU2 %d%%, disc reads %d%%%s%s%s%s",
+                          ", EE's thread in the IOP %d%%, the SPU2%s %d%%, disc reads %d%%%s%s%s%s",
                           int(100.0 * (iop_s - last_iop_s) / seconds + 0.5),
+                          iop::SoundThreaded() ? " (on its own thread)" : "",
                           int(100.0 * (spu2_s - last_spu2_s) / seconds + 0.5),
                           int(100.0 * (disc_s - last_disc_s) / seconds + 0.5), iop.empty() ? "" : ": ", iop.c_str(),
                           sound.empty() ? "" : "; ", sound.c_str());
@@ -482,6 +483,15 @@ void FrameTimes(u64 frame) {
                       (unsigned long long)(guesses - last_guesses), (unsigned long long)wrong);
     }
     last_guesses = guesses;
+    // Where the EE's thread was, sampled (--sample on the Vita, Linux: the
+    // section, activity or guest function it said it was in).
+    {
+        const std::string sampled = SampleWindow(8);
+        if (!sampled.empty()) {
+            const std::size_t used = std::strlen(job_text);
+            std::snprintf(job_text + used, sizeof job_text - used, "; EE's time: %s", sampled.c_str());
+        }
+    }
     // Frames here are vertical blanks; a game that cannot keep up draws a
     // picture every other one (or less), which the VIF1 transfers show.
     std::fprintf(stderr, "[frames] %llu-%llu: %.2f s, %.1f frames a second, %.1f VIF1 transfers a second%s\n",

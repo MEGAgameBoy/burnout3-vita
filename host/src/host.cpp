@@ -186,11 +186,19 @@ std::string Describe(u32 address) {
 }
 
 // The running thread's guest call stack, kept as the host unwinds through
-// translated code.
+// translated code; and the function running, for the sampler (profile.h).
 struct Frame {
-    explicit Frame(u32 address) : calls(CurrentCalls()) { calls.push_back(address); }
-    ~Frame() { calls.pop_back(); }
+    explicit Frame(u32 address)
+        : calls(CurrentCalls()), caller(g_sampled_function.load(std::memory_order_relaxed)) {
+        calls.push_back(address);
+        g_sampled_function.store(address, std::memory_order_relaxed);
+    }
+    ~Frame() {
+        calls.pop_back();
+        g_sampled_function.store(caller, std::memory_order_relaxed);
+    }
     std::vector<u32>& calls;
+    u32 caller;
 };
 
 }  // namespace
@@ -677,6 +685,9 @@ int Run(const Options& options) {
         else std::fprintf(stderr, "cannot write %s\n", options.audio_wav.c_str());
     }
     if (sound) iop::EnableSound();
+    // The SPU2 runs whether or not it is heard (its interrupts pace the
+    // game's streams): on its own thread too.
+    if (options.sound_thread && !options.virtual_time) iop::StartSoundThread();
     for (const auto& press : options.presses)
         if (!ScriptPress(press.button, press.from, press.to, press.pressure))
             std::fprintf(stderr, "--press: no button %s\n", press.button.c_str());
@@ -759,6 +770,8 @@ int Main(int argc, char** argv) {
         else if (arg == "--until-frame" && i + 1 < argc) options.until_frame = std::stoull(argv[++i]);
         else if (arg == "--frame-times" && i + 1 < argc) options.frame_times = unsigned(std::stoul(argv[++i]));
         else if (arg == "--iop-share" && i + 1 < argc) options.iop_share = unsigned(std::stoul(argv[++i]));
+        else if (arg == "--sound-thread") options.sound_thread = true;
+        else if (arg == "--no-sound-thread") options.sound_thread = false;
         else if (arg == "--gs-inline") options.gs_inline = true;
         else if (arg == "--gs-trace-frame" && i + 1 < argc) options.gs_trace_frame = std::stoll(argv[++i]);
         else if (arg == "--gs-dump-frame" && i + 1 < argc) options.gs_dump_frame = std::stoll(argv[++i]);

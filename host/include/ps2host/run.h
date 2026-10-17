@@ -219,6 +219,8 @@ enum class HostLane : int { kEe, kGs, kVif1, kCount };
 void SetActivity(HostLane lane, const char* what);
 /* "EE: ...; GS thread: ...; VIF1's worker: ..." (and the GPU's, with GXM). */
 std::string Activities();
+/* One lane's activity now (null: none), for the sampler (profile.h). */
+const char* LaneActivity(HostLane lane);
 /* A lane's activity for a scope, the one before restored after. */
 class Activity {
 public:

@@ -12,6 +12,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "ps2host/disc.h"
@@ -19,6 +20,7 @@
 #include "ps2host/gs.h"
 #include "ps2host/ipu.h"
 #include "iop_vm_internal.h"
+#include "ps2host/iop_vm.h"
 #include "spu2.h"
 #include "ps2host/mc2.h"
 #include "ps2host/memory.h"
@@ -1728,6 +1730,51 @@ void SpuDecodesAdpcmAndPlaysAVoice() {
     Check(wet.SetEffectAttr(0, 10, 0, 0, 0, 0) == -1, "SPU2: no eleventh preset");
 }
 
+/* The SPU2 on a thread of its own (--sound-thread, the Vita's): IRQA in core
+   0's voice-1 capture ring, written every sample, is reached there; the
+   interrupt waits for the EE's thread, whose SoundInterrupts calls the
+   handler (an IOP function counting its calls) - once until it is re-armed. */
+void SoundThreadRaisesInterruptsForTheEe() {
+    using namespace ps2host::iop;
+    Vm& vm = TheVm();
+    constexpr u32 kHandler = 0x00080000u, kCount = 0x00080100u;
+    const u32 code[] = {0x3C080008u,        // lui   $t0, 0x0008
+                        0x8D090100u,        // lw    $t1, 0x100($t0)
+                        0x00000000u,
+                        0x25290001u,        // addiu $t1, $t1, 1
+                        0xAD090100u,        // sw    $t1, 0x100($t0)
+                        0x03E00008u,        // jr    $ra
+                        0x00000000u};
+    for (u32 i = 0; i < 7; ++i) vm.Write(kHandler + 4 * i, code[i], 4);
+    vm.Write(kCount, 0, 4);
+    auto call = [&](u32 index, u32 a0, u32 a1) {
+        Context c;
+        c.r[4] = a0;
+        c.r[5] = a1;
+        FindLibrary("libsd", index)(vm, c);
+    };
+    call(27, kHandler, 0);                  // sceSdSetSpu2IntrHandler
+    call(9, 0x1F00, 0x0800);                // IRQA: core 0's voice-1 capture ring
+    call(11, 0x04, 1);                      // the interrupt on
+    StartSoundThread();
+    auto wait_for = [&](u32 count) {
+        for (int i = 0; i < 200 && vm.Read(kCount, 4) < count; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            SoundInterrupts(vm);
+        }
+        return vm.Read(kCount, 4);
+    };
+    Check(wait_for(1) == 1, "SPU2 thread: the interrupt reaches the EE's handler");
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    SoundInterrupts(vm);
+    Check(vm.Read(kCount, 4) == 1, "SPU2 thread: once, until re-armed");
+    call(11, 0x04, 1);
+    Check(wait_for(2) == 2, "SPU2 thread: again once re-armed");
+    StopSoundThread();
+    call(11, 0x04, 0);
+    call(27, 0, 0);
+}
+
 /*
  * What the processor does with the host's work, measured (PS2HOST_TEST_BENCH;
  * the Vita's runner asks for it): the numbers the port's speed is estimated
@@ -1881,6 +1928,7 @@ int RunHostTests(void (*observe)(const char* name, double ms, int failures)) {
         {"IpuDecodesAndRetriesCleanly", IpuDecodesAndRetriesCleanly},
         {"IopInstructionsMatchTheR5900", IopInstructionsMatchTheR5900},
         {"SpuDecodesAdpcmAndPlaysAVoice", SpuDecodesAdpcmAndPlaysAVoice},
+        {"SoundThreadRaisesInterruptsForTheEe", SoundThreadRaisesInterruptsForTheEe},
     };
     const bool times = std::getenv("PS2HOST_TEST_TIMES") != nullptr;
     for (const Named& t : kTests) {

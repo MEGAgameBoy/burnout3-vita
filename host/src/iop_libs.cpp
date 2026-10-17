@@ -19,6 +19,8 @@
  * A function the host lacks stops the run with its name (iop_vm.cpp).
  */
 
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -26,7 +28,9 @@
 #include <cctype>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <sstream>
+#include <thread>
 
 #include "iop_vm_internal.h"
 #include "spu2.h"
@@ -34,6 +38,7 @@
 #include "ps2host/memory.h"
 #include "ps2host/run.h"
 #include "ps2host/profile.h"
+#include "ps2plat/platform.h"
 
 namespace ps2host {
 namespace iop {
@@ -689,12 +694,38 @@ struct Sound {
         u64 period_us = 0, due_us = 0;
     } block[2];
     std::vector<u32> pending;       // channels whose transfer interrupt is due now
+    // The SPU2 on a thread of its own (StartSoundThread): it mixes as time
+    // goes by, the IOP's calls lock it meanwhile, and its interrupts wait
+    // here (a core's bit) for the EE's thread to call their handlers - the
+    // IOP's interpreter is that thread's alone.
+    std::mutex lock;
+    bool threaded = false;
+    std::atomic<u32> raised{0};
+    std::atomic<bool> stop{false};
+    std::thread thread;
 };
 
 Sound& S() {
     static Sound sound;
     return sound;
 }
+
+/* The SPU2, locked for the expression that uses it while its own thread
+   mixes (Spu()->SetParam(...)); unlocked when it has no thread - its mixing
+   then calls the interrupt handlers, which call back in. */
+class SpuLocked {
+public:
+    explicit SpuLocked(Sound& s) : s_(s), hold_(s.lock, std::defer_lock) {
+        if (s.threaded) hold_.lock();
+    }
+    Spu2* operator->() { return &s_.spu; }
+
+private:
+    Sound& s_;
+    std::unique_lock<std::mutex> hold_;
+};
+
+SpuLocked Spu() { return SpuLocked(S()); }
 
 Outcome SdQuit(Vm&, Context& c) { return Ret(c, KE_OK); }
 
@@ -705,18 +736,18 @@ Outcome SdQuit(Vm&, Context& c) { return Ret(c, KE_OK); }
 // voice went nowhere.
 Outcome SdInit(Vm&, Context& c) {
     for (u32 core = 0; core < 2; ++core)
-        for (u32 which : {0x18u, 0x19u, 0x1Au, 0x1Bu}) S().spu.SetSwitch((which << 8) | core, 0xFFFFFF);
+        for (u32 which : {0x18u, 0x19u, 0x1Au, 0x1Bu}) Spu()->SetSwitch((which << 8) | core, 0xFFFFFF);
     return Ret(c, KE_OK);
 }
 
-Outcome SdSetParam(Vm&, Context& c) { S().spu.SetParam(c.r[4] & 0xFFFF, c.r[5] & 0xFFFF); return Ret(c, 0); }
-Outcome SdGetParam(Vm&, Context& c) { return Ret(c, S().spu.GetParam(c.r[4] & 0xFFFF)); }
-Outcome SdSetSwitch(Vm&, Context& c) { S().spu.SetSwitch(c.r[4] & 0xFFFF, c.r[5]); return Ret(c, 0); }
-Outcome SdGetSwitch(Vm&, Context& c) { return Ret(c, S().spu.GetSwitch(c.r[4] & 0xFFFF)); }
-Outcome SdSetAddr(Vm&, Context& c) { S().spu.SetAddr(c.r[4] & 0xFFFF, c.r[5]); return Ret(c, 0); }
-Outcome SdGetAddr(Vm&, Context& c) { return Ret(c, S().spu.GetAddr(c.r[4] & 0xFFFF)); }
-Outcome SdSetCoreAttr(Vm&, Context& c) { S().spu.SetCoreAttr(c.r[4] & 0xFFFF, c.r[5] & 0xFFFF); return Ret(c, 0); }
-Outcome SdGetCoreAttr(Vm&, Context& c) { return Ret(c, S().spu.GetCoreAttr(c.r[4] & 0xFFFF)); }
+Outcome SdSetParam(Vm&, Context& c) { Spu()->SetParam(c.r[4] & 0xFFFF, c.r[5] & 0xFFFF); return Ret(c, 0); }
+Outcome SdGetParam(Vm&, Context& c) { return Ret(c, Spu()->GetParam(c.r[4] & 0xFFFF)); }
+Outcome SdSetSwitch(Vm&, Context& c) { Spu()->SetSwitch(c.r[4] & 0xFFFF, c.r[5]); return Ret(c, 0); }
+Outcome SdGetSwitch(Vm&, Context& c) { return Ret(c, Spu()->GetSwitch(c.r[4] & 0xFFFF)); }
+Outcome SdSetAddr(Vm&, Context& c) { Spu()->SetAddr(c.r[4] & 0xFFFF, c.r[5]); return Ret(c, 0); }
+Outcome SdGetAddr(Vm&, Context& c) { return Ret(c, Spu()->GetAddr(c.r[4] & 0xFFFF)); }
+Outcome SdSetCoreAttr(Vm&, Context& c) { Spu()->SetCoreAttr(c.r[4] & 0xFFFF, c.r[5] & 0xFFFF); return Ret(c, 0); }
+Outcome SdGetCoreAttr(Vm&, Context& c) { return Ret(c, Spu()->GetCoreAttr(c.r[4] & 0xFFFF)); }
 
 // Pitch: 0x1000 plays a sample at its recorded rate; a semitone is 2^(1/12).
 Outcome SdNote2Pitch(Vm&, Context& c) {
@@ -736,16 +767,16 @@ Outcome SdPitch2Note(Vm&, Context& c) {
 }
 
 u32 Batch(u32 func, u32 entry, u32 value) {
-    Spu2& s = S().spu;
+    SpuLocked s = Spu();
     switch (func) {
-        case 0x01: s.SetParam(entry, value & 0xFFFF); return 0;
-        case 0x02: s.SetSwitch(entry, value); return 0;
-        case 0x03: s.SetAddr(entry, value); return 0;
-        case 0x04: s.SetCoreAttr(entry, value & 0xFFFF); return 0;
-        case 0x11: return s.GetParam(entry);
-        case 0x12: return s.GetSwitch(entry);
-        case 0x13: return s.GetAddr(entry);
-        case 0x14: return s.GetCoreAttr(entry);
+        case 0x01: s->SetParam(entry, value & 0xFFFF); return 0;
+        case 0x02: s->SetSwitch(entry, value); return 0;
+        case 0x03: s->SetAddr(entry, value); return 0;
+        case 0x04: s->SetCoreAttr(entry, value & 0xFFFF); return 0;
+        case 0x11: return s->GetParam(entry);
+        case 0x12: return s->GetSwitch(entry);
+        case 0x13: return s->GetAddr(entry);
+        case 0x14: return s->GetCoreAttr(entry);
         default: throw Unimplemented{"IOP: sceSdProcBatch function " + std::to_string(func)};
     }
 }
@@ -783,9 +814,9 @@ Outcome SdVoiceTrans(Vm& vm, Context& c) {
     const u32 size = A(vm, c, 4);
     Sound& s = S();
     if ((mode & 3) == 0) {
-        if (size) s.spu.Write(spu, vm.At(iop, size), size);
+        if (size) Spu()->Write(spu, vm.At(iop, size), size);
     } else if ((mode & 3) == 1) {
-        if (size) s.spu.Read(spu, vm.At(iop, size), size);
+        if (size) Spu()->Read(spu, vm.At(iop, size), size);
     }
     // Only a DMA transfer interrupts when done; SD_TRANS_MODE_IO (8) is the CPU
     // writing through the SPU2's registers, finished when the call returns.
@@ -863,7 +894,7 @@ Outcome SdReturnsPrevious(Vm&, Context& c) { return Ret(c, 0); }
 Outcome SdSetEffectAttr(Vm& vm, Context& c) {
     const u32 p = A(vm, c, 1);
     const s32 depth_left = s32(std::int16_t(vm.Read(p + 8, 2))), depth_right = s32(std::int16_t(vm.Read(p + 10, 2)));
-    return Ret(c, u32(S().spu.SetEffectAttr(c.r[4] & 1, vm.Read(p + 4, 4), depth_left, depth_right,
+    return Ret(c, u32(Spu()->SetEffectAttr(c.r[4] & 1, vm.Read(p + 4, 4), depth_left, depth_right,
                                             vm.Read(p + 12, 4), vm.Read(p + 16, 4))));
 }
 
@@ -871,7 +902,7 @@ Outcome SdGetEffectAttr(Vm& vm, Context& c) {
     const u32 p = A(vm, c, 1);
     u32 mode = 0, delay = 0, feedback = 0;
     s32 depth_left = 0, depth_right = 0;
-    S().spu.GetEffectAttr(c.r[4] & 1, &mode, &depth_left, &depth_right, &delay, &feedback);
+    Spu()->GetEffectAttr(c.r[4] & 1, &mode, &depth_left, &depth_right, &delay, &feedback);
     vm.Write(p, c.r[4] & 1, 4);
     vm.Write(p + 4, mode, 4);
     vm.Write(p + 8, u32(depth_left) & 0xFFFF, 2);
@@ -984,14 +1015,14 @@ std::string ExportName(const std::string& library, u32 index) {
     return found == names.end() ? "?" : found->second;
 }
 
-void SetPcmInputVolume(u32 core, u32 percent) { S().spu.SetInputVolume(core, percent); }
+void SetPcmInputVolume(u32 core, u32 percent) { Spu()->SetInputVolume(core, percent); }
 
 std::string SoundActivity(double seconds) {
     static Spu2::Work last;
-    const Spu2::Work now = S().spu.work();
+    const Spu2::Work now = Spu()->work();
     const Spu2::Work was = last;
     last = now;
-    S().spu.ResetLongest();
+    Spu()->ResetLongest();
     if (seconds <= 0 || now.calls == was.calls) return "";
     const double samples = double(now.samples - was.samples);
     auto ms_per_s = [&](u64 a, u64 b) { return double(a - b) / 1e6 / seconds; };
@@ -1012,8 +1043,40 @@ std::string SoundActivity(double seconds) {
 }
 
 void EnableSound() {
-    S().spu.SetOutput([](const Spu2::s16* frames, u32 count) { AudioFrames(frames, count); });
+    Spu()->SetOutput([](const Spu2::s16* frames, u32 count) { AudioFrames(frames, count); });
 }
+
+// The SPU2's own thread: a millisecond's mixing at a time, locked, then
+// asleep. What reached IRQA is raised for SoundInterrupts.
+void StartSoundThread() {
+    Sound& s = S();
+    if (s.threaded) return;
+    Vm& vm = TheVm();                   // (made here, on the EE's thread)
+    s.threaded = true;                  // before the thread: the EE's calls lock from now on
+    s.stop = false;
+    s.thread = std::thread([&s, &vm] {
+        ps2plat::SetThreadRole(ps2plat::ThreadRole::kSound);
+        while (!s.stop.load(std::memory_order_relaxed)) {
+            {
+                std::lock_guard<std::mutex> hold(s.lock);
+                Timed timed(Section::Spu2);
+                s.spu.Advance(vm.NowUs(), [&s](u32 core) { s.raised.fetch_or(1u << core, std::memory_order_release); });
+            }
+            ps2plat::SleepUntil(std::chrono::steady_clock::now() + std::chrono::milliseconds(1));
+        }
+    });
+    std::fprintf(stderr, "[host] the SPU2 mixes on a thread of its own\n");
+}
+
+void StopSoundThread() {
+    Sound& s = S();
+    if (!s.thread.joinable()) return;
+    s.stop = true;
+    s.thread.join();
+    s.threaded = false;
+}
+
+bool SoundThreaded() { return S().threaded; }
 
 // Due sound interrupts: a voice transfer's completion, a block transfer's
 // half-buffer. Called by the interpreter's scheduler (iop_vm.cpp).
@@ -1035,7 +1098,17 @@ void SoundInterrupts(Vm& vm) {
         if (s.transfer[ch].function) vm.Call(s.transfer[ch].function, {ch, s.transfer[ch].arg});
         else if (s.transfer_callback[ch]) vm.Call(s.transfer_callback[ch], {0});
     }
-    // The SPU2's own interrupt: playback (or a transfer) reached IRQA.
+    // The SPU2's own interrupt: playback (or a transfer) reached IRQA - on
+    // its own thread, raised there and handled here.
+    if (s.threaded) {
+        const u32 raised = s.raised.exchange(0, std::memory_order_acquire);
+        for (u32 core = 0; core < 2; ++core) {
+            if (!(raised & (1u << core))) continue;
+            if (s.spu2.function) vm.Call(s.spu2.function, {1u << core, s.spu2.arg});
+            else if (s.irq_callback) vm.Call(s.irq_callback, {0});
+        }
+        return;
+    }
     Timed timed(Section::Spu2);
     Activity activity(HostLane::kEe, "the SPU2 mixing (and its interrupts' handlers)");
     s.spu.Advance(now, [&](u32 core) {

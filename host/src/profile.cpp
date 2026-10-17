@@ -3,6 +3,8 @@
 #include "ps2host/profile.h"
 #include "ps2host/timeline.h"
 #include "ps2host/run.h"
+#include "ps2plat/platform.h"
+#include "ps2host/host.h"
 
 #include <algorithm>
 #include <atomic>
@@ -55,6 +57,7 @@ std::vector<ThreadTicks*> g_threads;
 std::uint64_t g_ended[int(Section::Count)] = {};
 
 struct ThreadTicks {
+    bool sampled = false;                   // the EE's, published for the sampler (g_sampled_section)
     std::uint64_t ticks[int(Section::Count)] = {};
     std::uint64_t began_ns[16] = {};        // the timeline's (PS2HOST_PROFILE): when each open section began
     Section stack[16];
@@ -72,6 +75,8 @@ struct ThreadTicks {
 };
 
 thread_local ThreadTicks t_ticks;
+// The EE's thread's innermost section (-1: none), for the published sampler.
+std::atomic<int> g_sampled_section{-1};
 
 std::uint64_t SectionTicks(int section) {
     std::lock_guard<std::mutex> lock(g_threads_mutex);
@@ -98,6 +103,7 @@ Timed::Timed(Section section) : section_(section) {
     if (t.depth < 16 && timeline::On()) t.began_ns[t.depth] = timeline::Now();
     ++t.depth;
     t.since = now;
+    if (t.sampled) g_sampled_section.store(int(section), std::memory_order_relaxed);
 }
 
 Timed::~Timed() {
@@ -109,6 +115,8 @@ Timed::~Timed() {
         timeline::Span(kSectionNames[int(section_)], t.began_ns[t.depth], timeline::Now());
     if (t.depth < 16) t.began_ns[t.depth] = 0;
     t.since = now;
+    if (t.sampled)
+        g_sampled_section.store(t.depth > 0 && t.depth <= 16 ? int(t.stack[t.depth - 1]) : -1, std::memory_order_relaxed);
 }
 
 double SectionSeconds(Section section) {
@@ -503,11 +511,115 @@ LONG WINAPI CrashFilter(EXCEPTION_POINTERS* info) {
 
 void InstallCrashReport() { SetUnhandledExceptionFilter(CrashFilter); }
 
+std::string SampleWindow(int) { return ""; }
+
 #else
 
 void InstallCrashReport() {}
-void StartSampler() {}
-std::string SampleReport(int) { return ""; }
+
+namespace {
+
+/* The published sampler (profile.h): what the EE's thread says it is in, a
+   thousand times a second. A key is a section (its number), an activity (its
+   text, a literal), or a guest function. */
+struct Published {
+    std::atomic<bool> stop{false};
+    std::thread thread;
+    std::mutex mutex;
+    struct Key {
+        int kind;                   // 0 a section, 1 an activity, 2 a guest function
+        std::uintptr_t value;
+        bool operator<(const Key& o) const { return kind != o.kind ? kind < o.kind : value < o.value; }
+    };
+    std::map<Key, std::uint64_t> window, total;
+};
+
+Published& ThePublished() {
+    static Published published;
+    return published;
+}
+
+std::string Label(const Published::Key& key) {
+    if (key.kind == 0) return kSectionNames[key.value];
+    if (key.kind == 1) {
+        // The activity's head: "idle: every guest thread waits ..." is "idle".
+        std::string text = reinterpret_cast<const char*>(key.value);
+        const std::size_t cut = text.find_first_of(":(");
+        if (cut != std::string::npos) text = text.substr(0, cut);
+        while (!text.empty() && text.back() == ' ') text.pop_back();
+        return text;
+    }
+    if (key.value == 0) return "the host, before the guest's first call";
+    char hex[16];
+    std::snprintf(hex, sizeof hex, "0x%08X", unsigned(key.value));
+    const char* name = FunctionName(u32(key.value));
+    return name ? std::string(hex) + " " + name : std::string(hex);
+}
+
+std::string Shares(const std::map<Published::Key, std::uint64_t>& counts, int top, const char* separator) {
+    std::uint64_t all = 0;
+    std::vector<std::pair<std::uint64_t, Published::Key>> order;
+    for (const auto& [key, n] : counts) {
+        all += n;
+        order.push_back({n, key});
+    }
+    if (!all) return "";
+    std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::string out;
+    for (int i = 0; i < top && i < int(order.size()); ++i) {
+        char share[32];
+        std::snprintf(share, sizeof share, " %.0f%%", 100.0 * double(order[i].first) / double(all));
+        if (!out.empty()) out += separator;
+        out += Label(order[i].second) + share;
+    }
+    return out;
+}
+
+}  // namespace
+
+void StartSampler() {
+    Published& p = ThePublished();
+    if (p.thread.joinable()) return;
+    t_ticks.sampled = true;                 // the caller is the EE's thread
+    p.thread = std::thread([&p] {
+        ps2plat::SetThreadRole(ps2plat::ThreadRole::kSampler);
+        while (!p.stop.load(std::memory_order_relaxed)) {
+            ps2plat::SleepUntil(std::chrono::steady_clock::now() + std::chrono::milliseconds(1));
+            if (!g_sampling.load(std::memory_order_relaxed)) continue;
+            Published::Key key{0, 0};
+            const int section = g_sampled_section.load(std::memory_order_relaxed);
+            const char* activity = LaneActivity(HostLane::kEe);
+            if (section >= 0) key = {0, std::uintptr_t(section)};
+            else if (activity) key = {1, reinterpret_cast<std::uintptr_t>(activity)};
+            else key = {2, g_sampled_function.load(std::memory_order_relaxed)};
+            std::lock_guard<std::mutex> hold(p.mutex);
+            ++p.window[key];
+            ++p.total[key];
+        }
+    });
+}
+
+std::string SampleWindow(int top) {
+    Published& p = ThePublished();
+    if (!p.thread.joinable()) return "";
+    std::map<Published::Key, std::uint64_t> window;
+    {
+        std::lock_guard<std::mutex> hold(p.mutex);
+        window.swap(p.window);
+    }
+    return Shares(window, top, ", ");
+}
+
+std::string SampleReport(int top) {
+    Published& p = ThePublished();
+    if (!p.thread.joinable()) return "";
+    p.stop = true;
+    p.thread.join();
+    std::uint64_t all = 0;
+    for (const auto& [key, n] : p.total) all += n;
+    return "the EE's thread, sampled (" + std::to_string(all) + " samples):\n  " +
+           Shares(p.total, top, "\n  ") + "\n";
+}
 
 #endif
 

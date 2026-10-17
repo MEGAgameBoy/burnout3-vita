@@ -57,7 +57,10 @@ struct RoleSetting {
 // The three cores an application has: the EE (the game, the IOP, the
 // interrupts) on the first, VIF1 and VU1 on the second, the GS on the third.
 // The blank's timer shares the EE's core above it, to take the EE's place
-// the moment it wakes; sound shares the GS's.
+// the moment it wakes; sound shares the GS's. The SPU2's mixing (a third of
+// the EE's core where it ran there) shares VIF1's, above it: it mixes a
+// millisecond at a time and sleeps. The sampler wakes a thousand times a
+// second for a moment, off the EE's core.
 RoleSetting Setting(ThreadRole role) {
     switch (role) {
         case ThreadRole::kEe: return {96, SCE_KERNEL_CPU_MASK_USER_0};
@@ -66,6 +69,8 @@ RoleSetting Setting(ThreadRole role) {
         case ThreadRole::kBlankTimer: return {64, SCE_KERNEL_CPU_MASK_USER_0};
         case ThreadRole::kAudio: return {72, SCE_KERNEL_CPU_MASK_USER_2};
         case ThreadRole::kPresent: return {80, SCE_KERNEL_CPU_MASK_USER_2};
+        case ThreadRole::kSound: return {90, SCE_KERNEL_CPU_MASK_USER_1};
+        case ThreadRole::kSampler: return {70, SCE_KERNEL_CPU_MASK_USER_1 | SCE_KERNEL_CPU_MASK_USER_2};
         case ThreadRole::kDisc: return {120, SCE_KERNEL_CPU_MASK_USER_ALL};
         case ThreadRole::kHelper: return {128, SCE_KERNEL_CPU_MASK_USER_ALL};
     }
