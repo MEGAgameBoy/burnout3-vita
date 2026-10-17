@@ -84,6 +84,8 @@ public:
     u64 Run(u32 pc, u64 limit = u64(1) << 24);
 
     u64 pairs() const { return pairs_; }
+    /* Runs started (Run's calls). */
+    u64 runs() const { return runs_; }
     /* Of those, the pairs run compiled ahead of time (vu_core.h). */
     u64 compiled_pairs() const { return compiled_pairs_; }
     /* Compiled programs entered, found with other code in memory than they
@@ -126,6 +128,7 @@ private:
     friend struct VuCore;
     std::vector<std::uint8_t> own_micro_, own_data_;
     u32 data_mask_;                 /* in quadwords */
+    u64 runs_ = 0;
     u64 pairs_ = 0, kicks_ = 0, compiled_pairs_ = 0, compiled_entries_ = 0, compiled_stale_ = 0,
         compiled_checked_ = 0;
     std::map<u32, u64> starts_;
@@ -134,6 +137,10 @@ private:
     // (2.3 million entries a race compared 4.4 GB of code otherwise).
     u64 micro_generation_ = 1;
     std::unordered_map<const void*, u64> held_at_;
+    // --vu-record: each address's program recorded at that count of writes
+    // (Record: once each, not at every start - a race starts thousands a frame).
+    std::unordered_map<u32, u64> recorded_at_;
+    void Record(u32 pc);
 
     // Compiled code: the vector registers that may hold fields the model's
     // Clean would change (bit r for VF r) - loaded so, or not known; the FMAC

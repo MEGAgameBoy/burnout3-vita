@@ -1864,6 +1864,53 @@ void Benchmarks() {
         std::printf("  COP2 ADD           %7.1f ns\n", ns_since(began) / 5e5);
     }
 
+    // The SPU2 as Burnout 3's menus leave it: 42 voices keyed off and running
+    // silent, core 0's reverb on, IRQA in a capture ring - a millisecond's
+    // mixing (48 samples) at a time, as its thread does.
+    {
+        using ps2host::iop::Spu2;
+        auto spu = std::make_unique<Spu2>();
+        u64 samples = 0;
+        spu->SetOutput([&](const Spu2::s16*, Spu2::u32 count) { samples += count; });
+        std::vector<Spu2::u8> block(64 * 16, 0x11);
+        for (std::size_t b = 0; b < block.size(); b += 16) block[b] = 0, block[b + 1] = 0;
+        block[1] = 0x04;
+        block[block.size() - 16 + 1] = 0x03;
+        spu->Write(0x10000, block.data(), Spu2::u32(block.size()));
+        spu->SetEffectAttr(0, 4, 0x3000, 0x3000, 0, 0);
+        spu->SetCoreAttr(0x02, 1);
+        spu->SetAddr(0x1F00, 0x0800);
+        for (u32 core = 0; core < 2; ++core)
+            for (u32 voice = 0; voice < (core ? 18u : 24u); ++voice) {
+                const u32 entry = core | voice << 1;
+                spu->SetAddr(0x2000 | entry, 0x10000);
+                spu->SetParam(0x0200 | entry, 0x1000);
+                spu->SetParam(0x0300 | entry, 0x000F);
+                spu->SetSwitch(0x1500 | core, 1u << voice);
+                spu->SetSwitch(0x1600 | core, 1u << voice);
+            }
+        auto none = [](Spu2::u32) {};
+        u64 now = 1000;
+        spu->Advance(now, none);
+        const auto began = Clock::now();
+        for (int ms = 0; ms < 2000; ++ms) spu->Advance(now += 1000, none);
+        std::printf("  SPU2 mixing        %7.1f us a millisecond of sound (42 voices silent, reverb; %llu samples)\n",
+                    ns_since(began) / 1e3 / 2000.0, (unsigned long long)samples);
+    }
+
+    // The EE's MMI as the generated code calls it: a halfword add, an
+    // interleave, a pack - the movies' motion compensation is made of them.
+    {
+        u64 lo = 0x0102030405060708ull, hi = 0x1112131415161718ull, a = lo, b = hi;
+        const auto began = Clock::now();
+        for (int i = 0; i < 1000000; ++i) {
+            lifted::Lanes(lifted::kPaddh, lo, hi, lo, hi, a, b);
+            lifted::Interleave(a, b, lo, hi, 8);
+            lifted::PackBytes(lo, hi, a, b, lo, hi);
+        }
+        std::printf("  MMI add+zip+pack   %7.1f ns (%016llX)\n", ns_since(began) / 1e6, (unsigned long long)(lo ^ hi ^ a ^ b));
+    }
+
     // Sleeping: a 200 us sleep (the EE's idle wait), how long it takes.
     {
         double total = 0, worst = 0;

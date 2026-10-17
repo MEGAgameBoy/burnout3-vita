@@ -483,6 +483,28 @@ void FrameTimes(u64 frame) {
                       (unsigned long long)(guesses - last_guesses), (unsigned long long)wrong);
     }
     last_guesses = guesses;
+    // VU1's work (on VIF1's worker: read as it goes on, a diagnostic) and
+    // the IPU's: what the 3D and the movies cost, per second.
+    {
+        static u64 last_pairs = 0, last_compiled = 0, last_runs = 0;
+        const Vu& vu = Vu1();
+        const u64 pairs = vu.pairs(), compiled = vu.compiled_pairs(), runs = vu.runs();
+        if (pairs != last_pairs && seconds > 0) {
+            const std::size_t used = std::strlen(job_text);
+            std::snprintf(job_text + used, sizeof job_text - used, "; VU1 %.2fM pairs/s (%d%% compiled), %.0f runs/s",
+                          double(pairs - last_pairs) / seconds / 1e6,
+                          int(100.0 * double(compiled - last_compiled) / double(pairs - last_pairs) + 0.5),
+                          double(runs - last_runs) / seconds);
+        }
+        last_pairs = pairs;
+        last_compiled = compiled;
+        last_runs = runs;
+        const std::string ipu = IpuActivity(seconds);
+        if (!ipu.empty()) {
+            const std::size_t used = std::strlen(job_text);
+            std::snprintf(job_text + used, sizeof job_text - used, "; %s", ipu.c_str());
+        }
+    }
     // Where the EE's thread was, sampled (--sample on the Vita, Linux: the
     // section, activity or guest function it said it was in).
     {

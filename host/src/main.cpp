@@ -165,6 +165,11 @@ std::vector<std::string> PlayArguments(const char* self) {
     // (--sample: the published sampler, a thousand looks a second).
     for (const char* arg : {"--window", "--frame-times", "600", "--iop-share", "50", "--sound-thread", "--sample"})
         args.push_back(arg);
+    // The VU microprograms the game starts, recorded beside it: the
+    // player's own, for building into the next build compiled ahead of time
+    // (the Vita has no recompiler at run time). Each recorded once, ever.
+    args.push_back("--vu-record");
+    args.push_back(ps2plat::JoinPath(here, "vu_programs.txt"));
     if (ps2host::Setting("renderer", "gpu") != "software") args.push_back("--gpu");
 #else
     for (const char* arg : {"--window", "--gpu"}) args.push_back(arg);

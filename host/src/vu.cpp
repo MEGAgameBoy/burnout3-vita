@@ -270,8 +270,29 @@ void RegisterVuProgram(const VuCompiled* program) {
 }
 
 void Vu::RecordPrograms(const std::string& path) {
+    // What the file has from runs before: not written again (the Vita's runs
+    // all record, into the same file).
+    if (std::FILE* before = std::fopen(path.c_str(), "r")) {
+        std::string line;
+        char chunk[4096];
+        while (std::fgets(chunk, sizeof chunk, before)) {
+            line += chunk;
+            if (line.empty() || line.back() != '\n') continue;
+            line.pop_back();
+            Recorded().insert(std::hash<std::string>{}(line));
+            line.clear();
+        }
+        std::fclose(before);
+    }
     g_record = std::fopen(path.c_str(), "a");
     if (!g_record) std::fprintf(stderr, "vu: cannot write %s\n", path.c_str());
+}
+
+void Vu::Record(u32 pc) {
+    u64& at = recorded_at_[pc];
+    if (at == micro_generation_) return;
+    at = micro_generation_;
+    RecordProgram(micro, data_mask_ == 0x3FF ? 1 : 0, pc);
 }
 
 bool Vu::SameState(const Vu& o, bool flags) const {
@@ -822,7 +843,8 @@ Vu::u64 Vu::Run(u32 pc, u64 limit) {
     const int unit = data_mask_ == 0x3FF ? 1 : 0;
     pc &= u32(micro.size() - 1) & ~7u;
     ++starts_[pc];
-    if (g_record) RecordProgram(micro, unit, pc);
+    ++runs_;
+    if (g_record) Record(pc);
     if (unit == 1 && g_snapshotting.load(std::memory_order_relaxed) && g_snapshots_left) {
         Snapshot s{};
         s.pc = pc;
@@ -861,7 +883,7 @@ bool Vu::RunCompiled(VuRunState& state, u64 limit) {
     while (!state.done && state.count < limit && state.delayed == kNone && !state.stopping) {
         const auto found = Compiled().find(std::uint64_t(unit) << 32 | state.pc);
         if (found == Compiled().end()) {
-            if (g_record && ran) RecordProgram(micro, unit, state.pc);
+            if (g_record && ran) Record(state.pc);
             break;
         }
         const VuCompiled* program = nullptr;
@@ -985,7 +1007,7 @@ void Vu::Interpret(VuRunState& state, u64 limit) {
             // Where a jump to a register's address goes is a program of its own
             // (one recorded, and compiled, from there); compiled code, if any
             // starts here, goes on.
-            if (g_record && by_register) RecordProgram(micro, unit, pc);
+            if (g_record && by_register) Record(pc);
             state.pc = pc;
             state.count = count;
             state.delayed = delayed;

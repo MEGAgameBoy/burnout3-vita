@@ -35,6 +35,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <string>
 #include <vector>
 
 #include "ps2host/memory.h"
@@ -279,6 +280,8 @@ public:
         u64 tag;
     };
     u64 commands = 0;
+    u64 steps[16] = {};                 // finished, by command code (IpuActivity)
+    u64 retries = 0;                    // steps that ran out of data
     bool stalled = false;
     Stalled stall{};
     Stalled Now(const Source& walked) const {
@@ -535,6 +538,7 @@ public:
                 default: busy = false; return true;
             }
         } catch (const NeedData&) {
+            ++retries;
             ctrl = ctrl_before;
             std::copy(dc_before, dc_before + 3, dc_pred);
             if (r.ran_dry && to_running) {
@@ -556,6 +560,7 @@ public:
             return false;
         }
         Take(r);
+        ++steps[code];
         return true;
     }
 
@@ -870,6 +875,29 @@ Ipu& Unit() {
 }
 
 }  // namespace
+
+std::string IpuActivity(double seconds) {
+    static u64 last_steps[16] = {}, last_retries = 0;
+    const Ipu& u = Unit();
+    static const char* const kNames[16] = {"BCLR", "IDEC", "BDEC", "VDEC", "FDEC", "SETIQ", "SETVQ", "CSC",
+                                           "PACK", "SETTH", "?", "?", "?", "?", "?", "?"};
+    std::string out;
+    char part[48];
+    for (int code = 0; code < 16; ++code) {
+        const u64 n = u.steps[code] - last_steps[code];
+        last_steps[code] = u.steps[code];
+        if (!n || seconds <= 0) continue;
+        std::snprintf(part, sizeof part, "%s%.0f %s/s", out.empty() ? "IPU " : ", ", double(n) / seconds, kNames[code]);
+        out += part;
+    }
+    const u64 retries = u.retries - last_retries;
+    last_retries = u.retries;
+    if (!out.empty() && retries) {
+        std::snprintf(part, sizeof part, ", %.0f retries/s", double(retries) / seconds);
+        out += part;
+    }
+    return out;
+}
 
 void InstallIpu() {
     Memory& m = GuestMemory();

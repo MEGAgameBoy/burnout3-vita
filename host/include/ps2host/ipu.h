@@ -11,11 +11,17 @@
 #ifndef PS2HOST_IPU_H
 #define PS2HOST_IPU_H
 
+#include <string>
+
 namespace ps2host {
 
 /* Hooks the IPU's registers (0x10002000-0x1000203F), its FIFOs (0x10007000,
    0x10007010) and DMA channels 3 and 4 (devices.cpp leaves those two to it). */
 void InstallIpu();
+/* Its work since the last call, for the frame line: "IPU 3360 BDEC/s, 120
+   VDEC/s, ..., 40 retries/s" (a retry: a step that ran out of data, tried
+   again from its start when more came). Empty when it did nothing. */
+std::string IpuActivity(double seconds);
 
 }  // namespace ps2host
 

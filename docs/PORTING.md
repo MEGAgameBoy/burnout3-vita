@@ -256,7 +256,12 @@ python engine/tools/port.py --game games/burnout3 build    # compiles what was r
 the instruction pairs reachable from there - and the targets of jumps to a
 register's address (JR, JALR), as programs of their own; runs add to the
 file, and `--vu-interpret` makes sure every jump is seen by the interpreter.
-The file holds the game's microcode: it stays in build/.
+The file holds the game's microcode: it stays in build/. A run reads what
+the file already holds and writes each program once, and looks at a
+program once per change of instruction memory rather than at every start,
+so recording is cheap enough to leave on: the Vita's runs record into the
+data directory (`vu_programs.txt`) by default, the player's file for their
+next build.
 
 `port.py` hands it to `engine/tools/vurecomp.py`, which writes C++ into the
 port's generated sources: each program as blocks of straight-line code (from
