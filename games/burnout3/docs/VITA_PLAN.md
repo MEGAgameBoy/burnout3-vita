@@ -286,6 +286,42 @@ For the thirteenth run:
 * ps2host_tests' folders removed entry by entry, errors not the tests'
   (RemoveTree).
 
+**The thirteenth run (2026-10-17): compiled VU1 measured; the way chosen.**
+VU1 compiled ahead ran 1.36 million pairs a second on the hardware (0.51
+interpreted): the car select a picture every 2.5 s, as estimated. The
+host tests ran to the end (RemoveTree) and measured the Vita, per call:
+VU compiled or interpreted ~1.6 us a pair on the random corpus, the EE's
+float add and multiply 477 ns (17 on x86-64), macro mode's COP2 ADD 620
+ns, the MMI's add, interleave and pack 1,289 ns (8!), a fiber switch 1.3
+us, memcpy 199 MB/s, the SPU2 292 and 638 us a millisecond of sound (the
+menus', a race's). One check failed there and nowhere else: the EE FPU's
+results hash differently on the Vita than on x86-64 and under qemu-arm -
+the test now gives each operation's hash, and FPSCR, to say which. Under
+qemu-arm, the rounding mode a thread starts with changes the add, the
+subtraction, the multiply-adds and RSQRT's results, and FZ RSQRT's: so
+every host thread now clears RMode, FZ and DN as its role is set (the
+EE's as the game's starts, the test runner's too; the VUs and macro mode
+still set their own around their runs), and the test runner prints the
+FPSCR its thread started with.
+
+The player's choice for the 3D: **the Vita does the vertex work**, not an
+emulated VU1. The way there, in steps that each stand on their own:
+1. Measure which programs VU1's time goes to (this build: the frame
+   line's "VU1's programs", by address and a hash of their first four
+   pairs - engine/tools/vudis.py --list prints the same) and record what
+   they are given (`--vu-sample-runs`: each program's 1st, 10th, 100th,
+   1,000th and 10,000th run, registers and both memories, into
+   `ux0:data/burnout3/vu_runs.bin` - the game's data, the player's own).
+2. For the programs that take the time, the same work done natively:
+   what each computes, read from its microcode (vudis.py), written as
+   plain C++ with NEON for the vertices, and checked against the
+   emulated program on the recorded runs - the packets it kicks to the
+   GS, and whatever it leaves for the next run. A program without a
+   native version still runs as now.
+3. If the CPU's native vertices are still short of the frame, the
+   transform moves onto the GPU's vertex shaders, which takes the GS
+   renderer drawing vertices it has not been given in the GS's terms.
+
 The GPU tests on the hardware (sixth run of them: 6 failures left, all
 REGION_CLAMP/REPEAT and FBMSK within a channel): every depth surface the probe tried (DF32,
 DF32 + S8, S8D24; linear or tiled; CDRAM or LPDDR) keeps depth across scenes
