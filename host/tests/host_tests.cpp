@@ -1452,6 +1452,16 @@ void IpuDecodesAndRetriesCleanly() {
 // The MMI lane operations and PEXTL* in SSE2 (lifted_support.cpp) give
 // what the lane-by-lane model gives, over random values and lanes at their
 // limits (0, 1, the signed extremes, all ones).
+}  // namespace
+namespace lifted {     // (lifted_support.cpp's, the model NEON's forms are checked against)
+void AddBytesScalar(u64& lo, u64& hi, u64 alo, u64 ahi, u64 blo, u64 bhi, bool subtract);
+void ShiftHalfwordsRightScalar(u64& lo, u64& hi, u64 blo, u64 bhi, u32 amount);
+void ShiftLanesScalar(u64& lo, u64& hi, u64 blo, u64 bhi, u32 width, u32 kind, u32 amount);
+void PackHalfwordsScalar(u64& lo, u64& hi, u64 alo, u64 ahi, u64 blo, u64 bhi);
+void PackBytesScalar(u64& lo, u64& hi, u64 alo, u64 ahi, u64 blo, u64 bhi);
+}  // namespace lifted
+namespace {
+
 void MmiLanesAreScalar() {
     u64 seed = 0x9E3779B97F4A7C15ull;
     auto next = [&] {
@@ -1488,8 +1498,38 @@ void MmiLanesAreScalar() {
             ++checked;
             if (lo1 != lo2 || hi1 != hi2) ++wrong;
         }
+    // The byte adds, packs and shifts (NEON's on ARM) against their lane-by-lane forms.
+    for (int trial = 0; trial < 4000; ++trial) {
+        const u64 alo = value(), ahi = value(), blo = value(), bhi = value();
+        const u32 amount = u32(next() % 64);
+        u64 lo1, hi1, lo2, hi2;
+        auto same = [&] {
+            ++checked;
+            if (lo1 != lo2 || hi1 != hi2) ++wrong;
+        };
+        for (bool subtract : {false, true}) {
+            lifted::AddBytes(lo1, hi1, alo, ahi, blo, bhi, subtract);
+            lifted::AddBytesScalar(lo2, hi2, alo, ahi, blo, bhi, subtract);
+            same();
+        }
+        lifted::ShiftHalfwordsRight(lo1, hi1, blo, bhi, amount);
+        lifted::ShiftHalfwordsRightScalar(lo2, hi2, blo, bhi, amount);
+        same();
+        for (u32 width : {16u, 32u})
+            for (u32 kind : {0u, 1u, 2u}) {
+                lifted::ShiftLanes(lo1, hi1, blo, bhi, width, kind, amount);
+                lifted::ShiftLanesScalar(lo2, hi2, blo, bhi, width, kind, amount);
+                same();
+            }
+        lifted::PackHalfwords(lo1, hi1, alo, ahi, blo, bhi);
+        lifted::PackHalfwordsScalar(lo2, hi2, alo, ahi, blo, bhi);
+        same();
+        lifted::PackBytes(lo1, hi1, alo, ahi, blo, bhi);
+        lifted::PackBytesScalar(lo2, hi2, alo, ahi, blo, bhi);
+        same();
+    }
     char what[128];
-    std::snprintf(what, sizeof what, "MMI lanes in SSE2 are the model's (%u of %u differ)", wrong, checked);
+    std::snprintf(what, sizeof what, "MMI lanes in SSE2 or NEON are the model's (%u of %u differ)", wrong, checked);
     Check(wrong == 0, what);
 }
 

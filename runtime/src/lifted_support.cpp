@@ -9,8 +9,19 @@
 #if defined(__SSE2__) || defined(_M_X64)
 #include <emmintrin.h>
 #endif
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 
 namespace lifted {
+
+// The MMI forms lane by lane (the host tests' model for NEON's; declared
+// there).
+void AddBytesScalar(u64& lo, u64& hi, u64 alo, u64 ahi, u64 blo, u64 bhi, bool subtract);
+void ShiftHalfwordsRightScalar(u64& lo, u64& hi, u64 blo, u64 bhi, u32 amount);
+void ShiftLanesScalar(u64& lo, u64& hi, u64 blo, u64 bhi, u32 width, u32 kind, u32 amount);
+void PackHalfwordsScalar(u64& lo, u64& hi, u64 alo, u64 ahi, u64 blo, u64 bhi);
+void PackBytesScalar(u64& lo, u64& hi, u64 alo, u64 ahi, u64 blo, u64 bhi);
 
 void (*loop_head_hook)(Context& c, u32 address) = nullptr;
 
@@ -66,7 +77,7 @@ u32 FloatMulAdd(u32 acc, u32 a, u32 b, bool subtract) {
     return generated::FloatNarrow(subtract ? x - product : x + product);
 }
 
-void AddBytes(u64& lo, u64& hi, u64 alo, u64 ahi, u64 blo, u64 bhi, bool subtract) {
+void AddBytesScalar(u64& lo, u64& hi, u64 alo, u64 ahi, u64 blo, u64 bhi, bool subtract) {
     u64 out[2] = {0, 0};
     const u64 a[2] = {alo, ahi}, b[2] = {blo, bhi};
     for (int half = 0; half < 2; ++half) {
@@ -171,6 +182,111 @@ bool LanesSse2(int op, u64& lo, u64& hi, u64 alo, u64 ahi, u64 blo, u64 bhi) {
 }
 #endif
 
+#if defined(__ARM_NEON)
+/* The same lanes in NEON, on the Vita's Cortex-A9 (where the scalar loops
+   took 400 ns a call - the movies' motion compensation is made of them):
+   every MMI operation here has its exact NEON form; `done` false for the
+   rest. MmiLanesAreScalar (host tests) compares the two. */
+static inline uint8x16_t NeonQ(u64 lo, u64 hi) { return vreinterpretq_u8_u64(vcombine_u64(vcreate_u64(lo), vcreate_u64(hi))); }
+static inline void NeonOut(uint8x16_t r, u64& lo, u64& hi) {
+    lo = vgetq_lane_u64(vreinterpretq_u64_u8(r), 0);
+    hi = vgetq_lane_u64(vreinterpretq_u64_u8(r), 1);
+}
+
+static bool LanesNeon(int op, u64& lo, u64& hi, u64 alo, u64 ahi, u64 blo, u64 bhi) {
+    const uint8x16_t a = NeonQ(alo, ahi), b = NeonQ(blo, bhi);
+    const int8x16_t a8 = vreinterpretq_s8_u8(a), b8 = vreinterpretq_s8_u8(b);
+    const int16x8_t a16 = vreinterpretq_s16_u8(a), b16 = vreinterpretq_s16_u8(b);
+    const int32x4_t a32 = vreinterpretq_s32_u8(a), b32 = vreinterpretq_s32_u8(b);
+    uint8x16_t r;
+    switch (op) {
+        case kPcgtb: r = vcgtq_s8(a8, b8); break;
+        case kPcgth: r = vreinterpretq_u8_u16(vcgtq_s16(a16, b16)); break;
+        case kPcgtw: r = vreinterpretq_u8_u32(vcgtq_s32(a32, b32)); break;
+        case kPceqb: r = vceqq_u8(a, b); break;
+        case kPceqh: r = vreinterpretq_u8_u16(vceqq_s16(a16, b16)); break;
+        case kPceqw: r = vreinterpretq_u8_u32(vceqq_s32(a32, b32)); break;
+        case kPmaxh: r = vreinterpretq_u8_s16(vmaxq_s16(a16, b16)); break;
+        case kPminh: r = vreinterpretq_u8_s16(vminq_s16(a16, b16)); break;
+        case kPaddh: r = vreinterpretq_u8_s16(vaddq_s16(a16, b16)); break;
+        case kPaddub: r = vqaddq_u8(a, b); break;
+        case kPaddw: r = vreinterpretq_u8_s32(vaddq_s32(a32, b32)); break;
+        case kPsubw: r = vreinterpretq_u8_s32(vsubq_s32(a32, b32)); break;
+        case kPmaxw: r = vreinterpretq_u8_s32(vmaxq_s32(a32, b32)); break;
+        case kPminw: r = vreinterpretq_u8_s32(vminq_s32(a32, b32)); break;
+        case kPadduw: r = vreinterpretq_u8_u32(vqaddq_u32(vreinterpretq_u32_u8(a), vreinterpretq_u32_u8(b))); break;
+        case kPabsw: r = vreinterpretq_u8_s32(vqabsq_s32(b32)); break;
+        default: return false;
+    }
+    NeonOut(r, lo, hi);
+    return true;
+}
+
+/* PEXTLB, PEXTLH, PEXTLW: b's lanes even, a's odd, from the low doublewords. */
+static bool InterleaveNeon(u64& lo, u64& hi, u64 a, u64 b, u32 width) {
+    uint8x16_t r;
+    if (width == 8) {
+        const uint8x8x2_t z = vzip_u8(vcreate_u8(b), vcreate_u8(a));
+        r = vcombine_u8(z.val[0], z.val[1]);
+    } else if (width == 16) {
+        const uint16x4x2_t z = vzip_u16(vcreate_u16(b), vcreate_u16(a));
+        r = vreinterpretq_u8_u16(vcombine_u16(z.val[0], z.val[1]));
+    } else if (width == 32) {
+        const uint32x2x2_t z = vzip_u32(vcreate_u32(b), vcreate_u32(a));
+        r = vreinterpretq_u8_u32(vcombine_u32(z.val[0], z.val[1]));
+    } else {
+        return false;
+    }
+    NeonOut(r, lo, hi);
+    return true;
+}
+
+/* PPACB: b's halfwords' low bytes, then a's. */
+static void PackBytesNeon(u64& lo, u64& hi, u64 alo, u64 ahi, u64 blo, u64 bhi) {
+    const uint8x8_t low = vmovn_u16(vreinterpretq_u16_u8(NeonQ(blo, bhi)));
+    const uint8x8_t high = vmovn_u16(vreinterpretq_u16_u8(NeonQ(alo, ahi)));
+    NeonOut(vcombine_u8(low, high), lo, hi);
+}
+
+/* PPACH: b's words' low halfwords, then a's. */
+static void PackHalfwordsNeon(u64& lo, u64& hi, u64 alo, u64 ahi, u64 blo, u64 bhi) {
+    const uint16x4_t low = vmovn_u32(vreinterpretq_u32_u8(NeonQ(blo, bhi)));
+    const uint16x4_t high = vmovn_u32(vreinterpretq_u32_u8(NeonQ(alo, ahi)));
+    NeonOut(vreinterpretq_u8_u16(vcombine_u16(low, high)), lo, hi);
+}
+
+/* PSRLH by amount (its low four bits). */
+static void ShiftHalfwordsRightNeon(u64& lo, u64& hi, u64 blo, u64 bhi, u32 amount) {
+    const uint16x8_t r = vshlq_u16(vreinterpretq_u16_u8(NeonQ(blo, bhi)), vdupq_n_s16(-int16_t(amount & 0xF)));
+    NeonOut(vreinterpretq_u8_u16(r), lo, hi);
+}
+
+/* PADDB, PSUBB. */
+static void AddBytesNeon(u64& lo, u64& hi, u64 alo, u64 ahi, u64 blo, u64 bhi, bool subtract) {
+    const uint8x16_t a = NeonQ(alo, ahi), b = NeonQ(blo, bhi);
+    NeonOut(subtract ? vsubq_u8(a, b) : vaddq_u8(a, b), lo, hi);
+}
+
+/* PSLLH/W, PSRLH/W, PSRAH/W (kind 0, 1, 2) at 16 or 32 bits; `done` false for the rest. */
+static bool ShiftLanesNeon(u64& lo, u64& hi, u64 blo, u64 bhi, u32 width, u32 kind, u32 amount) {
+    const uint8x16_t b = NeonQ(blo, bhi);
+    uint8x16_t r;
+    if (width == 16) {
+        const int16x8_t by = vdupq_n_s16(int16_t(kind == 0 ? (amount & 15) : -int(amount & 15)));
+        r = kind == 2 ? vreinterpretq_u8_s16(vshlq_s16(vreinterpretq_s16_u8(b), by))
+                      : vreinterpretq_u8_u16(vshlq_u16(vreinterpretq_u16_u8(b), by));
+    } else if (width == 32) {
+        const int32x4_t by = vdupq_n_s32(kind == 0 ? int32_t(amount & 31) : -int32_t(amount & 31));
+        r = kind == 2 ? vreinterpretq_u8_s32(vshlq_s32(vreinterpretq_s32_u8(b), by))
+                      : vreinterpretq_u8_u32(vshlq_u32(vreinterpretq_u32_u8(b), by));
+    } else {
+        return false;
+    }
+    NeonOut(r, lo, hi);
+    return true;
+}
+#endif
+
 void LanesScalar(int op, u64& lo, u64& hi, u64 alo, u64 ahi, u64 blo, u64 bhi) {
     lo = LanesOf(op, alo, blo);
     hi = LanesOf(op, ahi, bhi);
@@ -179,11 +295,55 @@ void LanesScalar(int op, u64& lo, u64& hi, u64 alo, u64 ahi, u64 blo, u64 bhi) {
 void Lanes(int op, u64& lo, u64& hi, u64 alo, u64 ahi, u64 blo, u64 bhi) {
 #if defined(__SSE2__) || defined(_M_X64)
     if (LanesSse2(op, lo, hi, alo, ahi, blo, bhi)) return;
+#elif defined(__ARM_NEON)
+    if (LanesNeon(op, lo, hi, alo, ahi, blo, bhi)) return;
 #endif
     LanesScalar(op, lo, hi, alo, ahi, blo, bhi);
 }
 
+/* The MMI's byte adds, packs and shifts: NEON's where it has them (the
+   scalar loops took several hundred nanoseconds a call on the Vita, where
+   the movies' motion compensation is made of them), else lane by lane. */
+void AddBytes(u64& lo, u64& hi, u64 alo, u64 ahi, u64 blo, u64 bhi, bool subtract) {
+#if defined(__ARM_NEON)
+    AddBytesNeon(lo, hi, alo, ahi, blo, bhi, subtract);
+#else
+    AddBytesScalar(lo, hi, alo, ahi, blo, bhi, subtract);
+#endif
+}
+
 void ShiftHalfwordsRight(u64& lo, u64& hi, u64 blo, u64 bhi, u32 amount) {
+#if defined(__ARM_NEON)
+    ShiftHalfwordsRightNeon(lo, hi, blo, bhi, amount);
+#else
+    ShiftHalfwordsRightScalar(lo, hi, blo, bhi, amount);
+#endif
+}
+
+void ShiftLanes(u64& lo, u64& hi, u64 blo, u64 bhi, u32 width, u32 kind, u32 amount) {
+#if defined(__ARM_NEON)
+    if (ShiftLanesNeon(lo, hi, blo, bhi, width, kind, amount)) return;
+#endif
+    ShiftLanesScalar(lo, hi, blo, bhi, width, kind, amount);
+}
+
+void PackHalfwords(u64& lo, u64& hi, u64 alo, u64 ahi, u64 blo, u64 bhi) {
+#if defined(__ARM_NEON)
+    PackHalfwordsNeon(lo, hi, alo, ahi, blo, bhi);
+#else
+    PackHalfwordsScalar(lo, hi, alo, ahi, blo, bhi);
+#endif
+}
+
+void PackBytes(u64& lo, u64& hi, u64 alo, u64 ahi, u64 blo, u64 bhi) {
+#if defined(__ARM_NEON)
+    PackBytesNeon(lo, hi, alo, ahi, blo, bhi);
+#else
+    PackBytesScalar(lo, hi, alo, ahi, blo, bhi);
+#endif
+}
+
+void ShiftHalfwordsRightScalar(u64& lo, u64& hi, u64 blo, u64 bhi, u32 amount) {
     const u64 in[2] = {blo, bhi};
     u64 out[2] = {0, 0};
     for (int half = 0; half < 2; ++half)
@@ -193,7 +353,7 @@ void ShiftHalfwordsRight(u64& lo, u64& hi, u64 blo, u64 bhi, u32 amount) {
     hi = out[1];
 }
 
-void ShiftLanes(u64& lo, u64& hi, u64 blo, u64 bhi, u32 width, u32 kind, u32 amount) {
+void ShiftLanesScalar(u64& lo, u64& hi, u64 blo, u64 bhi, u32 width, u32 kind, u32 amount) {
     const u64 mask = (1ull << width) - 1;
     amount &= width - 1;
     const u64 in[2] = {blo, bhi};
@@ -240,11 +400,13 @@ void Interleave(u64& lo, u64& hi, u64 a, u64 b, u32 width) {
         hi = u64(_mm_cvtsi128_si64(_mm_unpackhi_epi64(r, r)));
         return;
     }
+#elif defined(__ARM_NEON)
+    if (InterleaveNeon(lo, hi, a, b, width)) return;
 #endif
     InterleaveScalar(lo, hi, a, b, width);
 }
 
-void PackHalfwords(u64& lo, u64& hi, u64 alo, u64 ahi, u64 blo, u64 bhi) {
+void PackHalfwordsScalar(u64& lo, u64& hi, u64 alo, u64 ahi, u64 blo, u64 bhi) {
     u64 low = 0, high = 0;
     for (int i = 0; i < 2; ++i) {
         low |= ((blo >> (32 * i)) & 0xFFFF) << (16 * i);
@@ -256,7 +418,7 @@ void PackHalfwords(u64& lo, u64& hi, u64 alo, u64 ahi, u64 blo, u64 bhi) {
     hi = high;
 }
 
-void PackBytes(u64& lo, u64& hi, u64 alo, u64 ahi, u64 blo, u64 bhi) {
+void PackBytesScalar(u64& lo, u64& hi, u64 alo, u64 ahi, u64 blo, u64 bhi) {
     u64 low = 0, high = 0;
     for (int i = 0; i < 4; ++i) {
         low |= ((blo >> (16 * i)) & 0xFF) << (8 * i);
