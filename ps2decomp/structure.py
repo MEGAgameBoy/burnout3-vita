@@ -447,7 +447,11 @@ class _Emitter:
             # Nothing runs between the test and the branch: no temporary needed.
             lines.append(pad + "if (%s) {" % block.condition)
         else:
-            lines.append(pad + "{ const bool t = %s;" % block.condition)
+            # (Declared, then set: code that jumps into the block - a goto
+            # the structuring left - may pass over it, which C++ allows only
+            # for a variable without an initializer. GCC refused the
+            # `const bool t = C;` form, MSVC took it.)
+            lines.append(pad + "{ bool t; t = %s;" % block.condition)
             if block.slot:
                 lines.append(pad + "  " + block.slot)
             lines.append(pad + "  if (t) {")
@@ -609,7 +613,7 @@ _PLAIN_SLOT = re.compile(r"^([a-z][a-z0-9]*) = [^;]*;$")
 
 
 def hoist_delay_slots(lines):
-    """`{ const bool t = C; S; if (t) {...} else {...} }` is `S; if (C) {...}
+    """`{ bool t; t = C; S; if (t) {...} else {...} }` is `S; if (C) {...}
     else {...}` when S cannot change C: S is a plain assignment to a name C does
     not mention, writing no memory and calling nothing. With the slot elided, it
     is just `if (C)`."""
@@ -617,11 +621,11 @@ def hoist_delay_slots(lines):
     k = 0
     while k + 1 < len(lines):
         head = lines[k].strip()
-        if not (head.startswith("{ const bool t = ") and head.endswith(";")):
+        if not (head.startswith("{ bool t; t = ") and head.endswith(";")):
             k += 1
             continue
         pad = lines[k][:len(lines[k]) - len(lines[k].lstrip())]
-        condition = head[len("{ const bool t = "):-1]
+        condition = head[len("{ bool t; t = "):-1]
         if lines[k + 1] == pad + "  if (t) {":
             slot, test = None, k + 1
         else:
