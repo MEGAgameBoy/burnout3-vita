@@ -30,6 +30,7 @@
 #include "ps2host/ipu.h"
 
 #include <algorithm>
+#include <chrono>
 #include <array>
 #include <cmath>
 #include <cstdio>
@@ -281,6 +282,7 @@ public:
     };
     u64 commands = 0;
     u64 steps[16] = {};                 // finished, by command code (IpuActivity)
+    u64 step_ns[16] = {};               // ...and the time in each code's steps, retries included
     u64 retries = 0;                    // steps that ran out of data
     bool stalled = false;
     Stalled stall{};
@@ -526,6 +528,14 @@ public:
         const u32 ctrl_before = ctrl;
         s32 dc_before[3];
         std::copy(dc_pred, dc_pred + 3, dc_before);
+        // Each command's time, finished or not (IpuActivity's microseconds).
+        struct Clocked {
+            u64& into;
+            std::chrono::steady_clock::time_point from = std::chrono::steady_clock::now();
+            ~Clocked() {
+                into += u64(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - from).count());
+            }
+        } clocked{step_ns[code]};
         try {
             switch (code) {
                 case 2: Bdec(r); break;
@@ -877,17 +887,19 @@ Ipu& Unit() {
 }  // namespace
 
 std::string IpuActivity(double seconds) {
-    static u64 last_steps[16] = {}, last_retries = 0;
+    static u64 last_steps[16] = {}, last_ns[16] = {}, last_retries = 0;
     const Ipu& u = Unit();
     static const char* const kNames[16] = {"BCLR", "IDEC", "BDEC", "VDEC", "FDEC", "SETIQ", "SETVQ", "CSC",
                                            "PACK", "SETTH", "?", "?", "?", "?", "?", "?"};
     std::string out;
     char part[48];
     for (int code = 0; code < 16; ++code) {
-        const u64 n = u.steps[code] - last_steps[code];
+        const u64 n = u.steps[code] - last_steps[code], ns = u.step_ns[code] - last_ns[code];
         last_steps[code] = u.steps[code];
+        last_ns[code] = u.step_ns[code];
         if (!n || seconds <= 0) continue;
-        std::snprintf(part, sizeof part, "%s%.0f %s/s", out.empty() ? "IPU " : ", ", double(n) / seconds, kNames[code]);
+        std::snprintf(part, sizeof part, "%s%.0f %s/s (%.1f us)", out.empty() ? "IPU " : ", ", double(n) / seconds,
+                      kNames[code], double(ns) / 1e3 / double(n));
         out += part;
     }
     const u64 retries = u.retries - last_retries;
