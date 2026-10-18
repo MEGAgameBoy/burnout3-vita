@@ -424,7 +424,12 @@ std::string MemorySource(MemoryVariant v) {
         "#endif\n"
         "}\n"
         "#else\n"
+        "// A depth buffer's float goes out alone (an F32 surface, the FLOAT register).\n"
+        "#if DEPTH\n"
+        "float main(float3 vStq : TEXCOORD0,\n"
+        "#else\n"
         "float4 main(float3 vStq : TEXCOORD0,\n"
+        "#endif\n"
         "            uniform sampler2D uMemory : TEXUNIT0,\n"
         "            uniform sampler2D uForward : TEXUNIT1,   // a pixel of a page -> its word (half word) there\n"
         "            uniform float4 uA) : COLOR {   // FBP (pages), FBW (pages a row, 1 or more), a page's rows\n"
@@ -445,7 +450,7 @@ std::string MemorySource(MemoryVariant v) {
         "#if SIXTEEN\n"
         "    float h = upper ? b.z + b.w * 256.0f : b.x + b.y * 256.0f;\n"
         "#if DEPTH\n"
-        "    return float4(h / 4294967296.0f, 0.0f, 0.0f, 0.0f);\n"
+        "    return h / 4294967296.0f;\n"
         "#else\n"
         "    float g = floor(h / 32.0f), bl = floor(h / 1024.0f), a = floor(h / 32768.0f);\n"
         "    return Out(float4((h - g * 32.0f) * 8.0f, (g - bl * 32.0f) * 8.0f, (bl - a * 32.0f) * 8.0f, a * 128.0f));\n"
@@ -456,7 +461,7 @@ std::string MemorySource(MemoryVariant v) {
         "#else\n"
         "    float z = ((b.w * 256.0f + b.z) * 256.0f + b.y) * 256.0f + b.x;\n"
         "#endif\n"
-        "    return float4(z / 4294967296.0f, 0.0f, 0.0f, 0.0f);\n"
+        "    return z / 4294967296.0f;\n"
         "#else\n"
         "#if TWENTY_FOUR\n"
         "    b.w = 0.0f;\n"
@@ -693,6 +698,17 @@ private:
        by a recorded pass, and written by it. */
     void Touch(u32 first, u32 count, bool written);
     bool cpu_memory_ = false;       // PS2HOST_GXM_CPU_MEMORY: the first version's local memory, on the CPU
+    bool depth_on_cpu_ = false;     // ...depth buffers' alone (their programs could not be had)
+    /* Pages [first, first + count) (wrapping) of the CPU's copy into the
+       GPU's, nothing recorded left (after Idle): what a CPU swizzle wrote. */
+    void CopyToGpu(u32 first, u32 count) {
+        u8* gpu = reinterpret_cast<u8*>(memory_target_.pixels);
+        for (u32 i = 0; i < std::min(count, 512u); ++i) {
+            const u32 page = (first + i) % 512;
+            std::memcpy(gpu + std::size_t(page) * 8192, memory_.data() + std::size_t(page) * 8192, 8192);
+            std::memset(gpu_wrote_.data() + page * 32, 0, 32);
+        }
+    }
     Target memory_target_;          // the 4 MB, 1024 x 1024 RGBA8
     Memory staging_;                // 4 MB of LPDDR, rows of 1024 words; reset at Idle
     u32 staging_rows_ = 0;
@@ -1501,15 +1517,21 @@ bool GxmGsRenderer::StartMemory(std::string* error) {
         {kFromMemory | kMemDepth, all, true}, {kFromMemory | kMemDepth | kMem24, all, true},
         {kFromMemory | kMemDepth | kMem16, all, true},
     };
+    // Depth's own programs, if they cannot be had, leave depth buffers alone
+    // to the CPU (after a finish, through the CPU's copy), colour on the GPU.
     for (const Use& use : uses) {
         MemoryParams* params = nullptr;
-        if (!MemoryProgram(use.variant, use.mask, use.float_out, &params)) {
-            char text[96];
-            std::snprintf(text, sizeof text, "GS local memory's program %02X (mask %X%s) could not be had",
-                          unsigned(use.variant), unsigned(use.mask), use.float_out ? ", float" : "");
-            *error = text;
-            return false;
+        if (MemoryProgram(use.variant, use.mask, use.float_out, &params)) continue;
+        char text[96];
+        std::snprintf(text, sizeof text, "GS local memory's program %02X (mask %X%s) could not be had",
+                      unsigned(use.variant), unsigned(use.mask), use.float_out ? ", float" : "");
+        if (use.variant & kMemDepth) {
+            std::fprintf(stderr, "[gxm] %s: depth buffers to and from GS memory on the CPU\n", text);
+            depth_on_cpu_ = true;
+            continue;
         }
+        *error = text;
+        return false;
     }
     // Local memory itself: CDRAM, as a target is.
     Target& m = memory_target_;
@@ -1908,12 +1930,24 @@ bool GxmGsRenderer::DepthToMemory(u32 zbp, u32 width, u32 height, u32 fbw, u32 z
     const Depth& d = found->second;
     cols = std::min(cols, d.width);
     rows = std::min(rows, d.height);
-    if (!cpu_memory_) {
+    if (!cpu_memory_ && !depth_on_cpu_) {
         // (Stored as its scene ends, which memory's beginning ends.)
         if (first_row < rows && cols) ToMemory(d.texture, true, zpsm, zbp, fbw, cols, rows, first_row, d.width, d.height);
         return true;
     }
     Idle();
+    // Depth on the CPU beside colour on the GPU: the CPU's copy of the pages
+    // brought up to date, written below, and sent over.
+    const u32 page_rows = Is16Bit(zpsm) ? 64 : 32, bw = std::max(fbw, 1u);
+    const u32 first_page = zbp + first_row / page_rows * bw;
+    const u32 pages = rows > first_row ? ((rows - 1) / page_rows + 1 - first_row / page_rows) * bw : 0;
+    if (!cpu_memory_) SyncCopyWrapped(first_page % 512 * 32, first_page % 512 * 32 + pages * 32);
+    struct SendOver {
+        GxmGsRenderer* r;
+        bool on;
+        u32 first, count;
+        ~SendOver() { if (on) r->CopyToGpu(first, count); }
+    } send{this, !cpu_memory_, first_page, pages};
     const bool sixteen = Is16Bit(zpsm), twenty_four = Is24Bit(zpsm);
     std::vector<u32> run(cols);
     for (u32 y = first_row; y < rows; ++y) {
@@ -1936,7 +1970,7 @@ bool GxmGsRenderer::DepthToMemory(u32 zbp, u32 width, u32 height, u32 fbw, u32 z
 }
 
 void GxmGsRenderer::DepthRowsFromMemory(u32 zbp, u32 width, u32 height, u32 fbw, u32 zpsm, u32 first_row, u32 rows) {
-    if (!cpu_memory_) {
+    if (!cpu_memory_ && !depth_on_cpu_) {
         Flush();
         Depth* d = DepthFor(zbp, width, height);
         if (!d) return;
@@ -1952,6 +1986,12 @@ void GxmGsRenderer::DepthRowsFromMemory(u32 zbp, u32 width, u32 height, u32 fbw,
     if (!d) return;
     const bool twenty_four = Is24Bit(zpsm);
     const u32 last = std::min(d->height, first_row + rows);
+    if (!cpu_memory_ && first_row < last) {      // (depth alone on the CPU: its pages from the GPU's copy)
+        const u32 page_rows = Is16Bit(zpsm) ? 64 : 32, bw = std::max(fbw, 1u);
+        const u32 first_page = zbp + first_row / page_rows * bw;
+        const u32 pages = ((last - 1) / page_rows - first_row / page_rows) * bw + (d->width - 1) / 64 + 1;
+        SyncCopyWrapped(first_page % 512 * 32, first_page % 512 * 32 + pages * 32);
+    }
     for (u32 y = first_row; y < last; ++y) {
         float* out = d->depth + std::size_t(y) * d->stride;
         for (u32 x = 0; x < d->width; ++x) {
