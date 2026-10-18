@@ -38,6 +38,9 @@
 #include <deque>
 #include <string>
 #include <vector>
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 
 #include "ps2host/memory.h"
 #include "ps2host/run.h"
@@ -115,6 +118,58 @@ constexpr u8 kAlternate[64] = {0,  8,  16, 24, 1,  9,  2,  10, 17, 25, 32, 40, 4
 constexpr u8 kNonLinearScale[32] = {0,  1,  2,  3,  4,  5,  6,  7,  8,  10, 12, 14, 16, 18,  20,  22,
                                     24, 28, 32, 36, 40, 44, 48, 52, 56, 64, 72, 80, 88, 96, 104, 112};
 
+#if defined(__ARM_NEON)
+// On ARM (the Vita) the same sums in single precision, eight at a time in
+// NEON: the double-precision form took the Cortex-A9's VFP a few thousand
+// cycles a block, six blocks a macroblock. Single precision's error, a
+// few hundred-thousandths here, moves a rounding across x.5 now and then:
+// a level off, rarely - the movies' pictures, not the GS's memory.
+void Idct(const s32 in[64], s32 out[64]) {
+    static const auto basis = [] {             // [u][x]: the x's for one frequency together
+        std::array<std::array<float, 8>, 8> c{};
+        const double pi = 3.14159265358979323846;
+        for (int x = 0; x < 8; ++x)
+            for (int u = 0; u < 8; ++u)
+                c[u][x] = float(0.5 * (u == 0 ? 1.0 / std::sqrt(2.0) : 1.0) * std::cos((2 * x + 1) * u * pi / 16.0));
+        return c;
+    }();
+    float32x4_t rows[8][2];
+    int live[8], live_rows = 0;
+    for (int v = 0; v < 8; ++v) {
+        float32x4_t lo = vdupq_n_f32(0.0f), hi = vdupq_n_f32(0.0f);
+        bool any = false;
+        for (int u = 0; u < 8; ++u) {
+            const s32 f = in[v * 8 + u];
+            if (!f) continue;
+            any = true;
+            const float ff = float(f);
+            lo = vmlaq_n_f32(lo, vld1q_f32(&basis[u][0]), ff);
+            hi = vmlaq_n_f32(hi, vld1q_f32(&basis[u][4]), ff);
+        }
+        rows[v][0] = lo;
+        rows[v][1] = hi;
+        if (any) live[live_rows++] = v;
+    }
+    const float32x4_t half = vdupq_n_f32(0.5f);
+    const int32x4_t low = vdupq_n_s32(-256), high = vdupq_n_s32(255);
+    for (int y = 0; y < 8; ++y) {
+        float32x4_t lo = vdupq_n_f32(0.0f), hi = vdupq_n_f32(0.0f);
+        for (int k = 0; k < live_rows; ++k) {
+            const float b = basis[live[k]][y];
+            lo = vmlaq_n_f32(lo, rows[live[k]][0], b);
+            hi = vmlaq_n_f32(hi, rows[live[k]][1], b);
+        }
+        // floor(sum + 0.5): truncated, then one less where that went up.
+        for (int part = 0; part < 2; ++part) {
+            const float32x4_t r = vaddq_f32(part ? hi : lo, half);
+            int32x4_t t = vcvtq_s32_f32(r);
+            const uint32x4_t over = vcgtq_f32(vcvtq_f32_s32(t), r);
+            t = vaddq_s32(t, vreinterpretq_s32_u32(over));         // (all ones: minus one)
+            vst1q_s32(out + y * 8 + part * 4, vminq_s32(vmaxq_s32(t, low), high));
+        }
+    }
+}
+#else
 // The IDCT, separable, in double precision and rounded once (IEEE 1180's
 // reference): out[y][x] = sum C(u) C(v) / 4 F[v][u] cos((2x+1)u pi/16) cos((2y+1)v pi/16).
 void Idct(const s32 in[64], s32 out[64]) {
@@ -167,6 +222,7 @@ void Idct(const s32 in[64], s32 out[64]) {
         }
     }
 }
+#endif
 
 // ---------------------------------------------------------------- DMA
 
@@ -730,11 +786,10 @@ public:
             }
         }
         // RAW16: Y (16 x 16), Cb (8 x 8), Cr (8 x 8), 384 halfwords.
-        std::vector<s16> halfwords;
-        halfwords.reserve(384);
-        for (auto& row : y) halfwords.insert(halfwords.end(), row, row + 16);
-        halfwords.insert(halfwords.end(), cb, cb + 64);
-        halfwords.insert(halfwords.end(), cr, cr + 64);
+        s16 halfwords[384];
+        std::memcpy(halfwords, y, sizeof y);
+        std::memcpy(halfwords + 256, cb, sizeof cb);
+        std::memcpy(halfwords + 320, cr, sizeof cr);
         // Past the macroblock: zero bits are a slice's stuffing - the IPU
         // goes to the byte boundary and over the zero bytes to the next start
         // code and says so (SCD), or flags an error (ECD) at anything else.
@@ -752,7 +807,7 @@ public:
                 r.Skip(8);
             }
         }
-        Emit(reinterpret_cast<const u8*>(halfwords.data()), 768);
+        Emit(reinterpret_cast<const u8*>(halfwords), 768);
         busy = false;
     }
 
