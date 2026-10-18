@@ -872,6 +872,45 @@ public:
             green_of[i] = ((-0x68 * cr) >> 6) + ((-0x32 * cb) >> 6) + 1;
             blue_of[i] = ((0x102 * cb) >> 6) + 1;
         }
+#if defined(__ARM_NEON)
+        // RGB32 eight pixels at a time in NEON (the same integer arithmetic,
+        // exact): a row's eight lumas and the four chroma samples each two
+        // of them share.
+        if (!rgb16) {
+            const int16x8_t zero = vdupq_n_s16(0), top = vdupq_n_s16(255);
+            const int16x8_t t0 = vdupq_n_s16(s16(th0)), t1 = vdupq_n_s16(s16(th1));
+            for (int py = 0; py < 16; ++py)
+                for (int half = 0; half < 2; ++half) {
+                    const uint8x8_t y8 = vld1_u8(raw + py * 16 + half * 8);
+                    const uint16x8_t above = vqsubq_u16(vmovl_u8(y8), vdupq_n_u16(16));
+                    const int16x8_t luma = vreinterpretq_s16_u16(vshrq_n_u16(vmulq_n_u16(above, 0x95), 6));
+                    const int c = (py >> 1) * 8 + half * 4;
+                    const s16 rs[8] = {s16(red_of[c]), s16(red_of[c]), s16(red_of[c + 1]), s16(red_of[c + 1]),
+                                       s16(red_of[c + 2]), s16(red_of[c + 2]), s16(red_of[c + 3]), s16(red_of[c + 3])};
+                    const s16 gs[8] = {s16(green_of[c]), s16(green_of[c]), s16(green_of[c + 1]), s16(green_of[c + 1]),
+                                       s16(green_of[c + 2]), s16(green_of[c + 2]), s16(green_of[c + 3]), s16(green_of[c + 3])};
+                    const s16 bs[8] = {s16(blue_of[c]), s16(blue_of[c]), s16(blue_of[c + 1]), s16(blue_of[c + 1]),
+                                       s16(blue_of[c + 2]), s16(blue_of[c + 2]), s16(blue_of[c + 3]), s16(blue_of[c + 3])};
+                    const int16x8_t red = vminq_s16(vmaxq_s16(vshrq_n_s16(vaddq_s16(luma, vld1q_s16(rs)), 1), zero), top);
+                    const int16x8_t green = vminq_s16(vmaxq_s16(vshrq_n_s16(vaddq_s16(luma, vld1q_s16(gs)), 1), zero), top);
+                    const int16x8_t blue = vminq_s16(vmaxq_s16(vshrq_n_s16(vaddq_s16(luma, vld1q_s16(bs)), 1), zero), top);
+                    // Alpha: 0 where all three are below TH0, 0x40 below TH1, else 0x80.
+                    const uint16x8_t below0 = vandq_u16(vandq_u16(vcltq_s16(red, t0), vcltq_s16(green, t0)), vcltq_s16(blue, t0));
+                    const uint16x8_t below1 = vandq_u16(vandq_u16(vcltq_s16(red, t1), vcltq_s16(green, t1)), vcltq_s16(blue, t1));
+                    const uint16x8_t alpha = vbslq_u16(below0, vdupq_n_u16(0),
+                                                       vbslq_u16(below1, vdupq_n_u16(0x40), vdupq_n_u16(0x80)));
+                    uint8x8x4_t px;
+                    px.val[0] = vmovn_u16(vreinterpretq_u16_s16(red));
+                    px.val[1] = vmovn_u16(vreinterpretq_u16_s16(green));
+                    px.val[2] = vmovn_u16(vreinterpretq_u16_s16(blue));
+                    px.val[3] = vmovn_u16(alpha);
+                    vst4_u8(reinterpret_cast<u8*>(rgba + py * 16 + half * 8), px);
+                }
+            Emit(reinterpret_cast<const u8*>(rgba), sizeof rgba);
+            if (--left == 0) busy = false;
+            return;
+        }
+#endif
         for (int py = 0; py < 16; ++py)
             for (int px = 0; px < 16; ++px) {
                 const int luma = kLuma[raw[py * 16 + px]];
