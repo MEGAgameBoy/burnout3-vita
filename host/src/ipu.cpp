@@ -62,22 +62,41 @@ constexpr s32 kEscape = -1, kEndOfBlock = -2;
 
 #include "ipu_tables.inc"
 
-// A VLC table as a lookup on the next 16 bits: the length (0: no such
-// code) and the value.
+// A VLC table as a lookup on the next 16 bits, in two levels: the first 8
+// bits, then for the longer codes the next 8 under their prefix - a few
+// kilobytes a table, where a flat 65,536 entries (320 KB each) missed the
+// Vita's caches on most symbols. An entry packs the value (above bit 5) and
+// the length (0: no such code; 31 in the first level: a subtable, its
+// number in the value).
 struct Lookup {
-    std::vector<u8> length;
-    std::vector<s32> value;
+    std::vector<u32> first = std::vector<u32>(256, 0);
+    std::vector<u32> second;
+    static u32 Leaf(s32 value, u32 length) { return u32(value) << 5 | length; }
+    void Lookup16(u32 code, s32* value, u32* length) const {
+        u32 e = first[code >> 8];
+        if ((e & 31) == 31) e = second[(e >> 5) * 256 + (code & 255)];
+        *length = e & 31;
+        *value = s32(e) >> 5;
+    }
 };
 
 template <std::size_t N>
 Lookup Build(const Vlc (&codes)[N]) {
-    Lookup t{std::vector<u8>(65536, 0), std::vector<s32>(65536, 0)};
+    Lookup t;
     for (const Vlc& v : codes) {
-        const u32 first = u32(v.code) << (16 - v.length), count = 1u << (16 - v.length);
-        for (u32 i = 0; i < count; ++i) {
-            t.length[first + i] = v.length;
-            t.value[first + i] = v.value;
+        if (v.length <= 8) {
+            const u32 at = u32(v.code) << (8 - v.length), count = 1u << (8 - v.length);
+            for (u32 i = 0; i < count; ++i) t.first[at + i] = Lookup::Leaf(v.value, v.length);
+            continue;
         }
+        const u32 prefix = u32(v.code) >> (v.length - 8);
+        if ((t.first[prefix] & 31) != 31) {
+            t.first[prefix] = u32(t.second.size() / 256) << 5 | 31;
+            t.second.resize(t.second.size() + 256, 0);
+        }
+        const u32 table = t.first[prefix] >> 5;
+        const u32 at = (u32(v.code) << (16 - v.length)) & 255, count = 1u << (16 - v.length);
+        for (u32 i = 0; i < count; ++i) t.second[table * 256 + at + i] = Lookup::Leaf(v.value, v.length);
     }
     return t;
 }
@@ -437,10 +456,11 @@ public:
         s32 Signed(u32 n) { return s32(Get(n) << (32 - n)) >> (32 - n); }
         /* A VLC symbol: its value, and its length in `*length` (0: none such). */
         s32 Vlc(const Lookup& t, u32* length) {
-            const u32 code = Peek(16);
-            *length = t.length[code];
+            s32 value;
+            t.Lookup16(Peek(16), &value, length);
             if (*length) bit += *length;
-            return t.value[code];
+            else value = 0;
+            return value;
         }
     };
 
