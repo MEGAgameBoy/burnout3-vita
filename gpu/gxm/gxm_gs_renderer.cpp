@@ -143,8 +143,11 @@ public:
         }
         return nullptr;
     }
+    bool Owns(const void* pointer) const {
+        return block_.base && pointer >= block_.base && pointer < static_cast<const u8*>(block_.base) + block_.size;
+    }
     void Give(void* pointer) {
-        if (!pointer) return;
+        if (!pointer || !Owns(pointer)) return;
         const std::uint32_t offset = std::uint32_t(static_cast<u8*>(pointer) - static_cast<u8*>(block_.base));
         auto used = used_.find(offset);
         if (used == used_.end()) return;
@@ -433,14 +436,14 @@ std::string MemorySource(MemoryVariant v) {
         "#if SIXTEEN\n"
         "    float hw = page * 4096.0f + off;\n"
         "    float w = floor(hw / 2.0f);\n"
-        "    bool high = hw - w * 2.0f > 0.5f;\n"
+        "    bool upper = hw - w * 2.0f > 0.5f;\n"
         "#else\n"
         "    float w = page * 2048.0f + off;\n"
         "#endif\n"
-        "    float row = floor(w / 1024.0f);\n"
-        "    float4 b = Bytes(tex2D(uMemory, float2((w - row * 1024.0f + 0.5f) / 1024.0f, (row + 0.5f) / 1024.0f)));\n"
+        "    float wy = floor(w / 1024.0f);     // (not \"row\": the Vita's Cg has it as a keyword)\n"
+        "    float4 b = Bytes(tex2D(uMemory, float2((w - wy * 1024.0f + 0.5f) / 1024.0f, (wy + 0.5f) / 1024.0f)));\n"
         "#if SIXTEEN\n"
-        "    float h = high ? b.z + b.w * 256.0f : b.x + b.y * 256.0f;\n"
+        "    float h = upper ? b.z + b.w * 256.0f : b.x + b.y * 256.0f;\n"
         "#if DEPTH\n"
         "    return float4(h / 4294967296.0f, 0.0f, 0.0f, 0.0f);\n"
         "#else\n"
@@ -705,6 +708,22 @@ private:
 
     Device* device_ = nullptr;
     Heap heap_;
+    // LPDDR the GPU reads (uncached): the depth surfaces scenes need but
+    // never load or keep (their memory untouched), and what CDRAM has no
+    // room left for - the fifteenth run's race ran out (134 textures not
+    // made, drawn without them).
+    Heap lpddr_;
+    void* TakeGpu(u32 bytes, u32 align = 256, bool lpddr_first = false) {
+        Heap& first = lpddr_first ? lpddr_ : heap_;
+        Heap& second = lpddr_first ? heap_ : lpddr_;
+        void* p = first.Take(bytes, align);
+        if (!p) p = second.Take(bytes, align);
+        return p;
+    }
+    void GiveGpu(void* p) {
+        if (heap_.Owns(p)) heap_.Give(p);
+        else lpddr_.Give(p);
+    }
     Memory vertex_memory_, index_memory_;
     u32 vertex_used_ = 0;
     u16* indices_ = nullptr;
@@ -787,6 +806,11 @@ bool GxmGsRenderer::Init(std::string* error) {
         *error = "no CDRAM for the GS's targets and textures";
         return false;
     }
+    u32 lpddr_size = 48u << 20;
+    while (lpddr_size >= (8u << 20) &&
+           !lpddr_.Init(lpddr_size, SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE, "gxm gs lpddr heap"))
+        lpddr_size -= 8u << 20;
+    if (lpddr_size < (8u << 20)) lpddr_size = 0;
     if (!Allocate(&vertex_memory_, SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE, kVertexRing, SCE_GXM_MEMORY_ATTRIB_READ,
                   "gxm gs vertices") ||
         !Allocate(&index_memory_, SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE, 65536 * 2, SCE_GXM_MEMORY_ATTRIB_READ,
@@ -812,8 +836,9 @@ bool GxmGsRenderer::Init(std::string* error) {
         Flush();
         CloseScene();
     });
-    std::fprintf(stderr, "[gxm] GS renderer: %u MB of CDRAM for targets and textures; GS local memory on the %s\n",
-                 unsigned(heap_size >> 20), cpu_memory_ ? "CPU" : "GPU");
+    std::fprintf(stderr, "[gxm] GS renderer: %u MB of CDRAM for targets and textures, %u MB of LPDDR besides; GS "
+                         "local memory on the %s\n",
+                 unsigned(heap_size >> 20), unsigned(lpddr_size >> 20), cpu_memory_ ? "CPU" : "GPU");
     return true;
 }
 
@@ -897,7 +922,7 @@ bool GxmGsRenderer::MakeTarget(Target& t, u32 width, u32 height) {
     t.width = std::min(std::max(width, 1u), kMaxSide);
     t.height = std::min(std::max(height, 1u), kMaxSide);
     t.stride = (t.width + 7) & ~7u;
-    t.pixels = static_cast<u32*>(heap_.Take(t.stride * t.height * 4));
+    t.pixels = static_cast<u32*>(TakeGpu(t.stride * t.height * 4));
     if (!t.pixels) {
         std::fprintf(stderr, "[gxm] no CDRAM for a %ux%u target (%u of %u MB in use)\n", unsigned(t.width),
                      unsigned(t.height), unsigned(heap_.in_use() >> 20), unsigned(heap_.size() >> 20));
@@ -925,7 +950,7 @@ Target* GxmGsRenderer::TargetFor(u32 fbp, u32 fbw, u32 psm, u32 width, u32 heigh
         if (!MakeTarget(bigger, std::max(width, t.width), std::max(height, t.height))) return &t;
         for (u32 y = 0; y < t.height; ++y)
             std::memcpy(bigger.pixels + std::size_t(y) * bigger.stride, t.pixels + std::size_t(y) * t.stride, t.width * 4);
-        heap_.Give(t.pixels);
+        GiveGpu(t.pixels);
         t = bigger;
         return &t;
     }
@@ -940,12 +965,14 @@ bool GxmGsRenderer::MakeDepth(Depth& d, u32 width, u32 height, bool kept) {
     d.height = height;
     d.stride = (width + SCE_GXM_TILE_SIZEX - 1) & ~(SCE_GXM_TILE_SIZEX - 1);
     const u32 rows = (height + SCE_GXM_TILE_SIZEY - 1) & ~(SCE_GXM_TILE_SIZEY - 1);
-    d.depth = static_cast<float*>(heap_.Take(d.stride * rows * 4));
-    d.stencil = static_cast<u8*>(heap_.Take(d.stride * rows));
+    // A depth buffer kept across scenes in CDRAM where it can be; one never
+    // loaded or stored (a scene's stand-in) in LPDDR.
+    d.depth = static_cast<float*>(TakeGpu(d.stride * rows * 4, 256, !kept));
+    d.stencil = static_cast<u8*>(TakeGpu(d.stride * rows, 256, !kept));
     if (!d.depth || !d.stencil) {
         std::fprintf(stderr, "[gxm] no CDRAM for a %ux%u depth buffer\n", unsigned(width), unsigned(height));
-        heap_.Give(d.depth);
-        heap_.Give(d.stencil);
+        GiveGpu(d.depth);
+        GiveGpu(d.stencil);
         d.depth = nullptr;
         d.stencil = nullptr;
         return false;
@@ -992,8 +1019,8 @@ Depth* GxmGsRenderer::DepthFor(u32 zbp, u32 width, u32 height) {
         if (!MakeDepth(bigger, std::max(width, d.width), std::max(height, d.height), true)) return &d;
         for (u32 y = 0; y < d.height; ++y)
             std::memcpy(bigger.depth + std::size_t(y) * bigger.stride, d.depth + std::size_t(y) * d.stride, d.width * 4);
-        heap_.Give(d.depth);
-        heap_.Give(d.stencil);
+        GiveGpu(d.depth);
+        GiveGpu(d.stencil);
         d = bigger;
         return &d;
     }
@@ -1059,7 +1086,7 @@ void GxmGsRenderer::Idle() {
     if (g_wait_observer) g_wait_observer("the GPU", from, WaitClock());
     ++waits_;
     ++g_waits;
-    for (void* p : released_) heap_.Give(p);
+    for (void* p : released_) GiveGpu(p);
     released_.clear();
     vertex_used_ = 0;
     staging_rows_ = 0;
@@ -1325,12 +1352,26 @@ void GxmGsRenderer::UploadTexture(u64 key, const u32* pixels, u32 width, u32 hei
     t.width = std::min(width, kMaxSide);
     t.height = std::min(height, kMaxSide);
     t.stride = (t.width + 7) & ~7u;
-    t.pixels = static_cast<u32*>(heap_.Take(t.stride * t.height * 4));
+    t.pixels = static_cast<u32*>(TakeGpu(t.stride * t.height * 4));
     if (!t.pixels) {
         Idle();         // what was released comes back
-        t.pixels = static_cast<u32*>(heap_.Take(t.stride * t.height * 4));
+        t.pixels = static_cast<u32*>(TakeGpu(t.stride * t.height * 4));
         if (!t.pixels) {
-            std::fprintf(stderr, "[gxm] no CDRAM for a %ux%u texture\n", unsigned(width), unsigned(height));
+            // What holds the memory, once in a while (each failure is a draw
+            // without its texture).
+            static int told = 0;
+            if (told++ % 64 == 0) {
+                u64 texture_bytes = 0, target_bytes = 0, depth_bytes = 0;
+                for (const auto& [k, x] : textures_) texture_bytes += u64(x.stride) * x.height * 4;
+                for (const auto& [k, x] : targets_) target_bytes += u64(x.stride) * x.height * 4;
+                for (const auto& [k, x] : depths_) depth_bytes += u64(x.stride) * x.height * 5;
+                std::fprintf(stderr, "[gxm] no GPU memory for a %ux%u texture (%d so far): CDRAM %u of %u MB in use, "
+                                     "LPDDR %u of %u; %zu textures %llu MB, %zu targets %llu MB, %zu depth buffers %llu MB\n",
+                             unsigned(width), unsigned(height), told, unsigned(heap_.in_use() >> 20),
+                             unsigned(heap_.size() >> 20), unsigned(lpddr_.in_use() >> 20), unsigned(lpddr_.size() >> 20),
+                             textures_.size(), (unsigned long long)(texture_bytes >> 20), targets_.size(),
+                             (unsigned long long)(target_bytes >> 20), depths_.size(), (unsigned long long)(depth_bytes >> 20));
+            }
             textures_.erase(key);
             return;
         }
@@ -1436,11 +1477,45 @@ int LayoutOf(u32 psm) {
 }
 
 bool GxmGsRenderer::StartMemory(std::string* error) {
+    // Every program the passes use, compiled and patched first, each with the
+    // colour mask and output it is used with: one that cannot be had leaves
+    // memory on the CPU, before anything is allocated for it. (The fifteenth
+    // run's first try met a Cg keyword in one, and the passes it had made
+    // until then went on without the rest.)
+    const u8 all = SCE_GXM_COLOR_MASK_ALL, rgb = SCE_GXM_COLOR_MASK_R | SCE_GXM_COLOR_MASK_G | SCE_GXM_COLOR_MASK_B;
+    const u8 low = SCE_GXM_COLOR_MASK_R | SCE_GXM_COLOR_MASK_G, high = SCE_GXM_COLOR_MASK_B | SCE_GXM_COLOR_MASK_A;
+    struct Use {
+        MemoryVariant variant;
+        u8 mask;
+        bool float_out;
+    };
+    const Use uses[] = {
+        {kCopy, all, false},
+        {kToMemory, all, false}, {kToMemory | kMem24, rgb, false},
+        {kToMemory | kMem16, all, false}, {kToMemory | kMem16 | (1u << kHalfShift), low, false},
+        {kToMemory | kMem16 | (2u << kHalfShift), high, false},
+        {kToMemory | kMemDepth, all, false}, {kToMemory | kMemDepth | kMem24, rgb, false},
+        {kToMemory | kMemDepth | kMem16, all, false}, {kToMemory | kMemDepth | kMem16 | (1u << kHalfShift), low, false},
+        {kToMemory | kMemDepth | kMem16 | (2u << kHalfShift), high, false},
+        {kFromMemory, all, false}, {kFromMemory | kMem24, all, false}, {kFromMemory | kMem16, all, false},
+        {kFromMemory | kMemDepth, all, true}, {kFromMemory | kMemDepth | kMem24, all, true},
+        {kFromMemory | kMemDepth | kMem16, all, true},
+    };
+    for (const Use& use : uses) {
+        MemoryParams* params = nullptr;
+        if (!MemoryProgram(use.variant, use.mask, use.float_out, &params)) {
+            char text[96];
+            std::snprintf(text, sizeof text, "GS local memory's program %02X (mask %X%s) could not be had",
+                          unsigned(use.variant), unsigned(use.mask), use.float_out ? ", float" : "");
+            *error = text;
+            return false;
+        }
+    }
     // Local memory itself: CDRAM, as a target is.
     Target& m = memory_target_;
     m.fbp = ~0u;
     m.width = m.height = m.stride = 1024;
-    m.pixels = static_cast<u32*>(heap_.Take(4u << 20, 4096));
+    m.pixels = static_cast<u32*>(TakeGpu(4u << 20, 4096));
     if (!m.pixels) {
         *error = "no CDRAM for GS local memory";
         return false;
@@ -1453,6 +1528,8 @@ bool GxmGsRenderer::StartMemory(std::string* error) {
     if (!Allocate(&staging_, SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE, 4u << 20, SCE_GXM_MEMORY_ATTRIB_READ,
                   "gxm gs staging")) {
         *error = "no memory for GS local memory's staging";
+        GiveGpu(m.pixels);
+        m.pixels = nullptr;
         return false;
     }
     sceGxmTextureInitLinear(&staging_texture_, staging_.base, SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR, 1024, 1024, 0);
@@ -1461,10 +1538,19 @@ bool GxmGsRenderer::StartMemory(std::string* error) {
     for (int k = 0; k < 6; ++k) {
         const bool sixteen = k >= 2;
         const u32 rows = sixteen ? 64 : 32;
-        u32* forward = static_cast<u32*>(heap_.Take(64 * rows * 4));
-        u32* inverse = static_cast<u32*>(heap_.Take(64 * rows * 4));
+        u32* forward = static_cast<u32*>(TakeGpu(64 * rows * 4));
+        u32* inverse = static_cast<u32*>(TakeGpu(64 * rows * 4));
         if (!forward || !inverse) {
             *error = "no CDRAM for GS local memory's tables";
+            GiveGpu(forward);
+            GiveGpu(inverse);
+            for (int j = 0; j < k; ++j) {
+                GiveGpu(sceGxmTextureGetData(&forward_[j]));
+                GiveGpu(sceGxmTextureGetData(&inverse_[j]));
+            }
+            GiveGpu(m.pixels);
+            m.pixels = nullptr;
+            gxm::Release(&staging_);
             return false;
         }
         for (u32 y = 0; y < rows; ++y)
@@ -1485,14 +1571,6 @@ bool GxmGsRenderer::StartMemory(std::string* error) {
     for (SceGxmTexture* t : {&m.texture, &staging_texture_}) {
         sceGxmTextureSetMinFilter(t, SCE_GXM_TEXTURE_FILTER_POINT);
         sceGxmTextureSetMagFilter(t, SCE_GXM_TEXTURE_FILTER_POINT);
-    }
-    // The programs now: one that cannot be compiled leaves memory on the CPU.
-    for (MemoryVariant v : {kCopy, kToMemory, kFromMemory}) {
-        MemoryParams* params = nullptr;
-        if (!MemoryProgram(v, SCE_GXM_COLOR_MASK_ALL, false, &params)) {
-            *error = "a GS local memory program could not be compiled";
-            return false;
-        }
     }
     return true;
 }
@@ -2010,7 +2088,7 @@ void GxmGsRenderer::UseClut() {
     // is recorded reads the one it was drawn with).
     if (!clut_changed_ && clut_pixels_) return;
     if (clut_pixels_) Release(clut_pixels_);
-    clut_pixels_ = static_cast<u32*>(heap_.Take(256 * 4));
+    clut_pixels_ = static_cast<u32*>(TakeGpu(256 * 4));
     if (!clut_pixels_) return;
     std::memcpy(clut_pixels_, clut_, sizeof clut_);
     sceGxmTextureInitLinear(&clut_texture_, clut_pixels_, SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR, 256, 1, 0);
