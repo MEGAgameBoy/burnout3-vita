@@ -196,7 +196,13 @@ void Vif1RunFrame(std::function<void()> command) {
         Activity activity(HostLane::kEe, "waiting for VIF1's worker to come within two frames");
         Waited waited{g_frame_wait_us};
         std::unique_lock<std::mutex> lock(w.mutex);
-        w.drained.wait(lock, [&] { return w.frames.load() < kFramesBehind; });
+        while (w.frames.load() >= kFramesBehind) {
+            // The IOP meanwhile (RunIopWhileWaiting); asleep when it has nothing to run.
+            lock.unlock();
+            const bool ran = RunIopWhileWaiting();
+            lock.lock();
+            if (!ran) w.drained.wait_for(lock, std::chrono::milliseconds(1), [&] { return w.frames.load() < kFramesBehind; });
+        }
     }
     ++w.frames;
     Vif1Run([&w, command = std::move(command)] {
@@ -237,7 +243,12 @@ void JoinVif1(const char* why, u32 address) {
         const auto began = std::chrono::steady_clock::now();
         {
             std::unique_lock<std::mutex> lock(w.mutex);
-            w.drained.wait(lock, [&] { return w.pending.load() == 0; });
+            while (w.pending.load() != 0) {
+                lock.unlock();
+                const bool ran = RunIopWhileWaiting();
+                lock.lock();
+                if (!ran) w.drained.wait_for(lock, std::chrono::milliseconds(1), [&] { return w.pending.load() == 0; });
+            }
         }
         const u64 us = u64(std::chrono::duration_cast<std::chrono::microseconds>(
                                std::chrono::steady_clock::now() - began).count());

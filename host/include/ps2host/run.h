@@ -106,6 +106,14 @@ void SifDma(u32 transfers, u32 count);
 bool DeliverIopReply();
 /* Whether an answer from the IOP waits to be delivered. */
 bool IopReplyPending();
+/* The EE's thread waiting on the host's own threads (VIF1's worker two
+   frames behind, the GS thread's ring full): a slice of the IOP meanwhile
+   (2 ms of its threads at most), as the idle loop gives it - on the
+   console the IOP runs beside the EE, and in a race the EE waited for the
+   worker 95% of the time while the IOP, run only at frames, starved (the
+   sound driver's buffers repeated: the buzz). Real time only, the EE's
+   thread only, not within itself. True if an IOP thread ran. */
+bool RunIopWhileWaiting();
 /* A packet from the IOP to the EE (a module's sceSifSendCmd): queued, and
    delivered as the SIF0 interrupt at the next safe point. */
 void QueueIopPacket(std::vector<u8> packet);

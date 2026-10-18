@@ -150,7 +150,7 @@ struct Feed {
         Activity activity(HostLane::kEe, "waiting for room in the GS thread's ring");
         while (at + words - tail.load(std::memory_order_acquire) > kRing) {
             Rethrow();
-            std::this_thread::yield();
+            if (!RunIopWhileWaiting()) std::this_thread::yield();     // (the EE's thread alone runs it)
         }
     }
 
@@ -170,7 +170,7 @@ struct Feed {
         for (int spins = 0; tail.load(std::memory_order_acquire) < target; ++spins) {
             Rethrow();
             if (spins < 4096) Pause();
-            else std::this_thread::yield();
+            else if (!RunIopWhileWaiting()) std::this_thread::yield();
         }
         Rethrow();
     }

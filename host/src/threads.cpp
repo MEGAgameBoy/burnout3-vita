@@ -829,7 +829,27 @@ void StartRealTime() {
 
 }  // namespace
 
+namespace {
+thread_local bool t_ee_thread = false;      // RunThreads' thread (the guest's fibers run on it)
+thread_local bool t_iop_while_waiting = false;
+}  // namespace
+
+bool RunIopWhileWaiting() {
+    Scheduler& s = S();
+    if (!t_ee_thread || t_iop_while_waiting || !s.realtime || s.virtual_time) return false;
+    t_iop_while_waiting = true;
+    u64 spent = 0;
+    {
+        Timed timed(Section::Iop);
+        Activity activity(HostLane::kEe, "the IOP, while the EE waits for the host's threads");
+        spent = iop::Run(50'000, 2'000'000);
+    }
+    t_iop_while_waiting = false;
+    return spent != 0;
+}
+
 void RunThreads(const lifted::Context& initial, u32 entry, s64 loop_budget) {
+    t_ee_thread = true;
     Scheduler& s = S();
     s.loop_budget = loop_budget;
     lifted::loop_head_hook = LoopHead;
