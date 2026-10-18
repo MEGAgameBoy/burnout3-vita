@@ -26,6 +26,18 @@
 #include <immintrin.h>
 #endif
 
+/* PS2HOST_VU_VFP: the FMAC's lanes one at a time in scalar floating point
+   (VuCore::Fmac's notes) - ARM's way (the Vita's); the PC's tests build it
+   on x86 too with PS2HOST_VU_FORCE_VFP, where SSE's scalar operations under
+   the run's MXCSR are the same arithmetic. PS2HOST_VU_SSE_LANES: the four
+   lanes at once, x86's. */
+#if PS2RT_VU_NEON || defined(PS2HOST_VU_FORCE_VFP)
+#define PS2HOST_VU_VFP 1
+#else
+#define PS2HOST_VU_VFP 0
+#endif
+#define PS2HOST_VU_SSE_LANES (PS2RT_VU_SSE && !PS2HOST_VU_VFP)
+
 #if defined(_MSC_VER)
 #define PS2HOST_VU_INLINE __forceinline
 #else
@@ -175,7 +187,7 @@ struct VuCore {
     /* Whether Clean leaves all four fields as they are: no infinity or NaN
        exponent, and no denormal (a zero exponent with a mantissa). */
     static PS2HOST_VU_INLINE bool Clean4(const u32* q) {
-#if PS2RT_VU_SSE
+#if PS2HOST_VU_SSE_LANES
         const __m128i x = _mm_loadu_si128(reinterpret_cast<const __m128i*>(q));
         const __m128i exponent = _mm_and_si128(x, _mm_set1_epi32(0x7F800000));
         const __m128i zero = _mm_setzero_si128();
@@ -239,7 +251,7 @@ struct VuCore {
     /* The lower operations macro mode shares, as ThroughCop2 would leave
        them: a vector write held back only if it changes the register, a VI
        write only if it changes the VI, Q's next value set. */
-#if PS2RT_VU_SSE
+#if PS2HOST_VU_SSE_LANES
     /* Dest's fields as a lane mask (x the first lane). Registers are read
        and written whole, as 16 bytes: a field stored alone and the register
        then read whole is a store the processor cannot forward (a stall of a
@@ -305,7 +317,7 @@ struct VuCore {
     static PS2HOST_VU_INLINE void Mfir(Vu& v, Vu::Pending& out, int it, int is, u32 dest) {
         u32 x = v.regs.vc[is] & 0xFFFF;
         if (x & 0x8000) x |= 0xFFFF0000u;
-#if PS2RT_VU_SSE
+#if PS2HOST_VU_SSE_LANES
         HoldVf(v, out, it, dest, _mm_set1_epi32(int(x)));
 #else
         const u32 value[4] = {x, x, x, x};
@@ -354,7 +366,135 @@ struct VuCore {
     static PS2HOST_VU_INLINE u32 Mac(Vu& v, u64 cycle) { LandFlags(v, cycle); return v.mac; }
 
     // ------------------------------------------------------------ upper
-#if PS2RT_VU_SSE
+#if PS2HOST_VU_VFP
+    /* The FMAC on ARM (the Vita): each lane a VFP operation on the
+       registers' memory, nothing leaving the VFP registers. The four-lane
+       paths below are NEON there, and NEON cannot round toward zero, so
+       sse_on_neon.h's float lanes were VFP operations on lanes taken out of
+       NEON registers one by one, through the ARM core's registers: some
+       fifteen such moves an FMAC, each stalling the Cortex-A9 until NEON's
+       pipeline drained - most of 1.6 us a pair on the Vita. Here the fields
+       are read as floats from where they are kept and the results stored
+       back: VFP's loads, operations and stores alone. A run has FPSCR at
+       round toward zero with flush to zero (Run's VuRounding), so an
+       operation on clean operands leaves a clean result - an overflow is
+       the largest float, a denormal a signed zero, never an infinity or a
+       NaN - and is the model's (the same argument as LanesSse's): only
+       operands not known clean are cleaned, as integers. MAX and MINI
+       compare the bits as integers. */
+    static PS2HOST_VU_INLINE void CleanTo(u32 out[4], const u32 in[4]) {
+        for (int lane = 0; lane < 4; ++lane) out[lane] = lifted::Clean(in[lane]);
+    }
+    template <int Op, int Operand, int To, u32 Dest, int Known = 0, int SetFlags = 0>
+    static PS2HOST_VU_INLINE void Fmac(Vu& v, int fs, int ft) {
+        lifted::Context& c = v.regs;
+        constexpr bool kRaw = Op == lifted::kMax_ || Op == lifted::kMini;
+        u32* to = To < 0 ? c.vacc : To == 0 ? v.discarded_ : c.vf[To];
+        if constexpr (kRaw) {
+            // As integers, the operands as they are.
+            u32 a[4], b[4];
+            std::memcpy(a, c.vf[fs], 16);
+            if constexpr (Operand == 6) std::memcpy(b, c.vf[ft], 16);
+            else {
+                const u32 x = Operand == 4 ? c.vc[lifted::kRegQ] : Operand == 5 ? c.vc[lifted::kRegI] : c.vf[ft][Operand & 3];
+                b[0] = b[1] = b[2] = b[3] = x;
+            }
+            for (int lane = 0; lane < 4; ++lane) {
+                if (!(Dest & (8u >> lane))) continue;
+                const bool take_b = Op == lifted::kMax_ ? lifted::Order(a[lane]) < lifted::Order(b[lane])
+                                                        : lifted::Order(b[lane]) < lifted::Order(a[lane]);
+                to[lane] = take_b ? b[lane] : a[lane];
+            }
+            if constexpr (To < 0) v.acc_unclean_ = true;
+            if constexpr (To > 0) v.unclean_ |= 1u << To;
+        } else {
+            u32 clean_a[4], clean_b[4], clean_acc[4];
+            const float* a = reinterpret_cast<const float*>(c.vf[fs]);
+            if constexpr ((Known & 1) == 0)
+                if ((v.unclean_ >> fs) & 1) {
+                    CleanTo(clean_a, c.vf[fs]);
+                    a = reinterpret_cast<const float*>(clean_a);
+                }
+            float b[4];
+            if constexpr (Operand == 6) {
+                const float* bf = reinterpret_cast<const float*>(c.vf[ft]);
+                if constexpr ((Known & 2) == 0)
+                    if ((v.unclean_ >> ft) & 1) {
+                        CleanTo(clean_b, c.vf[ft]);
+                        bf = reinterpret_cast<const float*>(clean_b);
+                    }
+                for (int lane = 0; lane < 4; ++lane) b[lane] = bf[lane];
+            } else {
+                u32 x = Operand == 4 ? c.vc[lifted::kRegQ] : Operand == 5 ? c.vc[lifted::kRegI] : c.vf[ft][Operand & 3];
+                if constexpr ((Known & 2) == 0) {
+                    if constexpr (Operand == 4 || Operand == 5) x = lifted::Clean(x);
+                    else if ((v.unclean_ >> ft) & 1) x = lifted::Clean(x);
+                }
+                float f;
+                std::memcpy(&f, &x, 4);
+                b[0] = b[1] = b[2] = b[3] = f;
+            }
+            const float* acc = reinterpret_cast<const float*>(c.vacc);
+            if constexpr ((Known & 4) == 0 && (Op == lifted::kMadd || Op == lifted::kMsub))
+                if (v.acc_unclean_) {
+                    CleanTo(clean_acc, c.vacc);
+                    acc = reinterpret_cast<const float*>(clean_acc);
+                }
+            // Every lane read before any is written (fd may be fs or ft).
+            float r[4];
+            for (int lane = 0; lane < 4; ++lane) {
+                if (!(Dest & (8u >> lane))) continue;
+                if constexpr (Op == lifted::kAdd) r[lane] = a[lane] + b[lane];
+                else if constexpr (Op == lifted::kSub) r[lane] = a[lane] - b[lane];
+                else if constexpr (Op == lifted::kMul) r[lane] = a[lane] * b[lane];
+                else if constexpr (Op == lifted::kMadd) r[lane] = acc[lane] + a[lane] * b[lane];
+                else r[lane] = acc[lane] - a[lane] * b[lane];
+            }
+            float* out = reinterpret_cast<float*>(to);
+            for (int lane = 0; lane < 4; ++lane)
+                if (Dest & (8u >> lane)) out[lane] = r[lane];
+            if constexpr (To < 0 && Dest == 15) v.acc_unclean_ = false;
+            if constexpr (To > 0 && Dest == 15) v.unclean_ &= ~(1u << To);
+        }
+        if constexpr (SetFlags == 1) Flags<To, Dest>(v);
+        else if constexpr (SetFlags == 2) StickyFlags<To, Dest>(v);
+    }
+    /* OPMULA, OPMSUB: a.yzx times b.zxy (from ACC). */
+    template <u32 Dest>
+    static PS2HOST_VU_INLINE void Opmula(Vu& v, int fs, int ft) {
+        u32 ca[4], cb[4];
+        CleanTo(ca, v.regs.vf[fs]);
+        CleanTo(cb, v.regs.vf[ft]);
+        const float* a = reinterpret_cast<const float*>(ca);
+        const float* b = reinterpret_cast<const float*>(cb);
+        const float r[3] = {a[1] * b[2], a[2] * b[0], a[0] * b[1]};
+        float* acc = reinterpret_cast<float*>(v.regs.vacc);
+        if constexpr ((Dest & 8) != 0) acc[0] = r[0];
+        if constexpr ((Dest & 4) != 0) acc[1] = r[1];
+        if constexpr ((Dest & 2) != 0) acc[2] = r[2];
+    }
+    template <u32 Dest>
+    static PS2HOST_VU_INLINE void Opmsub(Vu& v, int fd, int fs, int ft) {
+        u32 ca[4], cb[4], cacc[4];
+        CleanTo(ca, v.regs.vf[fs]);
+        CleanTo(cb, v.regs.vf[ft]);
+        CleanTo(cacc, v.regs.vacc);
+        const float* a = reinterpret_cast<const float*>(ca);
+        const float* b = reinterpret_cast<const float*>(cb);
+        const float* acc = reinterpret_cast<const float*>(cacc);
+        const float r[3] = {acc[0] - a[1] * b[2], acc[1] - a[2] * b[0], acc[2] - a[0] * b[1]};
+        if (fd == 0) {                                  // the flags' alone
+            float* d = reinterpret_cast<float*>(v.discarded_);
+            d[0] = r[0], d[1] = r[1], d[2] = r[2];
+            v.discarded_[3] = 0;
+            return;
+        }
+        float* to = reinterpret_cast<float*>(v.regs.vf[fd]);
+        if constexpr ((Dest & 8) != 0) to[0] = r[0];
+        if constexpr ((Dest & 4) != 0) to[1] = r[1];
+        if constexpr ((Dest & 2) != 0) to[2] = r[2];
+    }
+#elif PS2HOST_VU_SSE_LANES
     /* An FMAC operation: Op (vu_math.h's), Operand (0-3 a lane of ft, 4 Q,
        5 I, 6 ft), into To (-1 ACC; 0 VF0, which stays: the result goes to
        discarded_, for the flags). Flags 1 sets the flags as Flags<To, Dest>
@@ -425,11 +565,12 @@ struct VuCore {
         else if constexpr (SetFlags == 2) StickyFlags<To, Dest>(v);
     }
 #endif
+#if !PS2HOST_VU_VFP     // (VFP's Opmula and Opmsub are above)
     /* Macro mode's COP2 operations, as it runs them (vu0.cpp's Cop2), without
        finding which each time. */
     template <u32 Dest>
     static PS2HOST_VU_INLINE void Opmula(Vu& v, int fs, int ft) {
-#if PS2RT_VU_SSE
+#if PS2HOST_VU_SSE_LANES
         const __m128i a = _mm_shuffle_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(v.regs.vf[fs])),
                                             _MM_SHUFFLE(3, 0, 2, 1));
         const __m128i b = _mm_shuffle_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(v.regs.vf[ft])),
@@ -447,7 +588,9 @@ struct VuCore {
         if constexpr ((Dest & 2) != 0) v.regs.vacc[2] = out[2];
 #endif
     }
-#if PS2RT_VU_SSE
+#endif
+#if PS2HOST_VU_VFP
+#elif PS2HOST_VU_SSE_LANES
     /* The same lanes at once: a.yzx times b.zxy, from ACC (LanesSse's MSUB,
        the model's number; lane w is worked and dropped). */
     template <u32 Dest>
@@ -488,8 +631,52 @@ struct VuCore {
     }
 #endif
     /* ITOF0/4/12/15 (Shift 0-3), FTOI the same, ABS: into ft (VF0 stays). */
+#if PS2HOST_VU_VFP
+    /* A signed integer's bits converted to float as FPSCR rounds. In asm on
+       ARM: GCC folds float(i) * 2^-n into VCVT's fixed-point form, which
+       rounds to nearest whatever FPSCR says (ITOF4/12/15 a bit off, the
+       hardware's tests under qemu-arm found). */
+    static PS2HOST_VU_INLINE float ConvertedInt(u32 bits) {
+#if defined(__arm__)
+        float in, r;
+        std::memcpy(&in, &bits, 4);
+        __asm__("vcvt.f32.s32 %0, %1" : "=t"(r) : "t"(in));
+        return r;
+#else
+        return float(std::int32_t(bits));
+#endif
+    }
+    /* x truncated to a signed integer, saturating, its bits as a float's. */
+    static PS2HOST_VU_INLINE float TruncatedBits(float x) {
+#if defined(__arm__)
+        float r;
+        __asm__("vcvt.s32.f32 %0, %1" : "=t"(r) : "t"(x));
+        return r;
+#else
+        const std::int32_t i = x >= 2147483648.0f ? 0x7FFFFFFF : x <= -2147483648.0f ? INT32_MIN : std::int32_t(x);
+        float r;
+        std::memcpy(&r, &i, 4);
+        return r;
+#endif
+    }
+#endif
     template <u32 Dest, int Shift>
     static PS2HOST_VU_INLINE void Itof(Vu& v, int ft, int fs) {
+#if PS2HOST_VU_VFP
+        // The integer converted as FPSCR rounds (toward zero in a run), then
+        // the exact power of two: the model's Result(i / scale).
+        static constexpr float kInverse[4] = {1.0f, 1.0f / 16.0f, 1.0f / 4096.0f, 1.0f / 32768.0f};
+        if (ft > 0) {
+            float* to = reinterpret_cast<float*>(v.regs.vf[ft]);
+            float out[4];
+            for (int lane = 0; lane < 4; ++lane)
+                if (Dest & (8u >> lane)) out[lane] = ConvertedInt(v.regs.vf[fs][lane]) * kInverse[Shift];
+            for (int lane = 0; lane < 4; ++lane)
+                if (Dest & (8u >> lane)) to[lane] = out[lane];
+        }
+        Wrote<Dest>(v, ft, true);
+        return;
+#endif
         static constexpr double kScale[4] = {1.0, 16.0, 4096.0, 32768.0};
         const u32* a = v.regs.vf[fs];
         u32 out[4];
@@ -499,7 +686,7 @@ struct VuCore {
     }
     template <u32 Dest, int Shift>
     static PS2HOST_VU_INLINE void Ftoi(Vu& v, int ft, int fs) {
-#if PS2RT_VU_SSE
+#if PS2HOST_VU_SSE_LANES
         // Clean, times a power of two (exact, or an infinity past the
         // largest), truncated; cvttps2dq gives 0x80000000 for anything past
         // 32 bits, right for negatives, and turned to 0x7FFFFFFF for the
@@ -514,6 +701,22 @@ struct VuCore {
         __m128i* to = reinterpret_cast<__m128i*>(v.regs.vf[ft]);
         if constexpr (Dest == 15) _mm_storeu_si128(to, value);
         else _mm_storeu_si128(to, Blend(LaneMask(Dest), value, _mm_loadu_si128(to)));
+        Wrote<Dest>(v, ft, false);                      // integers
+        return;
+#elif PS2HOST_VU_VFP
+        // The same in VFP: times a power of two (exact, or the largest float
+        // under round toward zero), and VCVT's truncation, which saturates
+        // as FloatToInt does - the integer kept in a VFP register and stored.
+        static constexpr float kScaleF[4] = {1.0f, 16.0f, 4096.0f, 32768.0f};
+        if (ft == 0) return;
+        float* to = reinterpret_cast<float*>(v.regs.vf[ft]);
+        for (int lane = 0; lane < 4; ++lane) {
+            if (!(Dest & (8u >> lane))) continue;
+            const u32 bits = lifted::Clean(v.regs.vf[fs][lane]);
+            float x;
+            std::memcpy(&x, &bits, 4);
+            to[lane] = TruncatedBits(x * kScaleF[Shift]);
+        }
         Wrote<Dest>(v, ft, false);                      // integers
         return;
 #endif
@@ -535,7 +738,7 @@ struct VuCore {
     template <u32 Dest>
     static PS2HOST_VU_INLINE void WriteVf(Vu& v, int reg, const u32 out[4]) {
         if (reg == 0) return;
-#if PS2RT_VU_SSE
+#if PS2HOST_VU_SSE_LANES
         __m128i* to = reinterpret_cast<__m128i*>(v.regs.vf[reg]);
         const __m128i value = _mm_set_epi32(int(out[3]), int(out[2]), int(out[1]), int(out[0]));
         if constexpr (Dest == 15) _mm_storeu_si128(to, value);
@@ -573,7 +776,7 @@ struct VuCore {
     /* MAC: zero (bits 3-0) and sign (7-4) of each written field, x highest;
        `out` the register the upper wrote (Target: -1 ACC, 0 VF0 - the result
        itself, which VF0 does not keep). */
-#if PS2RT_VU_SSE
+#if PS2HOST_VU_SSE_LANES
     /* The four lanes at once: which are zero and which negative, lane x
        the highest bit as the MAC flag has it (the lanes turned round before
        the mask is taken). No Clean, as the interpreter has: every operation
@@ -604,7 +807,7 @@ struct VuCore {
     template <int Target, u32 Dest>
     static PS2HOST_VU_INLINE void Flags(Vu& v) {
         const u32* out = Target > 0 ? v.regs.vf[Target] : Target == 0 ? v.discarded_ : v.regs.vacc;
-#if PS2RT_VU_SSE
+#if PS2HOST_VU_SSE_LANES
         FlagsOf<Dest>(v, _mm_loadu_si128(reinterpret_cast<const __m128i*>(out)));
 #else
         u32 m = 0;
@@ -627,7 +830,7 @@ struct VuCore {
     template <int Target, u32 Dest>
     static PS2HOST_VU_INLINE void StickyFlags(Vu& v) {
         const u32* out = Target > 0 ? v.regs.vf[Target] : Target == 0 ? v.discarded_ : v.regs.vacc;
-#if PS2RT_VU_SSE
+#if PS2HOST_VU_SSE_LANES
         StickyFlagsOf<Dest>(v, _mm_loadu_si128(reinterpret_cast<const __m128i*>(out)));
 #else
         u32 zero = 0, sign = 0;
@@ -648,7 +851,7 @@ struct VuCore {
         const u64 ready = cycle + kFmacLatency;
         if (pending.vf > 0) {
             const u32 landing = pending.lanes & ~(written == pending.vf ? lanes : 0u);
-#if PS2RT_VU_SSE
+#if PS2HOST_VU_SSE_LANES
             __m128i* to = reinterpret_cast<__m128i*>(v.regs.vf[pending.vf]);
             _mm_storeu_si128(to, Blend(LaneMask(landing),
                                        _mm_loadu_si128(reinterpret_cast<const __m128i*>(pending.value)),
@@ -656,7 +859,7 @@ struct VuCore {
 #endif
             for (int lane = 0; lane < 4; ++lane) {
                 if (landing & (8u >> lane)) {
-#if !PS2RT_VU_SSE
+#if !PS2HOST_VU_SSE_LANES
                     v.regs.vf[pending.vf][lane] = pending.value[lane];
 #endif
                     v.vf_ready_[pending.vf][lane] = ready;
