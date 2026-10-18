@@ -369,6 +369,47 @@ For the fifteenth run:
   EndScene and Finish).
 * `--env NAME=VALUE`: the PS2HOST_* switches from run.args.
 
+**The fifteenth run (2026-10-18): GS memory stayed on the CPU.** One of
+the new programs did not compile on the Vita - "row" is a keyword of its
+Cg - so the renderer fell back to the first version's CPU swizzles, and
+the frame lines showed it plainly: the GS thread 90-115% busy, 88-94% of
+it in "GPU syncs", VU1 at 6-11%, the EE and the worker waiting on it. The
+fallback had also kept the 4 MB it had taken, and the race ran out of
+CDRAM: 134 textures not made, drawn without them (likely the "blue
+glitchy thing everywhere" the player saw). ps2gxm_tests' swizzle checks passed,
+but on that same CPU path - they say nothing yet about the passes. The
+player also found the menus barely usable: the title screen's background
+movie decodes ~1,400 macroblocks a second (1.3 pictures a second of a
+640x480 movie), the EE never idle - the IPU 23% of its time, libmpeg's
+own code (its motion compensation is MMI) much of the rest. And in the
+race the music buzzed: the IOP, run on the EE's thread at frames, got
+10,000 instructions a second while the EE waited for the worker.
+
+For the sixteenth run:
+* the keyword renamed; every program the passes use compiled and patched
+  before GS memory is allocated (a failure leaves it on the CPU whole,
+  giving back what it took);
+* depth surfaces a scene never loads or stores (stand-ins) in LPDDR, and
+  LPDDR for textures, targets and depth buffers when CDRAM is full; a
+  texture that still cannot be had says what holds the memory;
+* compiled VU code's lanes in VFP on ARM (VuCore's PS2HOST_VU_VFP): the
+  FMAC had gone through sse_on_neon.h's float lanes, each moved out of
+  NEON through the ARM core's registers - some fifteen such moves an
+  FMAC, each a stall of NEON's pipeline. FTOI and ITOF in asm (GCC folded
+  ITOF's scale into VCVT's fixed-point form, which rounds to nearest).
+  Checked on x86 (forced) and under qemu-arm: the VU corpus to the bit;
+* the MMI's lanes in NEON (the movies' motion compensation), checked
+  against the scalar model;
+* the structured form of the lift (7,845 of 8,179 verified functions;
+  structure.py now declares a branch's test without an initializer, which
+  GCC refused to see jumped over);
+* the IPU's IDCT and RGB32 colour conversion in NEON on ARM, its VLC
+  tables in two levels (one lookup for most codes, not a walk of a bit at
+  a time);
+* the IOP runs while the EE waits for VIF1's worker or the GS thread
+  (RunIopWhileWaiting), real time only;
+* each IPU command's time in the frame line.
+
 The GPU tests on the hardware (sixth run of them: 6 failures left, all
 REGION_CLAMP/REPEAT and FBMSK within a channel): every depth surface the probe tried (DF32,
 DF32 + S8, S8D24; linear or tiled; CDRAM or LPDDR) keeps depth across scenes
