@@ -302,7 +302,13 @@ bool Vu::SameState(const Vu& o, bool flags) const {
         return false;
     if ((flags && (mac != o.mac || status != o.status)) || clip != o.clip || p != o.p || resume != o.resume)
         return false;
-    if (cycle_ != o.cycle_ || !same(vf_ready_, o.vf_ready_, sizeof vf_ready_) || q_next_ != o.q_next_ ||
+    // When a field lands, as far as anything can see: compiled code leaves
+    // out the landings that come before the run ends (vurecomp, emit_pair),
+    // so a time at or before the cycle the run ended is "landed", whichever.
+    for (int r = 0; r < 32; ++r)
+        for (int lane = 0; lane < 4; ++lane)
+            if (Later(vf_ready_[r][lane], cycle_) != Later(o.vf_ready_[r][lane], o.cycle_)) return false;
+    if (cycle_ != o.cycle_ || q_next_ != o.q_next_ ||
         p_next_ != o.p_next_ || q_ready_ != o.q_ready_ || p_ready_ != o.p_ready_ || q_busy_ != o.q_busy_ ||
         p_busy_ != o.p_busy_)
         return false;
@@ -319,6 +325,46 @@ bool Vu::SameState(const Vu& o, bool flags) const {
             return false;
     }
     return data.size() == o.data.size() && same(data.data(), o.data.data(), data.size()) && kicks_ == o.kicks_;
+}
+
+std::string Vu::StateDifference(const Vu& o) const {
+    char text[160];
+    for (int r = 0; r < 32; ++r)
+        for (int l = 0; l < 4; ++l)
+            if (regs.vf[r][l] != o.regs.vf[r][l]) {
+                std::snprintf(text, sizeof text, "vf%d[%d] %08X vs %08X", r, l, regs.vf[r][l], o.regs.vf[r][l]);
+                return text;
+            }
+    for (int r = 0; r < 32; ++r)
+        if (regs.vc[r] != o.regs.vc[r]) {
+            std::snprintf(text, sizeof text, "vc%d %08X vs %08X", r, regs.vc[r], o.regs.vc[r]);
+            return text;
+        }
+    if (std::memcmp(regs.vacc, o.regs.vacc, sizeof regs.vacc)) return "ACC";
+    if (mac != o.mac || status != o.status || clip != o.clip) {
+        std::snprintf(text, sizeof text, "flags mac %X/%X status %X/%X clip %X/%X", mac, o.mac, status, o.status, clip, o.clip);
+        return text;
+    }
+    if (p != o.p || resume != o.resume) return "P or resume";
+    if (cycle_ != o.cycle_) {
+        std::snprintf(text, sizeof text, "cycle %llu vs %llu", (unsigned long long)cycle_, (unsigned long long)o.cycle_);
+        return text;
+    }
+    for (int r = 0; r < 32; ++r)
+        for (int l = 0; l < 4; ++l)
+            if (Later(vf_ready_[r][l], cycle_) != Later(o.vf_ready_[r][l], o.cycle_)) {
+                std::snprintf(text, sizeof text, "vf%d[%d] lands at %llu vs %llu (cycle %llu)", r, l,
+                              (unsigned long long)vf_ready_[r][l], (unsigned long long)o.vf_ready_[r][l],
+                              (unsigned long long)cycle_);
+                return text;
+            }
+    if (q_next_ != o.q_next_ || q_ready_ != o.q_ready_ || q_busy_ != o.q_busy_) return "Q in flight";
+    if (p_next_ != o.p_next_ || p_ready_ != o.p_ready_ || p_busy_ != o.p_busy_) return "P in flight";
+    if (mac_latest_ != o.mac_latest_ || status_latest_ != o.status_latest_ || clip_latest_ != o.clip_latest_) return "latest flags";
+    if (flag_count_ != o.flag_count_) return "flags in flight (count)";
+    if (data.size() != o.data.size() || std::memcmp(data.data(), o.data.data(), data.size())) return "data memory";
+    if (kicks_ != o.kicks_) return "kicks";
+    return SameState(o) ? "" : "flags in flight";
 }
 
 Vu::Vu(int index)
@@ -624,6 +670,13 @@ std::vector<std::pair<Vu::u64, Vu::u32>> Vu::ClipsInFlight() const {
 void Vu::LandAll() {
     cycle_ += 64;                   // time passes after the program: what was in flight lands
     Land();
+    // ...and is the present: no landed time stays behind long enough to wrap
+    // round (2^32 cycles) into the future.
+    for (auto& lanes : vf_ready_)
+        for (Cyc& ready : lanes) ready = cycle_;
+    if (!q_busy_) q_ready_ = cycle_;
+    if (!p_busy_) p_ready_ = cycle_;
+    qp_due_ = cycle_ + 0x40000000u;
 }
 
 namespace {
@@ -902,7 +955,7 @@ Vu::u64 Vu::Run(u32 pc, u64 limit) {
     }
     VuRunState state;
     state.pc = pc;
-    unclean_ = ~1u;                     // nothing known about the registers yet
+    std::memset(unclean_ + 1, 15, 31);       // nothing known about the registers yet
     acc_unclean_ = true;
     RunCompiled(state, limit);
     if (!state.done) Interpret(state, limit);
@@ -962,7 +1015,7 @@ bool Vu::RunCompiled(VuRunState& state, u64 limit) {
 }
 
 void Vu::Interpret(VuRunState& state, u64 limit) {
-    unclean_ = ~1u;                     // the interpreter does not keep track
+    std::memset(unclean_ + 1, 15, 31);       // the interpreter does not keep track
     acc_unclean_ = true;
     u64 count = state.count;
     u32 delayed = state.delayed;
@@ -983,12 +1036,12 @@ void Vu::Interpret(VuRunState& state, u64 limit) {
 
         // Stalls: operands still in the pipeline, a busy divider or EFU, the waits.
         const Reads& reads = d.reads;
-        u64 issue = cycle_;
+        Cyc issue = cycle_;
         for (int i = 0; i < reads.n; ++i)
             for (int lane = 0; lane < 4; ++lane)
-                if (reads.lanes[i] & (8u >> lane)) issue = std::max(issue, vf_ready_[reads.reg[i]][lane]);
-        if (q_busy_ && d.q_waits) issue = std::max(issue, q_ready_);
-        if (p_busy_ && d.p_waits) issue = std::max(issue, p_ready_);
+                if (reads.lanes[i] & (8u >> lane)) issue = Later(issue, vf_ready_[reads.reg[i]][lane]);
+        if (q_busy_ && d.q_waits) issue = Later(issue, q_ready_);
+        if (p_busy_ && d.p_waits) issue = Later(issue, p_ready_);
         cycle_ = issue;
         Land();
 
@@ -1019,17 +1072,17 @@ void Vu::Interpret(VuRunState& state, u64 limit) {
         if (pending.q_latency) {
             // (A quotient equal to the Q before changes no register: it is that Q.)
             q_next_ = pending.vc ? pending.vc_after[kRegQ] : regs.vc[kRegQ];
-            q_ready_ = cycle_ + u64(pending.q_latency);
+            q_ready_ = cycle_ + Cyc(pending.q_latency);
             q_busy_ = true;
-            qp_due_ = std::min(qp_due_, q_ready_);
+            qp_due_ = Earlier(qp_due_, q_ready_);
             if (pending.vc) pending.vc_after[kRegQ] = regs.vc[kRegQ];
         }
         if (pending.vc) std::memcpy(regs.vc, pending.vc_after, sizeof pending.vc_after);
         if (pending.p) {
             p_next_ = pending.p_value;
-            p_ready_ = cycle_ + u64(pending.p_latency ? pending.p_latency : 1);
+            p_ready_ = cycle_ + Cyc(pending.p_latency ? pending.p_latency : 1);
             p_busy_ = true;
-            qp_due_ = std::min(qp_due_, p_ready_);
+            qp_due_ = Earlier(qp_due_, p_ready_);
         }
         regs.vc[0] = 0;
         ++cycle_;

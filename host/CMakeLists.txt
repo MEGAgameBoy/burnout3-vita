@@ -305,6 +305,16 @@ END
         target_compile_options(${target} PRIVATE -ffunction-sections)
         set_source_files_properties(${translated} ${generated} TARGET_DIRECTORY ${target}
                                     PROPERTIES COMPILE_OPTIONS "-O2")
+        # The compiled VU programs without GCC's vectoriser: it made NEON of
+        # the lanes' loops whose results the ARM core then took (a VMOV out of
+        # NEON stalls the Cortex-A9 until NEON's pipeline drains); VuCore's
+        # lanes are VFP's on the Vita.
+        set(vu_generated ${generated})
+        list(FILTER vu_generated INCLUDE REGEX "/vu_[a-z_0-9]+\\.cpp$")
+        if(vu_generated)
+            set_source_files_properties(${vu_generated} TARGET_DIRECTORY ${target}
+                                        PROPERTIES COMPILE_OPTIONS "-O2;-fno-tree-vectorize")
+        endif()
         if(PORT_VITA_HEAP_MB)
             target_compile_definitions(${target} PRIVATE PS2HOST_VITA_HEAP_MB=${PORT_VITA_HEAP_MB})
         endif()

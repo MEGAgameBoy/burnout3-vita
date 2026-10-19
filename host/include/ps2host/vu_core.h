@@ -43,6 +43,15 @@
 #else
 #define PS2HOST_VU_INLINE inline __attribute__((always_inline))
 #endif
+/* A loop over a register's lanes, unrolled whole: its dest a constant, each
+   lane then a few instructions or none. GCC's -O2 left them loops (a shift,
+   a test and a predicated operation a lane, each turn), most of an FMAC on
+   the Vita. */
+#if defined(__GNUC__)
+#define PS2HOST_VU_LANES _Pragma("GCC unroll 4")
+#else
+#define PS2HOST_VU_LANES
+#endif
 
 namespace ps2host {
 
@@ -63,10 +72,11 @@ struct Vu::Pending {
 };
 
 inline void Vu::LandNow() {
-    if (q_busy_ && q_ready_ <= cycle_) { regs.vc[lifted::kRegQ] = q_next_; q_busy_ = false; }
-    if (p_busy_ && p_ready_ <= cycle_) { p = p_next_; p_busy_ = false; }
-    qp_due_ = std::min(q_busy_ ? q_ready_ : ~u64(0), p_busy_ ? p_ready_ : ~u64(0));
-    while (flag_count_ && flag_queue_[flag_head_].ready <= cycle_) {
+    if (q_busy_ && Due(q_ready_, cycle_)) { regs.vc[lifted::kRegQ] = q_next_; q_busy_ = false; }
+    if (p_busy_ && Due(p_ready_, cycle_)) { p = p_next_; p_busy_ = false; }
+    const Cyc none = cycle_ + 0x40000000u;
+    qp_due_ = Earlier(q_busy_ ? q_ready_ : none, p_busy_ ? p_ready_ : none);
+    while (flag_count_ && Due(flag_queue_[flag_head_].ready, cycle_)) {
         const FlagWrite& f = flag_queue_[flag_head_];
         if (f.sets_mac) { mac = f.mac; status = (status & ~0x3u) | (f.status & 0x3u); status |= f.status & 0xC0u; }
         if (f.sets_clip) clip = f.clip;
@@ -83,14 +93,14 @@ PS2HOST_VU_INLINE void Vu::Land() {
     // The flags land inline: nearly every pair has an FMAC's flags arriving,
     // and a call for each was 5% of a race. (Q, P and the flags are apart:
     // the order they land in within a cycle changes nothing.)
-    while (flag_count_ && flag_queue_[flag_head_].ready <= cycle_) {
+    while (flag_count_ && Due(flag_queue_[flag_head_].ready, cycle_)) {
         const FlagWrite& f = flag_queue_[flag_head_];
         if (f.sets_mac) { mac = f.mac; status = (status & ~0x3u) | (f.status & 0x3u); status |= f.status & 0xC0u; }
         if (f.sets_clip) clip = f.clip;
         flag_head_ = (flag_head_ + 1) & 7;
         --flag_count_;
     }
-    if (qp_due_ <= cycle_) LandNow();
+    if (Due(qp_due_, cycle_)) LandNow();
 }
 
 /* Where a run stands between pairs. */
@@ -126,17 +136,18 @@ void RegisterVuProgram(const VuCompiled* program);
 struct VuCore {
     using u32 = Vu::u32;
     using u64 = Vu::u64;
+    using Cyc = Vu::Cyc;
     using Pending = Vu::Pending;    // what the generated code holds a pair's lower writes in
     static constexpr u32 kNone = ~0u;
     static constexpr int kFmacLatency = 4;
 
     // ------------------------------------------------------------ stalls
-    static PS2HOST_VU_INLINE u64& Cycle(Vu& v) { return v.cycle_; }
-    static PS2HOST_VU_INLINE void Wait(u64& t, const Vu& v, int reg, int lane) {
-        t = std::max(t, v.vf_ready_[reg][lane]);
+    static PS2HOST_VU_INLINE Cyc& Cycle(Vu& v) { return v.cycle_; }
+    static PS2HOST_VU_INLINE void Wait(Cyc& t, const Vu& v, int reg, int lane) {
+        t = Vu::Later(t, v.vf_ready_[reg][lane]);
     }
-    static PS2HOST_VU_INLINE void WaitQ(u64& t, const Vu& v) { if (v.q_busy_) t = std::max(t, v.q_ready_); }
-    static PS2HOST_VU_INLINE void WaitP(u64& t, const Vu& v) { if (v.p_busy_) t = std::max(t, v.p_ready_); }
+    static PS2HOST_VU_INLINE void WaitQ(Cyc& t, const Vu& v) { if (v.q_busy_) t = Vu::Later(t, v.q_ready_); }
+    static PS2HOST_VU_INLINE void WaitP(Cyc& t, const Vu& v) { if (v.p_busy_) t = Vu::Later(t, v.p_ready_); }
     /* Compiled code lands the flags lazily: an FMAC's flags arrive four
        cycles after it, and landing them at every pair (as the interpreter
        does) was a loop of thirty instructions a pair. Nothing sees the
@@ -149,15 +160,21 @@ struct VuCore {
     /* The cycle is the block's own (a local the generated code keeps, and
        writes back to cycle_ as it leaves): MSVC read cycle_ again after every
        store otherwise. LandNow reads cycle_, so it is written back first. */
-    static PS2HOST_VU_INLINE void Issue(Vu& v, u64& cycle, u64 t) {
+    static PS2HOST_VU_INLINE void Issue(Vu& v, Cyc& cycle, Cyc t) {
         cycle = t;
-        if (v.qp_due_ <= t) {
+        if (Vu::Due(v.qp_due_, t)) {
             v.cycle_ = t;
             v.LandNow();
         }
     }
-    static PS2HOST_VU_INLINE void LandFlags(Vu& v, u64 cycle) {
-        while (v.flag_count_ && v.flag_queue_[v.flag_head_].ready <= cycle) {
+    /* A pair that neither reads Q or P nor starts or waits for them
+       (vurecomp's emit_pair): what is due lands at the next pair that does. */
+    static PS2HOST_VU_INLINE void IssueQuiet(Cyc& cycle, Cyc t) { cycle = t; }
+    /* A wait on a field the block wrote at a pair that issued at `issued`
+       (vurecomp keeps that cycle in a local): it lands four cycles on. */
+    static PS2HOST_VU_INLINE void WaitAt(Cyc& t, Cyc issued) { t = Vu::Later(t, issued + kFmacLatency); }
+    static PS2HOST_VU_INLINE void LandFlags(Vu& v, Cyc cycle) {
+        while (v.flag_count_ && Vu::Due(v.flag_queue_[v.flag_head_].ready, cycle)) {
             const Vu::FlagWrite& f = v.flag_queue_[v.flag_head_];
             if (f.sets_mac) {
                 v.mac = f.mac;
@@ -168,6 +185,24 @@ struct VuCore {
             v.flag_head_ = (v.flag_head_ + 1) & 7;
             --v.flag_count_;
         }
+    }
+
+    // ------------------------------------------------------------ clean fields
+    /* Whether any of `lanes` (dest bits: x 8 ... w 1) of VF `reg` may hold a
+       field Clean would change (Vu::unclean_), and marking them so or not. */
+    static PS2HOST_VU_INLINE bool Unclean(const Vu& v, int reg, u32 lanes) { return (v.unclean_[reg] & lanes) != 0; }
+    static PS2HOST_VU_INLINE void MarkUnclean(Vu& v, int reg, u32 lanes) {
+        if (reg <= 0) return;
+        if (lanes == 15) v.unclean_[reg] = 15;
+        else v.unclean_[reg] = std::uint8_t(v.unclean_[reg] | lanes);
+    }
+    static PS2HOST_VU_INLINE void MarkClean(Vu& v, int reg, u32 lanes) {
+        if (lanes == 15) v.unclean_[reg] = 0;
+        else v.unclean_[reg] = std::uint8_t(v.unclean_[reg] & ~lanes);
+    }
+    /* MR32's: lane i takes the source's lane i + 1 (w takes x). */
+    static constexpr u32 Mr32Sources(u32 dest) {
+        return ((dest & 8) ? 4u : 0u) | ((dest & 4) ? 2u : 0u) | ((dest & 2) ? 1u : 0u) | ((dest & 1) ? 8u : 0u);
     }
 
     // ------------------------------------------------------------ lower
@@ -182,7 +217,14 @@ struct VuCore {
         out.vf = it;
         out.lanes = dest;
         std::memcpy(out.value, q, 16);
+#if PS2HOST_VU_VFP
+        // Not looked at here: the FMAC looks the first time it takes the
+        // register (Fmac's CleanOperand), and what is only stored again (a
+        // vertex's colour, its texture coordinates) never is.
+        out.clean = false;
+#else
         out.clean = Clean4(q);
+#endif
     }
     /* Whether Clean leaves all four fields as they are: no infinity or NaN
        exponent, and no denormal (a zero exponent with a mantissa). */
@@ -196,9 +238,14 @@ struct VuCore {
             _mm_cmpeq_epi32(_mm_and_si128(x, _mm_set1_epi32(0x007FFFFF)), zero), _mm_cmpeq_epi32(exponent, zero));
         return _mm_movemask_epi8(_mm_or_si128(huge, denormal)) == 0;
 #else
-        for (int lane = 0; lane < 4; ++lane)
-            if (lifted::Clean(q[lane]) != q[lane]) return false;
-        return true;
+        // Without a branch a lane: a denormal's magnitude is 1 - 0x7FFFFF,
+        // an infinity's or NaN's 0x7F800000 and up (a zero is clean).
+        u32 bad = 0;
+        PS2HOST_VU_LANES for (int lane = 0; lane < 4; ++lane) {
+            const u32 magnitude = q[lane] & 0x7FFFFFFFu;
+            bad |= u32(magnitude - 1u < 0x007FFFFFu) | u32(magnitude >= 0x7F800000u);
+        }
+        return bad == 0;
 #endif
     }
     template <u32 Dest>
@@ -224,7 +271,7 @@ struct VuCore {
     static PS2HOST_VU_INLINE void Mfp(Vu& v, Vu::Pending& out, int it, u32 dest) {
         out.vf = it;
         out.lanes = dest;
-        for (u32& x : out.value) x = v.p;
+        PS2HOST_VU_LANES for (u32& x : out.value) x = v.p;
     }
     static PS2HOST_VU_INLINE u32 Top(const Vu& v) { return v.top; }
     static PS2HOST_VU_INLINE u32 Itop(const Vu& v) { return v.itop; }
@@ -273,11 +320,11 @@ struct VuCore {
         _mm_storeu_si128(reinterpret_cast<__m128i*>(out.value), after);
     }
     static PS2HOST_VU_INLINE void Move(Vu& v, Vu::Pending& out, int it, int fs, u32 dest) {
-        out.clean = !((v.unclean_ >> fs) & 1);
+        out.clean = !Unclean(v, fs, dest);
         HoldVf(v, out, it, dest, _mm_loadu_si128(reinterpret_cast<const __m128i*>(v.regs.vf[fs])));
     }
     static PS2HOST_VU_INLINE void Mr32(Vu& v, Vu::Pending& out, int it, int fs, u32 dest) {
-        out.clean = !((v.unclean_ >> fs) & 1);
+        out.clean = !Unclean(v, fs, Mr32Sources(dest));
         HoldVf(v, out, it, dest, _mm_shuffle_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(v.regs.vf[fs])),
                                                    _MM_SHUFFLE(0, 3, 2, 1)));
     }
@@ -286,7 +333,7 @@ struct VuCore {
         if (it == 0) return;
         u32 after[4];
         std::memcpy(after, v.regs.vf[it], 16);
-        for (int lane = 0; lane < 4; ++lane)
+        PS2HOST_VU_LANES for (int lane = 0; lane < 4; ++lane)
             if (dest & (8u >> lane)) after[lane] = value[lane];
         if (std::memcmp(after, v.regs.vf[it], 16) == 0) return;
         out.vf = it;
@@ -295,24 +342,22 @@ struct VuCore {
     }
     static PS2HOST_VU_INLINE void Move(Vu& v, Vu::Pending& out, int it, int fs, u32 dest) {
         const u32 value[4] = {v.regs.vf[fs][0], v.regs.vf[fs][1], v.regs.vf[fs][2], v.regs.vf[fs][3]};
-        out.clean = !((v.unclean_ >> fs) & 1);
+        out.clean = !Unclean(v, fs, dest);
         HoldVf(v, out, it, dest, value);
     }
     static PS2HOST_VU_INLINE void Mr32(Vu& v, Vu::Pending& out, int it, int fs, u32 dest) {
         const u32* a = v.regs.vf[fs];
         const u32 value[4] = {a[1], a[2], a[3], a[0]};
-        out.clean = !((v.unclean_ >> fs) & 1);
+        out.clean = !Unclean(v, fs, Mr32Sources(dest));
         HoldVf(v, out, it, dest, value);
     }
 #endif
-    /* An upper write of Dest's fields into `reg`: clean ones clean the
-       register when they are all of it (else it stays as it was); others
-       make it unknown. */
+    /* An upper write of Dest's fields into `reg`: clean or not known. */
     template <u32 Dest>
     static PS2HOST_VU_INLINE void Wrote(Vu& v, int reg, bool clean) {
         if (reg <= 0) return;
-        if (!clean) v.unclean_ |= 1u << reg;
-        else if constexpr (Dest == 15) v.unclean_ &= ~(1u << reg);
+        if (clean) MarkClean(v, reg, Dest);
+        else MarkUnclean(v, reg, Dest);
     }
     static PS2HOST_VU_INLINE void Mfir(Vu& v, Vu::Pending& out, int it, int is, u32 dest) {
         u32 x = v.regs.vc[is] & 0xFFFF;
@@ -359,11 +404,11 @@ struct VuCore {
         return lifted::Value(v.regs.vf[reg][lane]);
     }
     // The flag instructions read and set these (landed first: see Issue).
-    static PS2HOST_VU_INLINE u32& Clip(Vu& v, u64 cycle) { LandFlags(v, cycle); return v.clip; }
+    static PS2HOST_VU_INLINE u32& Clip(Vu& v, Cyc cycle) { LandFlags(v, cycle); return v.clip; }
     static PS2HOST_VU_INLINE u32& ClipLatest(Vu& v) { return v.clip_latest_; }
-    static PS2HOST_VU_INLINE u32& Status(Vu& v, u64 cycle) { LandFlags(v, cycle); return v.status; }
+    static PS2HOST_VU_INLINE u32& Status(Vu& v, Cyc cycle) { LandFlags(v, cycle); return v.status; }
     static PS2HOST_VU_INLINE u32& StatusLatest(Vu& v) { return v.status_latest_; }
-    static PS2HOST_VU_INLINE u32 Mac(Vu& v, u64 cycle) { LandFlags(v, cycle); return v.mac; }
+    static PS2HOST_VU_INLINE u32 Mac(Vu& v, Cyc cycle) { LandFlags(v, cycle); return v.mac; }
 
     // ------------------------------------------------------------ upper
 #if PS2HOST_VU_VFP
@@ -383,7 +428,27 @@ struct VuCore {
        operands not known clean are cleaned, as integers. MAX and MINI
        compare the bits as integers. */
     static PS2HOST_VU_INLINE void CleanTo(u32 out[4], const u32 in[4]) {
-        for (int lane = 0; lane < 4; ++lane) out[lane] = lifted::Clean(in[lane]);
+        PS2HOST_VU_LANES for (int lane = 0; lane < 4; ++lane) out[lane] = lifted::Clean(in[lane]);
+    }
+    /* Whether Clean leaves a field as it is (Clean4's test, one lane). */
+    static PS2HOST_VU_INLINE bool CleanField(u32 bits) {
+        const u32 magnitude = bits & 0x7FFFFFFFu;
+        return !(magnitude - 1u < 0x007FFFFFu) && magnitude < 0x7F800000u;
+    }
+    /* An FMAC operand not known clean, of which it takes `lanes` (dest
+       bits): fields found clean are marked so (unclean_), and the register
+       taken as it is - from then on without a look; else a cleaned copy, in
+       `copy`. */
+    static PS2HOST_VU_INLINE const float* CleanOperand(Vu& v, int reg, u32 lanes, u32 copy[4]) {
+        const u32* bits = v.regs.vf[reg];
+        if (!Unclean(v, reg, lanes)) return reinterpret_cast<const float*>(bits);
+        u32 unclean = v.unclean_[reg];
+        PS2HOST_VU_LANES for (int lane = 0; lane < 4; ++lane)
+            if ((lanes & unclean & (8u >> lane)) && CleanField(bits[lane])) unclean &= ~(8u >> lane);
+        v.unclean_[reg] = std::uint8_t(unclean);
+        if (!(unclean & lanes)) return reinterpret_cast<const float*>(bits);
+        CleanTo(copy, bits);
+        return reinterpret_cast<const float*>(copy);
     }
     template <int Op, int Operand, int To, u32 Dest, int Known = 0, int SetFlags = 0>
     static PS2HOST_VU_INLINE void Fmac(Vu& v, int fs, int ft) {
@@ -399,36 +464,28 @@ struct VuCore {
                 const u32 x = Operand == 4 ? c.vc[lifted::kRegQ] : Operand == 5 ? c.vc[lifted::kRegI] : c.vf[ft][Operand & 3];
                 b[0] = b[1] = b[2] = b[3] = x;
             }
-            for (int lane = 0; lane < 4; ++lane) {
+            PS2HOST_VU_LANES for (int lane = 0; lane < 4; ++lane) {
                 if (!(Dest & (8u >> lane))) continue;
                 const bool take_b = Op == lifted::kMax_ ? lifted::Order(a[lane]) < lifted::Order(b[lane])
                                                         : lifted::Order(b[lane]) < lifted::Order(a[lane]);
                 to[lane] = take_b ? b[lane] : a[lane];
             }
             if constexpr (To < 0) v.acc_unclean_ = true;
-            if constexpr (To > 0) v.unclean_ |= 1u << To;
+            if constexpr (To > 0) MarkUnclean(v, To, Dest);
         } else {
             u32 clean_a[4], clean_b[4], clean_acc[4];
             const float* a = reinterpret_cast<const float*>(c.vf[fs]);
-            if constexpr ((Known & 1) == 0)
-                if ((v.unclean_ >> fs) & 1) {
-                    CleanTo(clean_a, c.vf[fs]);
-                    a = reinterpret_cast<const float*>(clean_a);
-                }
+            if constexpr ((Known & 1) == 0) a = CleanOperand(v, fs, Dest, clean_a);
             float b[4];
             if constexpr (Operand == 6) {
                 const float* bf = reinterpret_cast<const float*>(c.vf[ft]);
-                if constexpr ((Known & 2) == 0)
-                    if ((v.unclean_ >> ft) & 1) {
-                        CleanTo(clean_b, c.vf[ft]);
-                        bf = reinterpret_cast<const float*>(clean_b);
-                    }
-                for (int lane = 0; lane < 4; ++lane) b[lane] = bf[lane];
+                if constexpr ((Known & 2) == 0) bf = CleanOperand(v, ft, Dest, clean_b);
+                PS2HOST_VU_LANES for (int lane = 0; lane < 4; ++lane) b[lane] = bf[lane];
             } else {
                 u32 x = Operand == 4 ? c.vc[lifted::kRegQ] : Operand == 5 ? c.vc[lifted::kRegI] : c.vf[ft][Operand & 3];
                 if constexpr ((Known & 2) == 0) {
                     if constexpr (Operand == 4 || Operand == 5) x = lifted::Clean(x);
-                    else if ((v.unclean_ >> ft) & 1) x = lifted::Clean(x);
+                    else x = reinterpret_cast<const u32*>(CleanOperand(v, ft, 8u >> (Operand & 3), clean_b))[Operand & 3];
                 }
                 float f;
                 std::memcpy(&f, &x, 4);
@@ -442,7 +499,7 @@ struct VuCore {
                 }
             // Every lane read before any is written (fd may be fs or ft).
             float r[4];
-            for (int lane = 0; lane < 4; ++lane) {
+            PS2HOST_VU_LANES for (int lane = 0; lane < 4; ++lane) {
                 if (!(Dest & (8u >> lane))) continue;
                 if constexpr (Op == lifted::kAdd) r[lane] = a[lane] + b[lane];
                 else if constexpr (Op == lifted::kSub) r[lane] = a[lane] - b[lane];
@@ -451,12 +508,12 @@ struct VuCore {
                 else r[lane] = acc[lane] - a[lane] * b[lane];
             }
             float* out = reinterpret_cast<float*>(to);
-            for (int lane = 0; lane < 4; ++lane)
+            PS2HOST_VU_LANES for (int lane = 0; lane < 4; ++lane)
                 if (Dest & (8u >> lane)) out[lane] = r[lane];
             if constexpr (To < 0 && Dest == 15) v.acc_unclean_ = false;
-            if constexpr (To > 0 && Dest == 15) v.unclean_ &= ~(1u << To);
+            if constexpr (To > 0) MarkClean(v, To, Dest);
         }
-        if constexpr (SetFlags == 1) Flags<To, Dest>(v);
+        if constexpr (SetFlags == 1) Flags<To, Dest, !kRaw>(v);
         else if constexpr (SetFlags == 2) StickyFlags<To, Dest>(v);
     }
     /* OPMULA, OPMSUB: a.yzx times b.zxy (from ACC). */
@@ -515,10 +572,10 @@ struct VuCore {
         // field unclean.
         constexpr bool kRaw = Op == lifted::kMax_ || Op == lifted::kMini;
         if constexpr ((Known & 1) == 0 && !kRaw)
-            if ((v.unclean_ >> fs) & 1) a = lifted::CleanLanes(a);
+            if (Unclean(v, fs, Dest)) a = lifted::CleanLanes(a);
         if constexpr ((Known & 2) == 0 && !kRaw) {
             if constexpr (Operand == 4 || Operand == 5) b = lifted::CleanLanes(b);
-            else if ((v.unclean_ >> ft) & 1) b = lifted::CleanLanes(b);
+            else if (Unclean(v, ft, Operand == 6 ? Dest : 8u >> (Operand & 3))) b = lifted::CleanLanes(b);
         }
         // ACC as the operands: cleaned only where not known clean (MADD,
         // MSUB read it).
@@ -532,8 +589,8 @@ struct VuCore {
         else if constexpr (To < 0 && kRaw) v.acc_unclean_ = true;
         if constexpr (SetFlags == 1) FlagsOf<Dest>(v, result);
         else if constexpr (SetFlags == 2) StickyFlagsOf<Dest>(v, result);
-        if constexpr (To > 0 && kRaw) v.unclean_ |= 1u << To;
-        else if constexpr (To > 0 && Dest == 15) v.unclean_ &= ~(1u << To);    // all four fields, clean
+        if constexpr (To > 0 && kRaw) MarkUnclean(v, To, Dest);
+        else if constexpr (To > 0) MarkClean(v, To, Dest);              // the fields written, clean
         if constexpr (To == 0) {
             _mm_storeu_si128(reinterpret_cast<__m128i*>(v.discarded_), result);
             return;
@@ -621,7 +678,7 @@ struct VuCore {
                             lifted::Binary(lifted::kMsub, a[2], b[0], acc[1]),
                             lifted::Binary(lifted::kMsub, a[0], b[1], acc[2])};
         if (fd == 0) {                                  // the flags' alone
-            for (int lane = 0; lane < 3; ++lane) v.discarded_[lane] = out[lane];
+            PS2HOST_VU_LANES for (int lane = 0; lane < 3; ++lane) v.discarded_[lane] = out[lane];
             v.discarded_[3] = 0;
             return;
         }
@@ -669,9 +726,9 @@ struct VuCore {
         if (ft > 0) {
             float* to = reinterpret_cast<float*>(v.regs.vf[ft]);
             float out[4];
-            for (int lane = 0; lane < 4; ++lane)
+            PS2HOST_VU_LANES for (int lane = 0; lane < 4; ++lane)
                 if (Dest & (8u >> lane)) out[lane] = ConvertedInt(v.regs.vf[fs][lane]) * kInverse[Shift];
-            for (int lane = 0; lane < 4; ++lane)
+            PS2HOST_VU_LANES for (int lane = 0; lane < 4; ++lane)
                 if (Dest & (8u >> lane)) to[lane] = out[lane];
         }
         Wrote<Dest>(v, ft, true);
@@ -680,7 +737,7 @@ struct VuCore {
         static constexpr double kScale[4] = {1.0, 16.0, 4096.0, 32768.0};
         const u32* a = v.regs.vf[fs];
         u32 out[4];
-        for (int lane = 0; lane < 4; ++lane) out[lane] = lifted::Result(double(std::int32_t(a[lane])) / kScale[Shift]);
+        PS2HOST_VU_LANES for (int lane = 0; lane < 4; ++lane) out[lane] = lifted::Result(double(std::int32_t(a[lane])) / kScale[Shift]);
         WriteVf<Dest>(v, ft, out);
         Wrote<Dest>(v, ft, true);
     }
@@ -710,7 +767,17 @@ struct VuCore {
         static constexpr float kScaleF[4] = {1.0f, 16.0f, 4096.0f, 32768.0f};
         if (ft == 0) return;
         float* to = reinterpret_cast<float*>(v.regs.vf[ft]);
-        for (int lane = 0; lane < 4; ++lane) {
+        if (!Unclean(v, fs, Dest)) {
+            // Found clean (an FMAC's result, as a rule): the floats as they
+            // are, never through the ARM core's registers - GCC moved an FMAC's
+            // result there out of VFP's to clean it, a stall of the Cortex-A9.
+            const float* from = reinterpret_cast<const float*>(v.regs.vf[fs]);
+            PS2HOST_VU_LANES for (int lane = 0; lane < 4; ++lane)
+                if (Dest & (8u >> lane)) to[lane] = TruncatedBits(from[lane] * kScaleF[Shift]);
+            Wrote<Dest>(v, ft, false);
+            return;
+        }
+        PS2HOST_VU_LANES for (int lane = 0; lane < 4; ++lane) {
             if (!(Dest & (8u >> lane))) continue;
             const u32 bits = lifted::Clean(v.regs.vf[fs][lane]);
             float x;
@@ -723,7 +790,7 @@ struct VuCore {
         static constexpr double kScale[4] = {1.0, 16.0, 4096.0, 32768.0};
         const u32* a = v.regs.vf[fs];
         u32 out[4];
-        for (int lane = 0; lane < 4; ++lane) out[lane] = lifted::FloatToInt(lifted::Value(a[lane]) * kScale[Shift]);
+        PS2HOST_VU_LANES for (int lane = 0; lane < 4; ++lane) out[lane] = lifted::FloatToInt(lifted::Value(a[lane]) * kScale[Shift]);
         WriteVf<Dest>(v, ft, out);
         Wrote<Dest>(v, ft, false);                      // integers
     }
@@ -731,7 +798,7 @@ struct VuCore {
     static PS2HOST_VU_INLINE void Abs(Vu& v, int ft, int fs) {
         const u32* a = v.regs.vf[fs];
         u32 out[4];
-        for (int lane = 0; lane < 4; ++lane) out[lane] = lifted::Clean(a[lane]) & ~lifted::kSign;
+        PS2HOST_VU_LANES for (int lane = 0; lane < 4; ++lane) out[lane] = lifted::Clean(a[lane]) & ~lifted::kSign;
         WriteVf<Dest>(v, ft, out);
         Wrote<Dest>(v, ft, true);
     }
@@ -754,7 +821,8 @@ struct VuCore {
     static void Cop2(Vu& v, u32 word) {
         lifted::Cop2(v.regs, 0x4A000000u | (word & 0x01FFFFFF));
         // Whatever it wrote is not known clean: fd's and ft's fields, ACC.
-        v.unclean_ |= ((1u << ((word >> 6) & 31)) | (1u << ((word >> 16) & 31))) & ~1u;
+        MarkUnclean(v, int((word >> 6) & 31), 15);
+        MarkUnclean(v, int((word >> 16) & 31), 15);
         v.acc_unclean_ = true;
     }
     /* CLIP: fs.xyz against |ft.w| - compared as Clean leaves them: the
@@ -769,7 +837,7 @@ struct VuCore {
         const u32* f = v.regs.vf[fs];
         const u32 w = CleanMagnitude(v.regs.vf[ft][3]);
         u32 judgement = 0;
-        for (int lane = 0; lane < 3; ++lane)
+        PS2HOST_VU_LANES for (int lane = 0; lane < 3; ++lane)
             if (CleanMagnitude(f[lane]) > w) judgement |= (f[lane] >> 31 ? 2u : 1u) << (2 * lane);
         v.clip_latest_ = ((v.clip_latest_ << 6) | judgement) & 0xFFFFFF;
     }
@@ -804,16 +872,19 @@ struct VuCore {
         v.status_latest_ |= ((zero ? 1u : 0u) | (sign ? 2u : 0u)) << 6;
     }
 #endif
-    template <int Target, u32 Dest>
+    /* kCleaned: the result is known clean - an FMAC's on cleaned operands
+       under the run's rounding (round toward zero, flush to zero): never an
+       infinity, a NaN or a denormal - so it is not cleaned again. */
+    template <int Target, u32 Dest, bool kCleaned = false>
     static PS2HOST_VU_INLINE void Flags(Vu& v) {
         const u32* out = Target > 0 ? v.regs.vf[Target] : Target == 0 ? v.discarded_ : v.regs.vacc;
 #if PS2HOST_VU_SSE_LANES
         FlagsOf<Dest>(v, _mm_loadu_si128(reinterpret_cast<const __m128i*>(out)));
 #else
         u32 m = 0;
-        for (int lane = 0; lane < 4; ++lane) {
+        PS2HOST_VU_LANES for (int lane = 0; lane < 4; ++lane) {
             if (!(Dest & (8u >> lane))) continue;
-            const u32 bits = lifted::Clean(out[lane]);
+            const u32 bits = kCleaned ? out[lane] : lifted::Clean(out[lane]);
             if ((bits & 0x7FFFFFFFu) == 0) m |= 8u >> lane;
             if (bits & 0x80000000u) m |= 0x80u >> lane;
         }
@@ -834,7 +905,7 @@ struct VuCore {
         StickyFlagsOf<Dest>(v, _mm_loadu_si128(reinterpret_cast<const __m128i*>(out)));
 #else
         u32 zero = 0, sign = 0;
-        for (int lane = 0; lane < 4; ++lane) {
+        PS2HOST_VU_LANES for (int lane = 0; lane < 4; ++lane) {
             if (!(Dest & (8u >> lane))) continue;
             if ((out[lane] & 0x7FFFFFFFu) == 0) zero = 1;
             if (out[lane] & 0x80000000u) sign = 1;
@@ -846,9 +917,9 @@ struct VuCore {
     // ------------------------------------------------------------ the pair's end
     /* As Run after the two halves: the lower's held writes (giving way to the
        upper's fields), when the fields land, the flags on their way, Q and P. */
-    static PS2HOST_VU_INLINE void Finish(Vu& v, u64& cycle, Vu::Pending& pending, int written, u32 lanes,
-                                         bool set_flags, bool sets_mac, bool sets_clip) {
-        const u64 ready = cycle + kFmacLatency;
+    static PS2HOST_VU_INLINE void Finish(Vu& v, Cyc& cycle, Vu::Pending& pending, int written, u32 lanes,
+                                         bool set_flags, bool sets_mac, bool sets_clip, bool keep_ready = true) {
+        const Cyc ready = cycle + kFmacLatency;
         if (pending.vf > 0) {
             const u32 landing = pending.lanes & ~(written == pending.vf ? lanes : 0u);
 #if PS2HOST_VU_SSE_LANES
@@ -857,52 +928,50 @@ struct VuCore {
                                        _mm_loadu_si128(reinterpret_cast<const __m128i*>(pending.value)),
                                        _mm_loadu_si128(to)));
 #endif
-            for (int lane = 0; lane < 4; ++lane) {
+            PS2HOST_VU_LANES for (int lane = 0; lane < 4; ++lane) {
                 if (landing & (8u >> lane)) {
 #if !PS2HOST_VU_SSE_LANES
                     v.regs.vf[pending.vf][lane] = pending.value[lane];
 #endif
-                    v.vf_ready_[pending.vf][lane] = ready;
+                    if (keep_ready) v.vf_ready_[pending.vf][lane] = ready;
                 }
             }
-            // Clean only if what lands is, and either it is all of the
-            // register or the rest was clean; with the upper writing the same
-            // register too, not known.
-            const u32 reg = 1u << pending.vf;
-            if (pending.clean && written != pending.vf && (pending.lanes == 15 || !(v.unclean_ & reg)))
-                v.unclean_ &= ~reg;
-            else
-                v.unclean_ |= reg;
+            // The fields that land, clean or not known (the upper's own, in
+            // the same register, it marked itself).
+            if (pending.clean) MarkClean(v, pending.vf, landing);
+            else MarkUnclean(v, pending.vf, landing);
         }
-        FinishUpper(v, cycle, written, lanes, set_flags, sets_mac, sets_clip);
+        FinishUpper(v, cycle, written, lanes, set_flags, sets_mac, sets_clip, keep_ready);
         if (pending.q_latency) {
             v.q_next_ = pending.q_set ? pending.q_value
                       : pending.vc    ? pending.vc_after[lifted::kRegQ] : v.regs.vc[lifted::kRegQ];
-            v.q_ready_ = cycle + u64(pending.q_latency);
+            v.q_ready_ = cycle + Cyc(pending.q_latency);
             v.q_busy_ = true;
-            v.qp_due_ = std::min(v.qp_due_, v.q_ready_);
+            v.qp_due_ = Vu::Earlier(v.qp_due_, v.q_ready_);
             if (pending.vc) pending.vc_after[lifted::kRegQ] = v.regs.vc[lifted::kRegQ];
         }
         if (pending.vc) std::memcpy(v.regs.vc, pending.vc_after, sizeof pending.vc_after);
         if (pending.p) {
             v.p_next_ = pending.p_value;
-            v.p_ready_ = cycle + u64(pending.p_latency ? pending.p_latency : 1);
+            v.p_ready_ = cycle + Cyc(pending.p_latency ? pending.p_latency : 1);
             v.p_busy_ = true;
-            v.qp_due_ = std::min(v.qp_due_, v.p_ready_);
+            v.qp_due_ = Vu::Earlier(v.qp_due_, v.p_ready_);
         }
-        End(v, cycle);
+        if (pending.vc) End(v, cycle);
+        else EndQuiet(cycle);
     }
-    /* The same for a pair whose lower left nothing (FinishUpper, then End). */
-    static PS2HOST_VU_INLINE void FinishUpper(Vu& v, u64 cycle, int written, u32 lanes, bool set_flags,
-                                              bool sets_mac, bool sets_clip) {
-        const u64 ready = cycle + kFmacLatency;
-#if defined(__AVX2__)
-        if (written > 0 && lanes == 15)         // all four in a store
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(v.vf_ready_[written]), _mm256_set1_epi64x(static_cast<long long>(ready)));
+    /* The same for a pair whose lower left nothing (FinishUpper, then End).
+       keep_ready false: when the fields land, no one can see (vurecomp). */
+    static PS2HOST_VU_INLINE void FinishUpper(Vu& v, Cyc cycle, int written, u32 lanes, bool set_flags,
+                                              bool sets_mac, bool sets_clip, bool keep_ready = true) {
+        const Cyc ready = cycle + kFmacLatency;
+#if PS2HOST_VU_SSE_LANES
+        if (keep_ready && written > 0 && lanes == 15)         // all four in a store
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(v.vf_ready_[written]), _mm_set1_epi32(int(ready)));
         else
 #endif
-        if (written > 0)
-            for (int lane = 0; lane < 4; ++lane)
+        if (keep_ready && written > 0)
+            PS2HOST_VU_LANES for (int lane = 0; lane < 4; ++lane)
                 if (lanes & (8u >> lane)) v.vf_ready_[written][lane] = ready;
         if (set_flags && v.flag_count_ == 8) LandFlags(v, cycle);   // as eager landing would have, at this issue
         if (set_flags && v.flag_count_ < 8) {
@@ -916,10 +985,13 @@ struct VuCore {
             f.sets_clip = sets_clip;
         }
     }
-    static PS2HOST_VU_INLINE void End(Vu& v, u64& cycle) {
+    static PS2HOST_VU_INLINE void End(Vu& v, Cyc& cycle) {
         v.regs.vc[0] = 0;
         ++cycle;
     }
+    /* A pair's end where nothing could have written VI0 (only macro mode's
+       COP2, through Pending's vc, can). */
+    static PS2HOST_VU_INLINE void EndQuiet(Cyc& cycle) { ++cycle; }
 };
 
 }  // namespace ps2host

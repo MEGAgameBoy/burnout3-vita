@@ -488,13 +488,15 @@ def needless_wait(r: int, lane: int, index: int, written: dict) -> bool:
     return index - j >= 4 if j is not None else index >= 3
 
 
-# How a block leaves: its locals back where the driver and the Vu keep them.
-LEAVE = "s.count = count; s.stopping = stopping; s.delayed = delayed; C::Cycle(v) = cyc; return;"
+# How a block leaves: its locals back where the driver and the Vu keep them,
+# the pairs run counted by the pair it leaves at (%d: its place in the block,
+# plus one - no pair counts as it goes).
+LEAVE = "s.count = count + %d; s.stopping = stopping; s.delayed = delayed; C::Cycle(v) = cyc; return;"
 
 
 def emit_pair(pc: int, lower: int, upper: int, mask: int, last: bool, index: int = 0,
               written: dict = None, clean: dict = None, dead_flags: bool = False,
-              after: tuple = None, no_flags: bool = False) -> list:
+              after: tuple = None, no_flags: bool = False, length: int = None) -> list:
     """One pair, as Run runs it, then where the run goes: on to the next pair
     of the block, or (`last`, a branch taken, the program's end) back to the
     driver with s.pc. `index` is its place in the block and `written` where
@@ -505,7 +507,25 @@ def emit_pair(pc: int, lower: int, upper: int, mask: int, last: bool, index: int
     `stopping` and `delayed` can be set only by the pair before - and are
     checked only after one that may set them. `no_flags`: the fast blocks
     of a program that never reads MAC or STATUS (fast_eligible) - an FMAC
-    leaves both alone (CLIP is as ever)."""
+    leaves both alone (CLIP is as ever).
+
+    `length` is the block's (None: not known, everything kept as the
+    interpreter keeps it). With it, three things a pair would do that no
+    one can see are left out, the run's outcome the same:
+    * when a field it writes lands (vf_ready_), unless the block may leave
+      before that: after its first pair (a branch or E pending as it
+      began) or its last - a block leaves nowhere else (emit_block). A
+      write at pair j lands four cycles after j issues; the block's last
+      pair issues length - 1 - j cycles after it at the least, and what
+      comes next a cycle after that. A later pair of the block that waits
+      for the field waits on j's issue cycle, a local (ci<j>), not the
+      store;
+    * landing Q and P as it issues, unless it reads them (an FMAC's Q, MFP),
+      starts DIV, SQRT, RSQRT or an EFU operation, waits for them, or goes
+      through macro mode's COP2 - the next pair that does lands what is
+      due (Issue);
+    * VI0 put back to zero at its end, unless its lower went through COP2
+      (nothing else writes VI0)."""
     if written is None:
         written = {}
     immediate = bool(upper & 0x80000000)
@@ -520,17 +540,44 @@ def emit_pair(pc: int, lower: int, upper: int, mask: int, last: bool, index: int
                 waits.append((r, lane))
     q_waits = not immediate and (is_divide(lower) or is_wait(lower, 0x3B))
     p_waits = not immediate and (is_efu(lower) or is_wait(lower, 0x7B))
+    lower_lines, pending, branch = ([], False, None) if immediate else emit_lower(lower, pc, mask)
+    fmac = decode_fmac(upper)
+    upper_q = ((fmac is not None and fmac[1] == 4) or
+               any(line.startswith("C::Cop2(") for line in emit_upper(upper)[0]))
+    through_cop2 = any("ThroughCop2(" in line for line in lower_lines)
+    needs_qp = (length is None or q_waits or p_waits or upper_q or through_cop2 or
+                any(line.startswith("C::Mfp(") for line in lower_lines))
+    issue = "C::Issue(v, cyc, %s);" if needs_qp else "C::IssueQuiet(cyc, %s);"
     if waits or q_waits or p_waits:
-        body.append("u64 t = cyc;")
-        body += ["C::Wait(t, v, %d, %d);" % w for w in waits]
+        body.append("Cyc t = cyc;")
+        local = set()
+        for r, lane in waits:
+            # (A lower that writes only if the value changes - HoldVf's -
+            # leaves the landing as it was when it does not: waited on as
+            # the interpreter does, through vf_ready_.)
+            j = written.get((r, lane)) if length is not None else None
+            if j is not None and written.get(("held", r, lane)):
+                j = None
+            if j is None:
+                body.append("C::Wait(t, v, %d, %d);" % (r, lane))
+            elif j not in local:
+                local.add(j)
+                body.append("C::WaitAt(t, ci%d);" % j)
         if q_waits:
             body.append("C::WaitQ(t, v);")
         if p_waits:
             body.append("C::WaitP(t, v);")
-        body.append("C::Issue(v, cyc, t);")
+        body.append(issue % "t")
     else:
-        body.append("C::Issue(v, cyc, cyc);")
-    lower_lines, pending, branch = ([], False, None) if immediate else emit_lower(lower, pc, mask)
+        body.append(issue % "cyc")
+    if length is not None:
+        body.append("ci%d = cyc;" % index)
+    # Its fields' landing kept where the block may leave before they land,
+    # or where a lower may write (HoldVf: only when the value changes) and
+    # later waits look at vf_ready_.
+    held = [w for w in lower_writes(lower_lines) if not any(l.startswith("C::Load(") for l in lower_lines)]
+    keep_ready = length is None or index == 0 or index >= length - 3 or bool(held)
+    ready_arg = "" if keep_ready else ", false"
     if pending:
         body.append("C::Pending pd;")
     if branch:
@@ -545,10 +592,16 @@ def emit_pair(pc: int, lower: int, upper: int, mask: int, last: bool, index: int
         set_flags = False
     upper_lines = fuse_flags(upper_lines)
     body += upper_lines
-    for r, dest in lower_writes(lower_lines) + [(upper_written, lanes)]:
+    for r, dest in lower_writes(lower_lines):
         for lane in range(4):
             if r > 0 and dest & (8 >> lane):
                 written[(r, lane)] = index
+                written[("held", r, lane)] = bool(held)
+    for r, dest in [(upper_written, lanes)]:
+        for lane in range(4):
+            if r > 0 and dest & (8 >> lane):
+                written[(r, lane)] = index
+                written[("held", r, lane)] = False
     if clean is not None:
         # The pair's end: the lower's held writes (not known clean), then the
         # upper's, which win over them in the fields both write.
@@ -567,29 +620,29 @@ def emit_pair(pc: int, lower: int, upper: int, mask: int, last: bool, index: int
     sets_clip = "true" if (upper & 0x7FF) == 0x1FF else "false"
     flags = "true" if set_flags else "false"
     if pending:
-        body.append("C::Finish(v, cyc, pd, %d, %du, %s, %s, %s);" % (written_reg, lanes, flags, sets_mac,
-                                                                    sets_clip))
+        body.append("C::Finish(v, cyc, pd, %d, %du, %s, %s, %s%s);" % (written_reg, lanes, flags, sets_mac,
+                                                                      sets_clip, ready_arg))
     else:
         if written_reg > 0 or set_flags:
-            body.append("C::FinishUpper(v, cyc, %d, %du, %s, %s, %s);" % (written_reg, lanes, flags, sets_mac,
-                                                                          sets_clip))
-        body.append("C::End(v, cyc);")
+            body.append("C::FinishUpper(v, cyc, %d, %du, %s, %s, %s%s);" % (written_reg, lanes, flags, sets_mac,
+                                                                            sets_clip, ready_arg))
+        body.append("C::End(v, cyc);" if length is None or through_cop2 else "C::EndQuiet(cyc);")
     next_pc = (pc + 8) & mask
-    body.append("++count;")
     may_stop = after is None or bool(after[1] & 0x40000000)
     may_branch = after is None or is_branch(*after)[0]
     if may_stop:
-        body.append("if (stopping) { s.pc = 0x%Xu; s.done = true; %s }" % (next_pc, LEAVE))
+        body.append("if (stopping) { s.pc = 0x%Xu; s.done = true; %s }" % (next_pc, LEAVE % (index + 1)))
     if end:
         body.append("stopping = true;")
     new_delayed = "branch" if branch else "kNone"
     if may_branch:
-        body.append("if (delayed != kNone) { s.pc = delayed; delayed = %s; %s }" % (new_delayed, LEAVE))
+        body.append("if (delayed != kNone) { s.pc = delayed; delayed = %s; %s }" % (new_delayed,
+                                                                                LEAVE % (index + 1)))
     if branch:
         body.append("delayed = branch;")
     if last:
         body.append("s.pc = 0x%Xu;" % next_pc)
-        body.append(LEAVE)
+        body.append(LEAVE % (index + 1))
     out += ["        " + line for line in body]
     out.append("    }")
     return out
@@ -741,7 +794,11 @@ def mac_live(pairs: dict, mask: int, start: int) -> bool:
             return True                             # a branch in a delay slot: not followed
         if reads_mac_only(lower, upper):
             return True
-        if sets_mac(upper):
+        if sets_mac(upper) and since is None:
+            # Counted from the first later FMAC: four pairs after it the
+            # landed flags are its or a later one's, whatever FMACs follow
+            # (counting again from each kept hand-pipelined code - an FMAC
+            # nearly every pair - "live" all the way to its next reader).
             since = 0
         nexts = after(pc, pending)
         if nexts is None:
@@ -774,14 +831,20 @@ def emit_block(name: str, block: list, pairs: dict, mask: int, drops: set = froz
     # dead_flags relies on; the first pair's flags are never left out.
     out = ["void %s(Vu& v, VuRunState& s, std::uint64_t limit) {" % name,
            "    if (s.count + %d > limit) return;" % len(block),
-           "    u64 count = s.count, cyc = C::Cycle(v);",
+           "    const u64 count = s.count;",
+           "    Cyc cyc = C::Cycle(v);",
            "    bool stopping = s.stopping;",
            "    u32 delayed = s.delayed;"]
+    # Each pair's issue cycle (ci<n>), for the waits of later pairs on what
+    # it wrote (emit_pair); those no wait reads the compiler drops.
+    names = ["ci%d" % i for i in range(len(block))]
+    for i in range(0, len(names), 16):
+        out.append("    [[maybe_unused]] Cyc %s;" % ", ".join(names[i:i + 16]))
     written, clean = {}, {}
     dead = dead_flags(block, pairs) - {0}
     for i, pc in enumerate(block):
         out += emit_pair(pc, pairs[pc][0], pairs[pc][1], mask, i == len(block) - 1, i, written, clean,
-                         i in dead, pairs[block[i - 1]] if i else None, pc in drops)
+                         i in dead, pairs[block[i - 1]] if i else None, pc in drops, len(block))
     out.append("}")
     return out
 
@@ -823,6 +886,7 @@ using ps2host::VuRunState;
 using C = ps2host::VuCore;
 using u32 = std::uint32_t;
 using u64 = std::uint64_t;
+using Cyc = ps2host::Vu::Cyc;
 constexpr u32 kNone = ~0u;
 """
 

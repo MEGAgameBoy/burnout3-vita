@@ -50,6 +50,12 @@ class Vu {
 public:
     using u32 = std::uint32_t;
     using u64 = std::uint64_t;
+    /* A time in cycles (32 bits, wrapping): `when` has come at `now`... */
+    using Cyc = std::uint32_t;
+    static bool Due(Cyc when, Cyc now) { return std::int32_t(when - now) <= 0; }
+    /* ...and the later, the earlier of two. */
+    static Cyc Later(Cyc a, Cyc b) { return std::int32_t(a - b) < 0 ? b : a; }
+    static Cyc Earlier(Cyc a, Cyc b) { return std::int32_t(a - b) < 0 ? a : b; }
 
     /* VU0 (4 KB of each memory) or VU1 (16 KB). */
     explicit Vu(int index);
@@ -107,6 +113,8 @@ public:
     /* For tests: everything a run can change, the same in both (`flags`
        false: but the MAC and STATUS flags, landed, latest and in flight). */
     bool SameState(const Vu& other, bool flags = true) const;
+    /* What differs first, in words (empty if SameState): for the tests. */
+    std::string StateDifference(const Vu& other) const;
     /* --vu-record: each program a run starts, and the code reachable from
        where it starts, to `path` (engine/tools/vurecomp.py compiles them). */
     static void RecordPrograms(const std::string& path);
@@ -158,11 +166,14 @@ private:
     std::unordered_map<u64, u64> program_pairs_, program_runs_;
     void WriteSnapshot(std::FILE* to, u32 pc);
 
-    // Compiled code: the vector registers that may hold fields the model's
-    // Clean would change (bit r for VF r) - loaded so, or not known; the FMAC
-    // cleans only those operands. Every bit is set as a run starts and when
-    // the interpreter runs (it does not keep them); VF0 is always clean.
-    u32 unclean_ = ~1u;
+    // Compiled code: the vector fields that may hold what the model's Clean
+    // would change - loaded so, or not known: for each VF, its fields as dest
+    // bits (x 8 ... w 1). The FMAC cleans only those of its operands' fields.
+    // By field, not by register: a vertex's xyz loaded over a w that holds an
+    // integer (a denormal, as a float) had every FMAC on its xyz clean all
+    // four. Every field is marked as a run starts and when the interpreter
+    // runs (it does not keep them); VF0's never are.
+    std::uint8_t unclean_[32] = {};
     bool acc_unclean_ = true;       // the same for ACC
     // An upper operation's result whose destination is VF0: the register
     // keeps 0, 0, 0, 1, but the MAC and status flags are this result's (a
@@ -170,20 +181,25 @@ private:
     // writes nowhere).
     u32 discarded_[4] = {};
 
-    /* Timing, in cycles (one per pair issued, plus stalls). */
-    u64 cycle_ = 0;
-    u64 vf_ready_[32][4] = {};      /* when each vector field's pending write lands */
+    /* Timing, in cycles (one per pair issued, plus stalls), 32 bits: the
+       Vita's processor is a 32-bit one, and 64-bit times doubled the
+       bookkeeping of every pair. Times are compared by their difference (a
+       run spans far less than 2^31 cycles), and what has landed is set to
+       the present as a run ends (LandAll), so no time left behind can wrap
+       round into the future. */
+    Cyc cycle_ = 0;
+    Cyc vf_ready_[32][4] = {};      /* when each vector field's pending write lands */
     u32 q_next_ = 0, p_next_ = 0;   /* DIV's and the EFU's results in flight */
-    u64 q_ready_ = 0, p_ready_ = 0;
+    Cyc q_ready_ = 0, p_ready_ = 0;
     bool q_busy_ = false, p_busy_ = false;
-    /* No earlier than the first of the busy Q and P lands (~0: neither is
-       busy): what each pair looks at before landing them, one compare for
-       four. LandNow sets it again. */
-    u64 qp_due_ = ~u64(0);
+    /* No earlier than the first of the busy Q and P lands (far ahead when
+       neither is busy): what each pair looks at before landing them, one
+       compare for four. LandNow sets it again. */
+    Cyc qp_due_ = 0x40000000u;
     /* The FMAC sets the flags as it finishes: what upper instructions have
        produced so far, and what is still on its way to the lower's view. */
     u32 mac_latest_ = 0, status_latest_ = 0, clip_latest_ = 0;
-    struct FlagWrite { u64 ready; u32 mac, status, clip; bool sets_mac, sets_clip; };
+    struct FlagWrite { Cyc ready; u32 mac, status, clip; bool sets_mac, sets_clip; };
     /* In the order they were set, which is the order they land in (each
        lands 4 cycles after it was set, and time only goes forward): a ring,
        flag_head_ the oldest. */
