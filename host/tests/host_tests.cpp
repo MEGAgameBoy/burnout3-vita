@@ -261,6 +261,105 @@ void DmaChainsAreWalked() {
 }
 
 // Every format's layout maps a page's pixels onto distinct bytes (nibbles).
+/* A texture decoded whole, a row at a time (the GXM renderer's textures),
+   is what the GS reads a texel at a time - every format, CLAMP's four modes
+   with their regions, mipmap levels, TEXA and the CLUT - and what the
+   renderer's texel-by-texel decode gave before it. */
+void GsDecodesTexturesWhole() {
+    using namespace ps2host::gs;
+    auto memory = std::make_unique<Memory>();
+    u32 seed = 2024;
+    auto next = [&] { seed = seed * 1664525u + 1013904223u; return seed; };
+    for (u32 i = 0; i < (4u << 20); ++i) memory->data()[i] = u8(next() >> 24);
+    std::vector<u32> clut(256);
+    for (u32& c : clut) c = next();
+    // The renderer's decode before (gxm_gs_renderer.cpp's TexelAt), as it was.
+    auto wrap = [](int i, u32 size, u32 mode, u32 lo, u32 hi) {
+        if (mode == 0) return int(u32(i) & (size - 1));
+        if (mode == 1) return std::clamp(i, 0, int(size) - 1);
+        if (mode == 2) return std::clamp(i, int(lo), int(hi));
+        return int((u32(i) & lo) | hi);
+    };
+    auto old_texel = [&](const TextureView& d, int iu, int iv, int n) {
+        u32 raw;
+        if (n == 0) {
+            const int u = wrap(iu, d.tw, d.wms, d.minu, d.maxu), v = wrap(iv, d.th, d.wmt, d.minv, d.maxv);
+            raw = memory->Read(d.tbp, d.tbw, u32(u) & 2047, u32(v) & 2047, d.psm);
+        } else {
+            const u32 w = std::max(1u, d.tw >> n), h = std::max(1u, d.th >> n);
+            const int u = std::clamp(wrap(iu, w, d.wms, d.minu >> n, d.maxu >> n), 0, int(w) - 1);
+            const int v = std::clamp(wrap(iv, h, d.wmt, d.minv >> n, d.maxv >> n), 0, int(h) - 1);
+            raw = memory->Read(d.level_tbp[n], std::max(1u, d.level_tbw[n]), u32(u), u32(v), d.psm);
+        }
+        const u32 ta0 = d.texa_lo & 0xFF;
+        const bool aem = (d.texa_lo & 0x8000u) != 0;
+        switch (d.psm) {
+            case PSMCT32: case PSMZ32: return raw;
+            case PSMCT24: case PSMZ24: {
+                const u32 rgb = raw & 0xFFFFFF;
+                return rgb | ((aem && !rgb) ? 0u : ta0) << 24;
+            }
+            case PSMCT16: case PSMCT16S: case PSMZ16: case PSMZ16S: {
+                const u32 a = (raw & 0x8000u) ? d.ta1 : ((aem && !(raw & 0x7FFFu)) ? 0u : ta0);
+                return ((raw & 31u) << 3) | (((raw >> 5) & 31u) << 11) | (((raw >> 10) & 31u) << 19) | (a << 24);
+            }
+            case PSMT8: case PSMT8H: return clut[raw & 0xFF];
+            case PSMT4: case PSMT4HL: case PSMT4HH: return clut[(d.csa * 16 + (raw & 15)) & 0xFF];
+            default: return raw;
+        }
+    };
+    const u32 psms[] = {PSMCT32, PSMCT24, PSMCT16, PSMCT16S, PSMT8, PSMT4, PSMT8H, PSMT4HL, PSMT4HH,
+                        PSMZ32, PSMZ24, PSMZ16, PSMZ16S};
+    u32 wrong_whole = 0, wrong_texel = 0, texels = 0;
+    std::vector<u32> pixels;
+    for (u32 psm : psms)
+        for (int i = 0; i < 24; ++i) {
+            TextureView d;
+            d.psm = psm;
+            d.tbp = next() >> 18;
+            d.tbw = (next() >> 8) % 12;                     // 0 included: one page a row, as the GS takes it
+            d.tw = 1u << ((next() >> 8) % 9);
+            d.th = 1u << ((next() >> 8) % 9);
+            d.wms = (next() >> 8) & 3;
+            d.wmt = (next() >> 8) & 3;
+            d.minu = (next() >> 8) & 1023, d.maxu = (next() >> 8) & 1023;
+            d.minv = (next() >> 8) & 1023, d.maxv = (next() >> 8) & 1023;
+            if (d.wms == 2 && d.minu > d.maxu) std::swap(d.minu, d.maxu);
+            if (d.wmt == 2 && d.minv > d.maxv) std::swap(d.minv, d.maxv);
+            d.texa_lo = next() & 0x80FF;
+            d.ta1 = next() & 0xFF;
+            d.csa = (next() >> 8) & 31;
+            d.levels = 1 + (next() >> 8) % 7;
+            for (u32 n = 1; n < 7; ++n) d.level_tbp[n] = next() >> 18, d.level_tbw[n] = (next() >> 8) % 12;
+            const u32 height = DecodedHeight(d);
+            pixels.assign(std::size_t(d.tw) * height, 0xDEADBEEFu);
+            DecodeTexture(*memory, d, clut.data(), pixels.data());
+            u32 row = 0;
+            for (u32 n = 0; n < std::min(d.levels, 7u); ++n) {
+                const u32 w = std::max(1u, d.tw >> n), h = std::max(1u, d.th >> n);
+                for (u32 v = 0; v < h; ++v)
+                    for (u32 u = 0; u < d.tw; ++u) {
+                        const u32 got = pixels[std::size_t(row + v) * d.tw + u];
+                        if (u >= w) {                       // right of a smaller level: untouched
+                            wrong_whole += got != 0xDEADBEEFu;
+                            continue;
+                        }
+                        const u32 want = old_texel(d, int(u), int(v), int(n));
+                        wrong_whole += got != want;
+                        wrong_texel += DecodeTexel(*memory, d, clut.data(), int(u), int(v), int(n)) != want;
+                        ++texels;
+                    }
+                row += h;
+            }
+        }
+    char what[160];
+    std::snprintf(what, sizeof what, "GS textures decoded a row at a time are the GS's texels (%u of %u wrong)",
+                  unsigned(wrong_whole), unsigned(texels));
+    Check(wrong_whole == 0, what);
+    std::snprintf(what, sizeof what, "...and so are they one at a time (%u wrong)", unsigned(wrong_texel));
+    Check(wrong_texel == 0, what);
+}
+
 void GsLayoutsArePermutations() {
     using namespace ps2host::gs;
     struct Case { u32 psm, w, h, bw; };
@@ -1040,7 +1139,13 @@ void VuCompiledIsTheInterpreter() {
             const u64 a = interpreted->Run(program.entry, limit), b = ahead->Run(program.entry, limit);
             ++runs;
             if (ahead->compiled_pairs()) ++entered;
-            if (a != b || !interpreted->SameState(*ahead)) ++wrong;
+            if (a != b || !interpreted->SameState(*ahead)) {
+                ++wrong;
+                if (std::getenv("PS2HOST_VU_DIFF"))
+                    std::printf("vu diff: program %zu (entry %04X) trial %d: %llu vs %llu pairs; %s\n", i,
+                                unsigned(program.entry), trial, (unsigned long long)a, (unsigned long long)b,
+                                interpreted->StateDifference(*ahead).c_str());
+            }
         }
     }
     char what[128];
@@ -1332,8 +1437,11 @@ void VuFastIsTheExactButFlags() {
                   wrong, runs);
     Check(wrong == 0 && runs >= 100, what);
     // The fast blocks do leave the flags alone (else they were not taken).
+    // (A fifth of the runs: since mac_live counts from the first later FMAC,
+    // programs that drop only a little have fast blocks too, and many of
+    // those end with the flags their last FMAC would have left anyway.)
     std::snprintf(what, sizeof what, "VU fast blocks taken: the flags differ in %u of %u runs", flags_differ, runs);
-    Check(flags_differ > runs / 4, what);
+    Check(flags_differ > runs / 8, what);
 }
 
 void VuTimingIsVisible() {
@@ -1444,6 +1552,98 @@ void IpuDecodesAndRetriesCleanly() {
     Check(!busy() && first_luma() == 129, "IPU: a retried BDEC keeps its DC predictor");
     Check(((m.Read(0x10002010u, 4) >> 15) & 1) && u32(m.Read(0x10002030u, 4)) == 0x000001B3u,
           "IPU: BDEC goes over a slice's stuffing to the start code (SCD)");
+}
+
+/* The IPU fed and drained through its channels as libmpeg does it (4 from
+   memory, 3 to memory): intra macroblocks with DC differentials and a few
+   AC coefficients through BDEC, then CSC over raw macroblocks - the bytes
+   out the same as they were before the IPU's channels and FIFOs were made
+   cheaper (hashes recorded from that build), and each command's time
+   (IpuMacroblockTimes, the benchmark). */
+constexpr u64 kIpuBdecHash = 0x5CEA2D1CA138E325ull, kIpuCscHash = 0x512F46001937988Cull;
+struct IpuRun {
+    u64 bdec_hash = 0, csc_hash = 0;
+    double bdec_ns = 0, csc_ns = 0;     // a macroblock
+};
+IpuRun RunIpuThroughChannels(u32 macroblocks) {
+    ps2host::InstallIpu();
+    ps2host::Memory& m = ps2host::GuestMemory();
+    u32 seed = 77;
+    auto next = [&] { return seed = seed * 1664525u + 1013904223u; };
+    std::string bits;
+    auto put = [&](u32 value, u32 count) { for (u32 i = count; i-- > 0;) bits += ((value >> i) & 1) ? '1' : '0'; };
+    // B.12 (luminance) and B.13 (chrominance) DC sizes 0-3; B.14's codes.
+    const char* const kLumaSize[4] = {"100", "00", "01", "101"};
+    const char* const kChromaSize[4] = {"00", "01", "10", "110"};
+    for (u32 mb = 0; mb < macroblocks; ++mb)
+        for (int b = 0; b < 6; ++b) {
+            const u32 size = next() >> 30;
+            bits += b < 4 ? kLumaSize[size] : kChromaSize[size];
+            if (size) put(next() >> (32 - size), size);
+            for (u32 k = next() >> 30; k-- > 0;) {        // up to three: (0,1) "11s", (1,1) "011s", (0,2) "0100s"
+                static const char* const kCodes[3] = {"11", "011", "0100"};
+                bits += kCodes[(next() >> 8) % 3];
+                put(next() >> 31, 1);
+            }
+            bits += "10";                                   // end of block
+        }
+    bits += std::string(8 - bits.size() % 8, '0') + "00000000" "00000000" "00000001" "10110011";
+    std::vector<u8> stream((bits.size() + 7) / 8, 0);
+    for (std::size_t i = 0; i < bits.size(); ++i)
+        if (bits[i] == '1') stream[i / 8] |= u8(0x80 >> (i % 8));
+    stream.resize((stream.size() + 15) / 16 * 16 + 64, 0);
+    const u32 kStream = 0x00400000u, kRaw16 = 0x00800000u, kRaw8 = 0x00A00000u, kRgb = 0x00C00000u;
+    for (std::size_t i = 0; i < stream.size(); ++i) m.Write(kStream + u32(i), stream[i], 1);
+    auto busy = [&] { return (m.Read(0x10002010u, 4) >> 31) & 1; };
+    IpuRun out;
+    using Clock = std::chrono::steady_clock;
+    // BDEC: intra, DC reset on the first, QSC 8; MPEG-2, IDP 0, B.14, zig-zag, an I picture.
+    m.Write(0x10002010u, 1u << 30, 4);
+    m.Write(0x10002010u, 1u << 24, 4);
+    m.Write(0x10002000u, 0x00000000u, 4);                   // BCLR
+    m.Write(0x1000B410u, kStream, 4);
+    m.Write(0x1000B420u, u32(stream.size() / 16), 4);
+    m.Write(0x1000B400u, 0x101u, 4);                        // channel 4: normal, from memory
+    m.Write(0x1000B010u, kRaw16, 4);
+    m.Write(0x1000B020u, macroblocks * 48, 4);
+    m.Write(0x1000B000u, 0x100u, 4);                        // channel 3
+    auto began = Clock::now();
+    for (u32 mb = 0; mb < macroblocks; ++mb) {
+        m.Write(0x10002000u, 0x28000000u | (mb == 0 ? 1u << 26 : 0u) | 8u << 16, 4);
+        for (int guard = 0; busy() && guard < 100; ++guard) {}
+    }
+    out.bdec_ns = std::chrono::duration<double, std::nano>(Clock::now() - began).count() / macroblocks;
+    Fnv bdec;
+    for (u32 i = 0; i < macroblocks * 768; i += 4) bdec.Of(u32(m.Read(kRaw16 + i, 4)));
+    out.bdec_hash = bdec.h;
+    // CSC: raw macroblocks (Y 256, Cb 64, Cr 64), RGB32, no dither.
+    for (u32 i = 0; i < macroblocks * 384; i += 4) m.Write(kRaw8 + i, next(), 4);
+    m.Write(0x10002000u, 0x00000000u, 4);                   // BCLR
+    m.Write(0x1000B410u, kRaw8, 4);
+    m.Write(0x1000B420u, macroblocks * 24, 4);
+    m.Write(0x1000B400u, 0x101u, 4);
+    m.Write(0x1000B010u, kRgb, 4);
+    m.Write(0x1000B020u, macroblocks * 64, 4);
+    m.Write(0x1000B000u, 0x100u, 4);
+    began = Clock::now();
+    m.Write(0x10002000u, 0x70000000u | macroblocks, 4);
+    for (int guard = 0; busy() && guard < 100; ++guard) {}
+    out.csc_ns = std::chrono::duration<double, std::nano>(Clock::now() - began).count() / macroblocks;
+    Fnv csc;
+    for (u32 i = 0; i < macroblocks * 1024; i += 4) csc.Of(u32(m.Read(kRgb + i, 4)));
+    out.csc_hash = csc.h;
+    return out;
+}
+
+void IpuStreamsThroughItsChannels() {
+    const IpuRun run = RunIpuThroughChannels(40);
+    char what[160];
+    std::snprintf(what, sizeof what, "IPU: BDEC through channels 4 and 3 gives what it did (%016llX)",
+                  (unsigned long long)run.bdec_hash);
+    Check(run.bdec_hash == kIpuBdecHash, what);
+    std::snprintf(what, sizeof what, "IPU: CSC through channels 4 and 3 gives what it did (%016llX)",
+                  (unsigned long long)run.csc_hash);
+    Check(run.csc_hash == kIpuCscHash, what);
 }
 
 // MAX and MINI hand back an operand as it is: Burnout 3's car microcode
@@ -1591,6 +1791,148 @@ void IopInstructionsMatchTheR5900() {
 }
 
 }  // namespace
+
+/* The SPU2 on its own thread mixes each voice over a whole call at once
+   (SetBatchVoices): the same sound, sample for sample, as a sample at a time
+   across the voices - with every voice's ways through it (sweeps, the
+   envelope's phases, key-offs and key-ons between calls, blocks' loop and
+   end flags, pitches up to four times, both cores' reverb, MMIX, an
+   interrupt in a voice's blocks and one in a capture ring, re-armed as the
+   driver does), SPU RAM the same after, and the same interrupts each call. */
+void Spu2MixesVoicesInBatchesOnce(bool parked) {
+    using ps2host::iop::Spu2;
+    u32 seed = parked ? 3141 : 2718;
+    auto next = [&] { return seed = seed * 1664525u + 1013904223u; };
+    auto one = std::make_unique<Spu2>(), batch = std::make_unique<Spu2>();
+    batch->SetBatchVoices(true);
+    std::vector<Spu2::s16> out_one, out_batch;
+    one->SetOutput([&](const Spu2::s16* f, Spu2::u32 n) { out_one.insert(out_one.end(), f, f + 2 * n); });
+    batch->SetOutput([&](const Spu2::s16* f, Spu2::u32 n) { out_batch.insert(out_batch.end(), f, f + 2 * n); });
+    auto both = [&](auto&& act) { act(*one); act(*batch); };
+    // Blocks: random filters, shifts and nibbles; flags 0, loop start,
+    // end + repeat, end alone.
+    std::vector<Spu2::u8> blocks(0x10000);
+    for (std::size_t b = 0; b < blocks.size(); b += 16) {
+        blocks[b] = Spu2::u8(((next() >> 8) % 5) << 4 | (next() >> 8) % 13);
+        const u32 r = (next() >> 8) % 16;
+        blocks[b + 1] = Spu2::u8(r < 10 ? 0 : r < 12 ? 4 : r < 14 ? 3 : 1);
+        for (int i = 2; i < 16; ++i) blocks[b + i] = Spu2::u8(next() >> 24);
+    }
+    both([&](Spu2& spu) { spu.Write(0x10000, blocks.data(), Spu2::u32(blocks.size())); });
+    for (u32 core = 0; core < 2; ++core) {
+        const u32 mode = 1 + (next() >> 8) % 9;
+        both([&](Spu2& spu) {
+            spu.SetEffectAttr(core, mode, 0x3000, 0x2800, 0x40, 0x30);
+            spu.SetCoreAttr(0x02 | core, 1);
+            spu.SetParam(0x0B00 | core, 0x2000);
+            spu.SetParam(0x0C00 | core, 0x1800);
+            spu.SetParam(0x0800 | core, core ? 0xFFF : 0xFF0);
+        });
+    }
+    // Main volume: core 1's a sweep down.
+    both([&](Spu2& spu) { spu.SetParam(0x0901, 0x8000 | 0x2000 | 0x30); });
+    auto set_voice = [&](u32 core, u32 voice) {
+        const u32 entry = core | voice << 1;
+        const u32 ssa = 0x10000 + ((next() >> 8) % 4096) * 16;
+        const u32 voll = (next() >> 8) % 3 == 0 ? (0x8000 | ((next() >> 8) & 0x7F7F)) : ((next() >> 8) & 0x3FFF);
+        const u32 volr = (next() >> 8) % 3 == 0 ? (0x8000 | ((next() >> 8) & 0x7F7F)) : ((next() >> 8) & 0x3FFF);
+        const u32 pitch = 0x200 + (next() >> 8) % 0x3E00;
+        const u32 adsr1 = next() & 0xFFFF, adsr2 = next() & 0xFFFF;
+        // (LSAX where it starts, as a driver's waveform has it: a voice
+        // never wanders into the capture rings, which a batch writes later
+        // in its call than a sample at a time does.)
+        both([&](Spu2& spu) {
+            spu.SetAddr(0x2000 | entry, ssa);
+            spu.SetAddr(0x2100 | entry, ssa);
+            // Parked where it would start, or (not) left at address 0 to
+            // walk through the capture rings silent, a sample at a time.
+            if (parked) spu.SetAddr(0x2200 | entry, ssa);
+            spu.SetParam(0x0000 | entry, voll);
+            spu.SetParam(0x0100 | entry, volr);
+            spu.SetParam(0x0200 | entry, pitch);
+            spu.SetParam(0x0300 | entry, adsr1);
+            spu.SetParam(0x0400 | entry, adsr2);
+        });
+    };
+    for (u32 core = 0; core < 2; ++core) {
+        for (u32 voice = 0; voice < 24; ++voice) set_voice(core, voice);
+        const u32 l = next() & 0xFFFFFF, r = next() & 0xFFFFFF, el = next() & 0xFFFFFF, er = next() & 0xFFFFFF;
+        both([&](Spu2& spu) {
+            spu.SetSwitch(0x1800 | core, l);
+            spu.SetSwitch(0x1A00 | core, r);
+            spu.SetSwitch(0x1900 | core, el);
+            spu.SetSwitch(0x1B00 | core, er);
+        });
+    }
+    // Interrupts: core 0's in the voices' blocks, core 1's in a capture ring.
+    both([&](Spu2& spu) {
+        spu.SetAddr(0x1F00, 0x10000 + 0x2340);
+        spu.SetAddr(0x1F01, 0x2000 + 0x180);
+        spu.SetCoreAttr(0x04, 1);
+        spu.SetCoreAttr(0x05, 1);
+    });
+    u64 now = 1000;
+    u32 raised_one = 0, raised_batch = 0, calls_differing = 0, interrupts = 0;
+    std::vector<Spu2::u8> ram_one(0x6000), ram_batch(0x6000);
+    u32 ram_differing = 0;
+    for (int call = 0; call < 600; ++call) {
+        if (call % 25 == 0) {                               // keys on and off, as a driver's frame might
+            const u32 core = (next() >> 8) & 1, on = next() & 0xFFFFFF, off = next() & 0xFFFFFF & ~on;
+            if (call % 75 == 0)
+                for (u32 voice = 0; voice < 24; ++voice)
+                    if (on >> voice & 1) set_voice(core, voice);
+            both([&](Spu2& spu) {
+                spu.SetSwitch(0x1600 | core, off);
+                spu.SetSwitch(0x1500 | core, on);
+            });
+        }
+        now += 500 + (next() >> 8) % 1500;
+        raised_one = raised_batch = 0;
+        const std::size_t before_out = out_one.size();
+        one->Advance(now, [&](Spu2::u32 core) { raised_one |= 1u << core; });
+        batch->Advance(now, [&](Spu2::u32 core) { raised_batch |= 1u << core; });
+        if (std::getenv("PS2HOST_SPU_DEBUG"))
+            for (std::size_t i = before_out; i < out_one.size() && i < out_batch.size(); ++i)
+                if (out_one[i] != out_batch[i]) {
+                    std::printf("spu debug: call %d, sample %zu of the call: %d vs %d\n", call, (i - before_out) / 2,
+                                out_one[i], out_batch[i]);
+                    break;
+                }
+        calls_differing += raised_one != raised_batch;
+        for (u32 core = 0; core < 2; ++core)
+            if (raised_one >> core & 1) {
+                ++interrupts;
+                both([&](Spu2& spu) { spu.SetCoreAttr(0x04 | core, 1); });
+            }
+        one->Read(0, ram_one.data(), 0x6000);
+        batch->Read(0, ram_batch.data(), 0x6000);
+        ram_differing += ram_one != ram_batch;
+        if (std::getenv("PS2HOST_SPU_DEBUG") && call >= 520 && call <= 531) {
+            std::vector<Spu2::u8> a(2u << 20), b(2u << 20);
+            one->Read(0, a.data(), Spu2::u32(a.size()));
+            batch->Read(0, b.data(), Spu2::u32(b.size()));
+            for (std::size_t i = 0; i < a.size(); ++i)
+                if (a[i] != b[i]) { std::printf("spu debug: call %d, RAM first differs at %06zX\n", call, i); break; }
+        }
+    }
+    std::vector<Spu2::u8> all_one(2u << 20), all_batch(2u << 20);
+    one->Read(0, all_one.data(), Spu2::u32(all_one.size()));
+    batch->Read(0, all_batch.data(), Spu2::u32(all_batch.size()));
+    u64 differing = out_one.size() != out_batch.size() ? ~0ull : 0;
+    for (std::size_t i = 0; i < out_one.size() && i < out_batch.size(); ++i) differing += out_one[i] != out_batch[i];
+    char what[192];
+    std::snprintf(what, sizeof what, "SPU2: voices mixed a call at a time sound the same%s (%llu of %zu samples differ)",
+                  parked ? "" : ", voices walking through the rings", (unsigned long long)differing, out_one.size());
+    Check(differing == 0 && !out_one.empty(), what);
+    std::snprintf(what, sizeof what, "SPU2: ...with the same interrupts (%u calls differ, %u raised) and RAM (%u calls differ, %s at the end)",
+                  calls_differing, interrupts, ram_differing, all_one == all_batch ? "the same" : "different");
+    Check(calls_differing == 0 && interrupts > 0 && ram_differing == 0 && all_one == all_batch, what);
+}
+
+void Spu2MixesVoicesInBatches() {
+    Spu2MixesVoicesInBatchesOnce(true);
+    Spu2MixesVoicesInBatchesOnce(false);
+}
 
 void SpuDecodesAdpcmAndPlaysAVoice() {
     using ps2host::iop::Spu2;
@@ -1884,6 +2226,36 @@ void Benchmarks() {
                     (unsigned long long)pairs);
     }
 
+    // A texture decoded from GS memory (the GXM renderer's textures): a
+    // 256 x 256 8-bit one through the CLUT, a texel at a time as before and
+    // a row at a time.
+    {
+        using namespace ps2host::gs;
+        auto memory = std::make_unique<Memory>();
+        for (u32 i = 0; i < (4u << 20); ++i) memory->data()[i] = u8(i * 2654435761u >> 24);
+        std::vector<u32> clut(256, 0x80808080u), pixels(256 * 256);
+        TextureView d;
+        d.tbp = 0x1000, d.tbw = 4, d.psm = PSMT8, d.tw = 256, d.th = 256;
+        u32 sum = 0;
+        auto began = Clock::now();
+        for (int i = 0; i < 4; ++i)
+            for (u32 v = 0; v < 256; ++v)
+                for (u32 u = 0; u < 256; ++u) sum += DecodeTexel(*memory, d, clut.data(), int(u), int(v), 0);
+        const double one = ns_since(began) / (4.0 * 65536.0);
+        began = Clock::now();
+        for (int i = 0; i < 4; ++i) DecodeTexture(*memory, d, clut.data(), pixels.data());
+        const double whole = ns_since(began) / (4.0 * 65536.0);
+        std::printf("  texture decode     %7.1f ns a texel one at a time, %.1f a row at a time (%08X)\n", one, whole,
+                    unsigned(sum + pixels[1234]));
+    }
+
+    // The IPU through its channels (libmpeg's movies): a macroblock's BDEC
+    // and its CSC.
+    {
+        const IpuRun run = RunIpuThroughChannels(400);
+        std::printf("  IPU macroblock     %7.1f us BDEC, %.1f us CSC\n", run.bdec_ns / 1000.0, run.csc_ns / 1000.0);
+    }
+
     // Main memory: a copy of the size of the PS2's RAM.
     {
         std::vector<u8> from(32u << 20, 1), to(32u << 20);
@@ -1942,6 +2314,7 @@ void Benchmarks() {
     for (u32 heard : {0u, 25u}) {
         using ps2host::iop::Spu2;
         auto spu = std::make_unique<Spu2>();
+        spu->SetBatchVoices(true);          // as its own thread mixes
         u64 samples = 0;
         spu->SetOutput([&](const Spu2::s16*, Spu2::u32 count) { samples += count; });
         std::vector<Spu2::u8> block(64 * 16, 0x11);
@@ -2025,6 +2398,7 @@ int RunHostTests(void (*observe)(const char* name, double ms, int failures)) {
         {"VifSkipsDataAndAppliesMaskPath3", VifSkipsDataAndAppliesMaskPath3},
         {"DmaChainsAreWalked", DmaChainsAreWalked},
         {"GsLayoutsArePermutations", GsLayoutsArePermutations},
+        {"GsDecodesTexturesWhole", GsDecodesTexturesWhole},
         {"GsDrawsASprite", GsDrawsASprite},
         {"GsFogsTowardsFogcol", GsFogsTowardsFogcol},
         {"GsLoadsACsm2Clut", GsLoadsACsm2Clut},
@@ -2051,8 +2425,10 @@ int RunHostTests(void (*observe)(const char* name, double ms, int failures)) {
         {"VuMaxKeepsADenormal", VuMaxKeepsADenormal},
         {"MmiLanesAreScalar", MmiLanesAreScalar},
         {"IpuDecodesAndRetriesCleanly", IpuDecodesAndRetriesCleanly},
+        {"IpuStreamsThroughItsChannels", IpuStreamsThroughItsChannels},
         {"IopInstructionsMatchTheR5900", IopInstructionsMatchTheR5900},
         {"SpuDecodesAdpcmAndPlaysAVoice", SpuDecodesAdpcmAndPlaysAVoice},
+        {"Spu2MixesVoicesInBatches", Spu2MixesVoicesInBatches},
         {"SoundThreadRaisesInterruptsForTheEe", SoundThreadRaisesInterruptsForTheEe},
     };
     const bool times = std::getenv("PS2HOST_TEST_TIMES") != nullptr;
