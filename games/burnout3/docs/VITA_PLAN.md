@@ -422,6 +422,84 @@ REGION_REPEAT, FBMSK within a channel. The status screen was also put up
 over the GPU's pictures once a second (the flicker the player saw): with the
 GPU drawing, only the caption now.
 
+**The sixteenth run (2026-10-18): GS memory on the GPU; the race still
+unplayable.** The passes compiled this time, and GS memory stayed on the
+GPU (440 passes a hundred frames, images in and out there); the race's
+textures all found room, and the player saw far fewer of the blue
+glitches. But the race made 0.3-0.4 pictures a second (VIF1's display
+lists), the GS thread 99-102% busy and 63-70% of the window in "GPU syncs".
+The new "[gpu] decoded most" line and the GS thread's own shares said
+where: ~65 textures a hundred frames still decoded on the CPU - the race's
+glow and blur layers, 8-bit (and 4-bit) textures over its own targets -
+each texel through gs::Memory's addressing (a division and a lookup a
+texel), from GS memory brought back from the GPU (16,000 blocks a hundred
+frames, 230 ms of waiting). The SPU2's thread, on the same core at a
+higher priority, took 62% of it (24 voices heard and 22 running silent
+every sample, 18,000 ADPCM blocks a second). VU1 ran 0.4-0.5M pairs a
+second, 19-24% of the time; in car select, with the GS thread less
+loaded, 1.99M a second at 90% of the worker: ~455 ns a pair, so the
+race's 1.2 million pairs a picture would allow ~1.6 pictures a second at
+best - VU1 is the ceiling once the GS thread is not. The menus' movies:
+1,476 macroblocks a second (about 1.2 pictures of 640 x 480). ps2gxm_tests
+(eighth run of them): the GPU's swizzles exact into and out of memory for
+every colour format, but the depth formats wrong out of memory (8,155 -
+8,190 of 8,192 pixels): the F32 colour surface's program went through
+the blending a colour target has.
+
+For the seventeenth run:
+* textures decoded on the GPU, from GS memory where it is: a pass reads
+  each texel's word through the format's layout table (CT32/24/16/16S,
+  T8 and T4 with their CLUT, T8H, T4HL/HH) into the texture GXM samples.
+  Checked at the start against the CPU's decode (exact, or the CPU's is
+  kept); `--env PS2HOST_GXM_CPU_DECODE=1` forces the CPU's, which now
+  decodes a row at a time with shifts (no division a texel);
+* the race's blur off by default on the Vita (`--setting blur=original`
+  in run.args brings it back): a full-screen layer a frame;
+* depth buffers out of GS memory on the GPU two ways - into the F32
+  surface without blending, or the floats' bytes into an RGBA8 view of
+  the depth buffer - whichever the start's check finds exact to the bit
+  (Z32, Z24, Z16), else on the CPU; `PS2HOST_GXM_DEPTH_BITS` forces the
+  second, `PS2HOST_GXM_DEPTH_CPU` the CPU;
+* the SPU2: voices mixed in batches on the sound thread, a silent voice's
+  run skipped in one step, ADPCM decoded with its history in registers;
+* the IPU (the movies): the data channel 4 brings synced lazily, pictures
+  written straight into channel 3's buffer, the colour conversion's input
+  read in bulk;
+* compiled VU1: less bookkeeping a pair (pairs that cannot land Q, P or
+  flags issue quietly; waits on the same block's writes from local
+  times; ready times stored only where a later block can read them; the
+  pairs counted where a block leaves), 32-bit cycle times; operands
+  cleaned lazily and known clean by field, not by register (a vertex's
+  xyz loaded over an integer w had every FMAC on it clean all four
+  fields, a quarter of the compiled code's instructions); the MAC flags
+  kept only where a reader may see them, counted from the first FMAC
+  after (fast mode leaves out 91% of the FMACs' flags, 62% before); the
+  lanes' loops unrolled whole (GCC had left them loops) and no
+  vectoriser on the generated code (its NEON results went through the
+  ARM core's registers). Checked against the interpreter to the cycle on
+  x86 (SSE and VFP) and ARM. On the player's recorded runs under
+  qemu-arm: 71 instructions a pair in fast mode (the Vita's), 157 before;
+  109 exact, 186 before;
+* the frame line: the GS thread's own time by step (texture decodes,
+  image transfers, CLUT loads, local copies, syncs), the IOP's code
+  where its quanta ended.
+
+What should follow, whatever the seventeenth run shows: with the GS
+thread no longer the limit, VU1 is - even at half the instructions a
+pair, compiled VU1 code cannot carry 1.2 million pairs a picture at a
+playable rate on one 444 MHz core (twenty pictures a second would be
+some twenty cycles a pair). The race's VU1 time is in a few routines:
+the stubs it starts at 0x1318, 0x14E0, 0x1548 and 0x1910 jump (JR VI15)
+to a dispatcher at 0x0020 (156133C7) that picks among relocated copies of
+one 435-pair routine (439AEC5A: transforms, clip codes, a backface test
+on the cross product, the GIF packets) and its smaller relatives at
+0x0680/0x02B8, and the 587-pair program at 0x0000. Those are to be
+written as native code, NEON where rounding allows - the vertex work done
+the Vita's way - each checked against the interpreter on the player's
+recorded runs (vu_runs.bin: the same packets kicked and the same memory,
+allowing a last bit where NEON rounds to nearest), the compiled code
+kept for everything else.
+
 ## How it will be measured
 
 * **Exactness, without a renderer** - a per-frame checksum of everything the

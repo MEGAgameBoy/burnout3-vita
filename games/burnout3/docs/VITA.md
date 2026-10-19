@@ -151,21 +151,21 @@ The LiveArea's art is the port's own, drawn by
 ## Known issues
 
 * The GPU renderer is a first version (VITA_PLAN.md, "M2"): native
-  resolution, the GPU finished at every frame's end, local memory's swizzles
-  and decodes on the CPU; REGION_CLAMP/REPEAT and FBMSK within a channel not
-  yet drawn.
-* Slow everywhere so far: the boot's load (about 20 s), the movies (their
-  pictures late, their sound repeating a stretch while it waits for the
-  next) and the menus. The game's code is still the plain lifted form
-  (every EE register through memory) until the structured form's
-  verification has finished, and the IOP's modules run in an interpreter on
-  the EE's core. The IOP's threads get at most half of that core at each
-  frame (`--iop-share 50`, the Vita's default; `run.args` can say
-  otherwise); the SPU2 mixes on a core of its own (`--sound-thread`).
+  resolution, the GPU finished at every frame's end; GS memory, its
+  swizzles and texture decodes on the GPU (each checked at the start
+  against the CPU's, which is kept where a check fails);
+  REGION_CLAMP/REPEAT and FBMSK within a channel not yet drawn. The race's
+  blur is off by default (`--setting blur=original` in `run.args`).
+* Slow everywhere so far (VITA_PLAN.md has each run's measures): the race
+  a picture or two a second at best - VU1, the 3D's vertex work, compiled
+  from its microcode but still some 450 ns a pair, and a race picture is
+  1.2 million pairs; the menus' movies about a picture a second (the IPU's
+  MPEG decoding on the EE's core); the boot's load about 20 s. The IOP's
+  modules run in an interpreter on the EE's core, its threads at most half
+  of it at each frame (`--iop-share 50`, the Vita's default; `run.args` can
+  say otherwise); the SPU2 mixes on a core of its own (`--sound-thread`).
 * No settings menu for the Vita's options yet; rumble does nothing (the Vita
   has none).
-* Speed: to be measured on the hardware (VITA_PLAN.md). Expect the race to
-  be far from full speed until the VU1 and GS work is made cheaper.
 
 ## Memory map
 

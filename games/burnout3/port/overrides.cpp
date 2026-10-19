@@ -143,8 +143,17 @@ void SkipMovie(lifted::Context& c) {
    (glow) and a radial speed blur gathered there over frames, the buffer laid
    over the whole frame (0x002F9F50). At 320x224 that layer softens the
    picture at any internal resolution. BLUR OFF leaves the frame as drawn. */
+#ifdef __vita__
+/* The Vita: off unless asked for (PC SETTINGS). The layer is drawn from the
+   frame read back as textures through GS local memory - the race's write-
+   backs, reloads and decodes, most of what kept the sixteenth run's GS
+   thread busy. */
+constexpr const char* kBlurDefault = "off";
+#else
+constexpr const char* kBlurDefault = "original";
+#endif
 void PostEffects(lifted::Context& c) {
-    if (ps2host::Setting("blur", "original") == "off") return;
+    if (ps2host::Setting("blur", kBlurDefault) == "off") return;
     F_002FA9A0(c);
 }
 
@@ -326,7 +335,7 @@ int Resolution() {
     return 0;
 }
 void SetResolution(int which) { ps2host::SetSetting("resolution", kResolutions[which]); }
-int Blur() { return ps2host::Setting("blur", "original") == "off" ? 1 : 0; }
+int Blur() { return ps2host::Setting("blur", kBlurDefault) == "off" ? 1 : 0; }
 void SetBlur(int off) { ps2host::SetSetting("blur", off ? "off" : "original"); }
 const char* const kAspects[] = {"4:3", "16:9", "auto"};
 int Aspect() {
