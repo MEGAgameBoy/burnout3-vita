@@ -139,14 +139,25 @@ namespace {
 // the page (times two, plus the nibble, for PSMT4). Every access to GS memory
 // - transfers, CLUT loads, texture decoding, the software rasteriser - goes
 // through Address, and the tables took most of its time.
+// The page's sides are powers of two, kept as shifts too: the Vita's
+// Cortex-A9 has no divide instruction, and a division by a size read from
+// the table was a library call - four of them a pixel.
 struct PageTable {
     u32 width, height;                  // the page, in pixels
     bool half_width;                    // pages per row are BW / 2 (PSMT8, PSMT4)
+    u32 wshift, hshift;                 // log2 of width and height
     std::vector<std::uint16_t> offset;
 };
 
+u32 Log2(u32 n) {
+    u32 s = 0;
+    while ((1u << s) < n) ++s;
+    return s;
+}
+
 PageTable Build(u32 psm, u32 width, u32 height, bool half_width) {
-    PageTable t{width, height, half_width, std::vector<std::uint16_t>(std::size_t(width) * height)};
+    PageTable t{width, height, half_width, Log2(width), Log2(height),
+                std::vector<std::uint16_t>(std::size_t(width) * height)};
     for (u32 y = 0; y < height; ++y)
         for (u32 x = 0; x < width; ++x) {
             u32 nibble = 0;
@@ -184,8 +195,8 @@ inline const PageTable* TableFor(u32 psm) { return g_page_tables.by_psm[psm & 63
 u32 Memory::Address(u32 bp, u32 bw, u32 x, u32 y, u32 psm, u32* nibble) {
     const PageTable* t = TableFor(psm);
     if (!t) return AddressReference(bp, bw, x, y, psm, nibble);
-    const u32 page = Page(bp, t->half_width ? bw / 2 : bw, x / t->width, y / t->height);
-    const u32 within = t->offset[std::size_t(y % t->height) * t->width + x % t->width];
+    const u32 page = Page(bp, t->half_width ? bw / 2 : bw, x >> t->wshift, y >> t->hshift);
+    const u32 within = t->offset[(std::size_t(y & (t->height - 1)) << t->wshift) + (x & (t->width - 1))];
     if (psm == PSMT4) {
         *nibble = within & 1;
         return (page * 256 + within / 2) & kMask;
@@ -244,13 +255,13 @@ inline void Store(u8* bytes, u32 within, u32 page, u32 value) {
 template <u32 Psm>
 void StoreRun(u8* bytes, const PageTable& t, u32 bp, u32 bw, u32 x, u32 y, const u32* values, u32 count) {
     const u32 page_bw = t.half_width ? bw / 2 : bw;
-    const std::uint16_t* row = &t.offset[std::size_t(y % t.height) * t.width];
-    const u32 page_y = y / t.height;
+    const std::uint16_t* row = &t.offset[std::size_t(y & (t.height - 1)) << t.wshift];
+    const u32 page_y = y >> t.hshift;
     for (u32 i = 0; i < count;) {
         const u32 px = x + i;
-        const u32 page = Page(bp, page_bw, px / t.width, page_y);
-        const u32 in_page = std::min(count - i, t.width - px % t.width);
-        for (u32 k = 0, wx = px % t.width; k < in_page; ++k, ++wx)
+        const u32 page = Page(bp, page_bw, px >> t.wshift, page_y);
+        const u32 in_page = std::min(count - i, t.width - (px & (t.width - 1)));
+        for (u32 k = 0, wx = px & (t.width - 1); k < in_page; ++k, ++wx)
             Store<Psm>(bytes, row[wx], page, values[i + k]);
         i += in_page;
     }
@@ -295,6 +306,183 @@ void Memory::Write(u32 bp, u32 bw, u32 x, u32 y, u32 psm, u32 value) {
         case PSMT4HL: p[3] = u8((p[3] & 0xF0) | (value & 15)); break;
         case PSMT4HH: p[3] = u8((p[3] & 0x0F) | (value << 4)); break;
         default: break;
+    }
+}
+
+}  // namespace gs
+}  // namespace ps2host
+
+// ------------------------------------------------------------------ textures, decoded whole
+
+namespace ps2host {
+namespace gs {
+
+namespace {
+
+// CLAMP's modes, as the software GS and the GPU renderers wrap a texel
+// coordinate: REPEAT, CLAMP, REGION_CLAMP, REGION_REPEAT.
+int WrapCoordinate(int i, u32 size, u32 mode, u32 lo, u32 hi) {
+    if (mode == 0) return int(u32(i) & (size - 1));
+    if (mode == 1) return i < 0 ? 0 : (int(size) - 1 < i ? int(size) - 1 : i);
+    if (mode == 2) return i < int(lo) ? int(lo) : (int(hi) < i ? int(hi) : i);
+    return int((u32(i) & lo) | hi);
+}
+
+// A level's column (row) for coordinate i: level 0 wrapped and kept within
+// 2048, the smaller levels wrapped by their own region and clamped to them.
+u32 LevelCoordinate(int i, u32 size0, u32 n, u32 mode, u32 lo, u32 hi) {
+    if (n == 0) return u32(WrapCoordinate(i, size0, mode, lo, hi)) & 2047;
+    const u32 size = std::max(1u, size0 >> n);
+    const int c = WrapCoordinate(i, size, mode, lo >> n, hi >> n);
+    return u32(c < 0 ? 0 : (int(size) - 1 < c ? int(size) - 1 : c));
+}
+
+u32 Expand(const TextureView& d, const u32* clut, u32 raw) {
+    const u32 ta0 = d.texa_lo & 0xFF;
+    const bool aem = (d.texa_lo & 0x8000u) != 0;
+    switch (d.psm) {
+        case PSMCT32: case PSMZ32: return raw;
+        case PSMCT24: case PSMZ24: {
+            const u32 rgb = raw & 0xFFFFFF;
+            return rgb | ((aem && !rgb) ? 0u : ta0) << 24;
+        }
+        case PSMCT16: case PSMCT16S: case PSMZ16: case PSMZ16S: {
+            const u32 a = (raw & 0x8000u) ? d.ta1 : ((aem && !(raw & 0x7FFFu)) ? 0u : ta0);
+            return ((raw & 31u) << 3) | (((raw >> 5) & 31u) << 11) | (((raw >> 10) & 31u) << 19) | (a << 24);
+        }
+        case PSMT8: case PSMT8H: return clut[raw & 0xFF];
+        case PSMT4: case PSMT4HL: case PSMT4HH: return clut[(d.csa * 16 + (raw & 15)) & 0xFF];
+        default: return raw;
+    }
+}
+
+// A pixel's raw value at (page, its place there), as Memory::Read gives it.
+template <u32 Psm>
+inline u32 RawAt(const u8* bytes, u32 page, u32 within) {
+    if constexpr (Psm == PSMT4) {
+        const u8 b = bytes[(page * 256 + within / 2) & kMask];
+        return (within & 1) ? u32(b >> 4) : u32(b & 15);
+    } else {
+        const u8* p = &bytes[(page * 256 + within) & kMask];
+        if constexpr (Psm == PSMCT32) return u32(p[0]) | u32(p[1]) << 8 | u32(p[2]) << 16 | u32(p[3]) << 24;
+        else if constexpr (Psm == PSMCT24) return u32(p[0]) | u32(p[1]) << 8 | u32(p[2]) << 16;
+        else if constexpr (Psm == PSMT8) return p[0];
+        else if constexpr (Psm == PSMT8H) return p[3];
+        else if constexpr (Psm == PSMT4HL) return u32(p[3] & 15);
+        else if constexpr (Psm == PSMT4HH) return u32(p[3] >> 4);
+        else return u32(p[0]) | u32(p[1]) << 8;          // the 16-bit formats
+    }
+}
+
+// Row y's raw values at columns xs[0..count).
+template <u32 Psm>
+void ReadRow(const u8* bytes, const PageTable& t, u32 bp, u32 bw, u32 y, const u32* xs, u32 count, u32* raw) {
+    const u32 page_bw = t.half_width ? bw / 2 : bw;
+    const std::uint16_t* row = &t.offset[std::size_t(y & (t.height - 1)) << t.wshift];
+    const u32 base = Page(bp, page_bw, 0, y >> t.hshift);
+    const u32 wshift = t.wshift, wmask = t.width - 1;
+    for (u32 i = 0; i < count; ++i) {
+        const u32 x = xs[i];
+        raw[i] = RawAt<Psm>(bytes, base + 32 * (x >> wshift), row[x & wmask]);
+    }
+}
+
+void ReadRowAny(const u8* bytes, const PageTable& t, u32 psm, u32 bp, u32 bw, u32 y, const u32* xs, u32 count,
+                u32* raw) {
+    switch (psm) {
+        case PSMCT32: case PSMZ32: ReadRow<PSMCT32>(bytes, t, bp, bw, y, xs, count, raw); return;
+        case PSMCT24: case PSMZ24: ReadRow<PSMCT24>(bytes, t, bp, bw, y, xs, count, raw); return;
+        case PSMT8: ReadRow<PSMT8>(bytes, t, bp, bw, y, xs, count, raw); return;
+        case PSMT4: ReadRow<PSMT4>(bytes, t, bp, bw, y, xs, count, raw); return;
+        case PSMT8H: ReadRow<PSMT8H>(bytes, t, bp, bw, y, xs, count, raw); return;
+        case PSMT4HL: ReadRow<PSMT4HL>(bytes, t, bp, bw, y, xs, count, raw); return;
+        case PSMT4HH: ReadRow<PSMT4HH>(bytes, t, bp, bw, y, xs, count, raw); return;
+        default: ReadRow<PSMCT16>(bytes, t, bp, bw, y, xs, count, raw); return;     // the 16-bit formats
+    }
+}
+
+// Raw values to RGBA, the format's switch outside the row.
+void ExpandRow(const TextureView& d, const u32* clut, const u32* raw, u32 count, u32* out) {
+    const u32 ta0 = d.texa_lo & 0xFF;
+    const bool aem = (d.texa_lo & 0x8000u) != 0;
+    switch (d.psm) {
+        case PSMCT32: case PSMZ32:
+            std::copy(raw, raw + count, out);
+            return;
+        case PSMCT24: case PSMZ24:
+            for (u32 i = 0; i < count; ++i) {
+                const u32 rgb = raw[i] & 0xFFFFFF;
+                out[i] = rgb | ((aem && !rgb) ? 0u : ta0) << 24;
+            }
+            return;
+        case PSMCT16: case PSMCT16S: case PSMZ16: case PSMZ16S:
+            for (u32 i = 0; i < count; ++i) {
+                const u32 r = raw[i];
+                const u32 a = (r & 0x8000u) ? d.ta1 : ((aem && !(r & 0x7FFFu)) ? 0u : ta0);
+                out[i] = ((r & 31u) << 3) | (((r >> 5) & 31u) << 11) | (((r >> 10) & 31u) << 19) | (a << 24);
+            }
+            return;
+        case PSMT8: case PSMT8H:
+            for (u32 i = 0; i < count; ++i) out[i] = clut[raw[i] & 0xFF];
+            return;
+        case PSMT4: case PSMT4HL: case PSMT4HH: {
+            const u32* row = clut + (d.csa * 16) % 256;     // CSA's 16 entries (CSA < 32: within the 256)
+            if (d.csa < 16)
+                for (u32 i = 0; i < count; ++i) out[i] = row[raw[i] & 15];
+            else
+                for (u32 i = 0; i < count; ++i) out[i] = clut[(d.csa * 16 + (raw[i] & 15)) & 0xFF];
+            return;
+        }
+        default:
+            std::copy(raw, raw + count, out);
+            return;
+    }
+}
+
+}  // namespace
+
+u32 DecodeTexel(const Memory& memory, const TextureView& d, const u32* clut, int iu, int iv, int n) {
+    u32 raw;
+    if (n == 0) {
+        const u32 u = LevelCoordinate(iu, d.tw, 0, d.wms, d.minu, d.maxu);
+        const u32 v = LevelCoordinate(iv, d.th, 0, d.wmt, d.minv, d.maxv);
+        raw = memory.Read(d.tbp, d.tbw, u, v, d.psm);
+    } else {
+        const u32 u = LevelCoordinate(iu, d.tw, u32(n), d.wms, d.minu, d.maxu);
+        const u32 v = LevelCoordinate(iv, d.th, u32(n), d.wmt, d.minv, d.maxv);
+        raw = memory.Read(d.level_tbp[n], std::max(1u, d.level_tbw[n]), u, v, d.psm);
+    }
+    return Expand(d, clut, raw);
+}
+
+u32 DecodedHeight(const TextureView& d) {
+    const u32 levels = std::max(1u, std::min(d.levels, 7u));
+    u32 height = 0;
+    for (u32 n = 0; n < levels; ++n) height += std::max(1u, d.th >> n);
+    return height;
+}
+
+void DecodeTexture(const Memory& memory, const TextureView& d, const u32* clut, u32* pixels) {
+    const u32 levels = std::max(1u, std::min(d.levels, 7u));
+    const PageTable* t = TableFor(d.psm);
+    const u8* bytes = memory.data();
+    std::vector<u32> xs(d.tw), raw(d.tw);
+    u32 row = 0;
+    for (u32 n = 0; n < levels; ++n) {
+        const u32 w = std::max(1u, d.tw >> n), h = std::max(1u, d.th >> n);
+        const u32 bp = n ? d.level_tbp[n] : d.tbp, bw = n ? std::max(1u, d.level_tbw[n]) : d.tbw;
+        for (u32 u = 0; u < w; ++u) xs[u] = LevelCoordinate(int(u), d.tw, n, d.wms, d.minu, d.maxu);
+        for (u32 v = 0; v < h; ++v) {
+            u32* out = pixels + std::size_t(row + v) * d.tw;
+            if (!t) {                                       // a format with no page table: as the GS reads it
+                for (u32 u = 0; u < w; ++u) out[u] = DecodeTexel(memory, d, clut, int(u), int(v), int(n));
+                continue;
+            }
+            const u32 y = LevelCoordinate(int(v), d.th, n, d.wmt, d.minv, d.maxv);
+            ReadRowAny(bytes, *t, d.psm, bp, bw, y, xs.data(), w, raw.data());
+            ExpandRow(d, clut, raw.data(), w, out);
+        }
+        row += h;
     }
 }
 

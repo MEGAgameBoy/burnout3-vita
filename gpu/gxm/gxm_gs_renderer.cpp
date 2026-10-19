@@ -77,9 +77,12 @@
 #include "gxm_device.h"
 #include "ps2gpu/gs_renderer.h"
 #include "ps2host/gs.h"
+#include "ps2host/run.h"
 
 namespace ps2gpu {
 
+using ps2host::Activity;
+using ps2host::HostLane;
 namespace {
 
 using namespace gxm;
@@ -105,6 +108,8 @@ struct GxmMemoryStats {
     std::uint64_t passes = 0, to_memory = 0, from_memory = 0, direct_blocks = 0, staged_blocks = 0;
     std::uint64_t read_blocks = 0, read_ns = 0, waits = 0, patches = 0;
     std::uint64_t begin_ns = 0, end_ns = 0, finish_ns = 0;     // in sceGxmBeginScene, EndScene, Finish
+    std::uint64_t gpu_decodes = 0, cpu_decodes = 0, cpu_decode_ns = 0;  // textures from memory, by where
+    std::uint64_t depth_gpu = 0, depth_cpu = 0, depth_cpu_ns = 0;      // depth buffers from memory, by where
 };
 GxmMemoryStats g_memory_stats;
 
@@ -351,11 +356,23 @@ using MemoryVariant = u32;
 constexpr MemoryVariant kCopy = 0, kToMemory = 1, kFromMemory = 2, kMemDepth = 1u << 2, kMem16 = 1u << 3,
                         kMem24 = 1u << 4;
 constexpr int kHalfShift = 5;
+/* A texture decoded from memory on the GPU (TextureFromMemory): KIND 3, its
+   format's way in bits 2-4 (DecodeFormat). */
+constexpr MemoryVariant kDecode = 3;
+constexpr int kDecodeFormats = 8;
+/* A depth buffer from memory (kFromMemory | kMemDepth) with its floats' bits
+   written as bytes, into a U8U8U8U8 surface over them (Depth::as_bytes) - the
+   way when the F32 surface's own is not drawn as it should be (the
+   sixteenth run's reloads all came out wrong). */
+constexpr MemoryVariant kMemBits = 1u << 7;
 
 std::string MemorySource(MemoryVariant v) {
-    char defines[160];
-    std::snprintf(defines, sizeof defines, "#define KIND %u\n#define DEPTH %u\n#define SIXTEEN %u\n#define TWENTY_FOUR %u\n#define HALF %u\n",
-                  v & 3u, (v >> 2) & 1u, (v >> 3) & 1u, (v >> 4) & 1u, (v >> kHalfShift) & 3u);
+    char defines[224];
+    std::snprintf(defines, sizeof defines,
+                  "#define KIND %u\n#define DEPTH %u\n#define SIXTEEN %u\n#define TWENTY_FOUR %u\n#define HALF %u\n"
+                  "#define FMT %u\n#define BITS %u\n",
+                  v & 3u, (v >> 2) & 1u, (v >> 3) & 1u, (v >> 4) & 1u, (v >> kHalfShift) & 3u, (v >> 2) & 7u,
+                  (v >> 7) & 1u);
     static const char body[] =
         "float4 Out(float4 bytes) { return (bytes + 0.25f) / 255.0f; }\n"
         "float4 Bytes(float4 t) { return floor(t * 255.0f + 0.5f); }\n"
@@ -423,9 +440,59 @@ std::string MemorySource(MemoryVariant v) {
         "#endif\n"
         "#endif\n"
         "}\n"
-        "#else\n"
-        "// A depth buffer's float goes out alone (an F32 surface, the FLOAT register).\n"
-        "#if DEPTH\n"
+        "#elif KIND == 2\n"
+        "// A depth buffer's float goes out alone (an F32 surface, the FLOAT register),\n"
+        "// or (BITS) its IEEE bits as four bytes.\n"
+        "#if BITS\n"
+        "// floor(log2(x)) of a whole number 1 <= x < 2^24, by powers of two (exact).\n"
+        "float Log2Floor(float x) {\n"
+        "    float e = 0.0f;\n"
+        "    if (x >= 65536.0f) { e += 16.0f; x = floor(x / 65536.0f); }\n"
+        "    if (x >= 256.0f) { e += 8.0f; x = floor(x / 256.0f); }\n"
+        "    if (x >= 16.0f) { e += 4.0f; x = floor(x / 16.0f); }\n"
+        "    if (x >= 4.0f) { e += 2.0f; x = floor(x / 4.0f); }\n"
+        "    if (x >= 2.0f) { e += 1.0f; }\n"
+        "    return e;\n"
+        "}\n"
+        "// 2^k for a whole 0 <= k < 32, by powers of two (exact).\n"
+        "float Pow2(float k) {\n"
+        "    float p = 1.0f;\n"
+        "    if (k >= 16.0f) { p *= 65536.0f; k -= 16.0f; }\n"
+        "    if (k >= 8.0f) { p *= 256.0f; k -= 8.0f; }\n"
+        "    if (k >= 4.0f) { p *= 16.0f; k -= 4.0f; }\n"
+        "    if (k >= 2.0f) { p *= 4.0f; k -= 2.0f; }\n"
+        "    if (k >= 1.0f) { p *= 2.0f; }\n"
+        "    return p;\n"
+        "}\n"
+        "// The bytes of the float Z / 2^32 (to nearest, ties to even: the CPU's\n"
+        "// conversion), Z = H * 256 + L for whole H < 2^24, L < 256.\n"
+        "float4 ZBits(float H, float L) {\n"
+        "    if (H < 0.5f && L < 0.5f) return float4(0.0f, 0.0f, 0.0f, 0.0f);\n"
+        "    float e = H > 0.5f ? Log2Floor(H) + 8.0f : Log2Floor(L);\n"
+        "    float m;\n"
+        "    if (e <= 23.0f) {\n"
+        "        m = (H * 256.0f + L) * Pow2(23.0f - e);\n"
+        "    } else {\n"
+        "        float sh = e - 23.0f;                  // 1-8\n"
+        "        float p = Pow2(sh);\n"
+        "        float q = floor(L / p);\n"
+        "        m = H * Pow2(8.0f - sh) + q;\n"
+        "        float r = L - q * p, mid = p * 0.5f;   // (not \"half\": a Cg type)\n"
+        "        float odd = m - floor(m * 0.5f) * 2.0f;\n"
+        "        if (r > mid || (r == mid && odd > 0.5f)) m += 1.0f;\n"
+        "    }\n"
+        "    float E = e + 95.0f;                         // e - 32 + 127\n"
+        "    float mant = m - 8388608.0f;\n"
+        "    if (mant >= 8388608.0f) { E += 1.0f; mant = 0.0f; }\n"
+        "    float m2 = floor(mant / 65536.0f);\n"
+        "    float rest = mant - m2 * 65536.0f;\n"
+        "    float m1 = floor(rest / 256.0f);\n"
+        "    float m0 = rest - m1 * 256.0f;\n"
+        "    float e1 = floor(E / 2.0f);\n"
+        "    return float4(m0, m1, m2 + (E - e1 * 2.0f) * 128.0f, e1);\n"
+        "}\n"
+        "#endif\n"
+        "#if DEPTH && !BITS\n"
         "float main(float3 vStq : TEXCOORD0,\n"
         "#else\n"
         "float4 main(float3 vStq : TEXCOORD0,\n"
@@ -449,11 +516,20 @@ std::string MemorySource(MemoryVariant v) {
         "    float4 b = Bytes(tex2D(uMemory, float2((w - wy * 1024.0f + 0.5f) / 1024.0f, (wy + 0.5f) / 1024.0f)));\n"
         "#if SIXTEEN\n"
         "    float h = upper ? b.z + b.w * 256.0f : b.x + b.y * 256.0f;\n"
-        "#if DEPTH\n"
+        "#if DEPTH && BITS\n"
+        "    float hh = floor(h / 256.0f);\n"
+        "    return Out(ZBits(hh, h - hh * 256.0f));\n"
+        "#elif DEPTH\n"
         "    return h / 4294967296.0f;\n"
         "#else\n"
         "    float g = floor(h / 32.0f), bl = floor(h / 1024.0f), a = floor(h / 32768.0f);\n"
         "    return Out(float4((h - g * 32.0f) * 8.0f, (g - bl * 32.0f) * 8.0f, (bl - a * 32.0f) * 8.0f, a * 128.0f));\n"
+        "#endif\n"
+        "#elif DEPTH && BITS\n"
+        "#if TWENTY_FOUR\n"
+        "    return Out(ZBits(b.z * 256.0f + b.y, b.x));\n"
+        "#else\n"
+        "    return Out(ZBits((b.w * 256.0f + b.z) * 256.0f + b.y, b.x));\n"
         "#endif\n"
         "#elif DEPTH\n"
         "#if TWENTY_FOUR\n"
@@ -467,6 +543,59 @@ std::string MemorySource(MemoryVariant v) {
         "    b.w = 0.0f;\n"
         "#endif\n"
         "    return Out(b);\n"
+        "#endif\n"
+        "}\n"
+        "#else\n"
+        "// A texture's texels from memory (KIND 3), as gs::DecodeTexture reads them: the\n"
+        "// level's pixel (u, v) at its page and place in it (the layout: a word, or a half\n"
+        "// word (16-bit), and the byte or nibble in the word), its bytes from memory, then\n"
+        "// expanded by TEXA or through the CLUT.\n"
+        "float4 main(float3 vStq : TEXCOORD0,\n"
+        "            uniform sampler2D uMemory : TEXUNIT0,\n"
+        "            uniform sampler2D uLayout : TEXUNIT1,\n"
+        "            uniform sampler2D uClut : TEXUNIT2,\n"
+        "            uniform float4 uA,       // TBP in words, pages a row, a page's rows, its columns\n"
+        "            uniform float4 uB,       // the level's first row here, CSA * 16, TA0, TA1\n"
+        "            uniform float4 uC) : COLOR {   // AEM\n"
+        "    float u = floor(vStq.x), v = floor(vStq.y) - uB.x;\n"
+        "    float px = floor(u / uA.w), py = floor(v / uA.z);\n"
+        "    float4 l = Bytes(tex2D(uLayout, float2((u - px * uA.w + 0.5f) / uA.w, (v - py * uA.z + 0.5f) / uA.z)));\n"
+        "#if FMT == 2\n"
+        "    float hw = l.x + l.y * 256.0f;\n"
+        "    float off = floor(hw / 2.0f);\n"
+        "    bool upper = hw - off * 2.0f > 0.5f;\n"
+        "#else\n"
+        "    float off = l.x + l.y * 256.0f;\n"
+        "#endif\n"
+        "    float w = Mod(uA.x + (py * uA.y + px) * 2048.0f + off, 1048576.0f);\n"
+        "    float wy = floor(w / 1024.0f);\n"
+        "    float4 b = Bytes(tex2D(uMemory, float2((w - wy * 1024.0f + 0.5f) / 1024.0f, (wy + 0.5f) / 1024.0f)));\n"
+        "#if FMT == 0\n"
+        "    return Out(b);\n"
+        "#elif FMT == 1\n"
+        "    float a24 = (uC.x > 0.5f && b.x + b.y + b.z < 0.5f) ? 0.0f : uB.z;\n"
+        "    return Out(float4(b.x, b.y, b.z, a24));\n"
+        "#elif FMT == 2\n"
+        "    float h = upper ? b.z + b.w * 256.0f : b.x + b.y * 256.0f;\n"
+        "    float g = floor(h / 32.0f), bl = floor(h / 1024.0f), top = floor(h / 32768.0f);\n"
+        "    float low = h - top * 32768.0f;\n"
+        "    float a16 = top > 0.5f ? uB.w : ((uC.x > 0.5f && low < 0.5f) ? 0.0f : uB.z);\n"
+        "    return Out(float4((h - g * 32.0f) * 8.0f, (g - bl * 32.0f) * 8.0f, (bl - top * 32.0f) * 8.0f, a16));\n"
+        "#else\n"
+        "#if FMT == 3\n"
+        "    float idx = l.z < 0.5f ? b.x : (l.z < 1.5f ? b.y : (l.z < 2.5f ? b.z : b.w));\n"
+        "#elif FMT == 4\n"
+        "    float by = l.z < 1.5f ? b.x : (l.z < 3.5f ? b.y : (l.z < 5.5f ? b.z : b.w));\n"
+        "    float hn = floor(by / 16.0f);\n"
+        "    float idx = Mod(uB.y + (Mod(l.z, 2.0f) > 0.5f ? hn : by - hn * 16.0f), 256.0f);\n"
+        "#elif FMT == 5\n"
+        "    float idx = b.w;\n"
+        "#elif FMT == 6\n"
+        "    float idx = Mod(uB.y + (b.w - floor(b.w / 16.0f) * 16.0f), 256.0f);\n"
+        "#else\n"
+        "    float idx = Mod(uB.y + floor(b.w / 16.0f), 256.0f);\n"
+        "#endif\n"
+        "    return Out(Bytes(tex2D(uClut, float2((idx + 0.5f) / 256.0f, 0.5f))));\n"
         "#endif\n"
         "}\n"
         "#endif\n";
@@ -492,13 +621,32 @@ struct Depth {
     // surface (from memory), over the same memory.
     SceGxmTexture texture{};
     Target as_colour;
+    Target as_bytes;                            // ...and as four bytes a sample (kMemBits)
 };
 
 struct Texture {
     u32 width = 0, height = 0, stride = 0;
     u32* pixels = nullptr;
     SceGxmTexture texture{};
+    bool on_gpu = false;            // decoded by a pass on the GPU (read back after a finish)
 };
+
+/* A texture format's way through the GPU's decode (kDecode's bits 2-4), or
+   -1: 32-bit, 24-bit, 16-bit, T8, T4, T8H, T4HL, T4HH. */
+int DecodeFormat(u32 psm) {
+    switch (psm) {
+        case 0x00: case 0x30: return 0;
+        case 0x01: case 0x31: return 1;
+        case 0x02: case 0x0A: case 0x32: case 0x3A: return 2;
+        case 0x13: return 3;
+        case 0x14: return 4;
+        case 0x1B: return 5;
+        case 0x24: return 6;
+        case 0x2C: return 7;
+        default: return -1;
+    }
+}
+const char* const kDecodeFormatNames[8] = {"32-bit", "24-bit", "16-bit", "T8", "T4", "T8H", "T4HL", "T4HH"};
 
 bool Is16Bit(u32 psm) { return psm == 0x02 || psm == 0x0A || psm == 0x32 || psm == 0x3A; }
 bool Is24Bit(u32 psm) { return psm == 0x01 || psm == 0x31; }
@@ -659,7 +807,6 @@ private:
               const float tex_scale[2], const void* vertices, u32 count, SceGxmDepthFunc depth_func, bool depth_write,
               Stencil stencil = Stencil::kOff);
     void DateSetup(Target* t, u32 datm);
-    u32 TexelAt(const GsTextureDecode& d, int u, int v, int level) const;
 
     // GS local memory on the GPU (the notes at the top).
     bool StartMemory(std::string* error);
@@ -676,7 +823,18 @@ private:
     SceGxmFragmentProgram* MemoryProgram(MemoryVariant variant, u8 mask, bool float_out, MemoryParams** params);
     void MemoryPass(Target* into, MemoryVariant variant, u8 mask, bool float_out, const SceGxmTexture* t0,
                     const SceGxmTexture* t1, const float a[4], const float b[4], const float c[4], const PassRect* rects,
-                    int count);
+                    int count, const SceGxmTexture* t2 = nullptr);
+    /* A texture decoded from memory by a pass of its own (kDecode), into
+       GPU memory of its own: false if it cannot be (a format or region
+       mode it does not take, or no memory), for the CPU to do. */
+    bool DecodeOnGpu(u64 key, const GsTextureDecode& d, u32 levels);
+    /* At the start, what the GPU makes of memory, checked against the CPU on
+       patterns of its own: textures of each format (gpu_decode_ok_ keeps
+       those that agree), and a depth buffer's reload (else depth stays on
+       the CPU). Memory and the CLUT are left as they were (zeros). */
+    void SelfCheck();
+    u8 gpu_decode_ok_ = 0;          // DecodeFormat's formats the GPU decodes (bits)
+    SceGxmTexture forward_t8_{}, forward_t4_{};     // T8's and T4's pages: a pixel's word and byte (nibble)
     /* An image (a target's pixels, a depth buffer's floats) into memory: the
        rows [first_row, rows), `cols` wide, of an image `width` x `height`. */
     void ToMemory(const SceGxmTexture& image, bool depth, u32 psm, u32 base, u32 fbw, u32 cols, u32 rows,
@@ -699,6 +857,11 @@ private:
     void Touch(u32 first, u32 count, bool written);
     bool cpu_memory_ = false;       // PS2HOST_GXM_CPU_MEMORY: the first version's local memory, on the CPU
     bool depth_on_cpu_ = false;     // ...depth buffers' alone (their programs could not be had)
+    bool depth_f32_ok_ = false, depth_bits_ok_ = false;   // the ways back from memory whose programs were had
+    bool depth_bits_ = false;       // depth from memory as its floats' bytes (kMemBits), not the F32 surface
+    bool depth_reload_cpu_ = false; // depth from memory alone on the CPU (neither way checked right)
+    /* The surface a depth buffer comes back from memory into (FromMemory). */
+    Target* DepthTarget(Depth* d) { return depth_bits_ ? &d->as_bytes : &d->as_colour; }
     /* Pages [first, first + count) (wrapping) of the CPU's copy into the
        GPU's, nothing recorded left (after Idle): what a CPU swizzle wrote. */
     void CopyToGpu(u32 first, u32 count) {
@@ -765,6 +928,7 @@ private:
 
     ps2host::gs::Memory memory_;    // GS local memory "on the GPU"
     u32 clut_[256] = {};            // the GPU's CLUT (ClutFromMemory, ClutRows)
+    std::vector<u32> decoded_;      // TextureFromMemory's pixels, kept between decodes
     bool clut_changed_ = true;      // ...since clut_texture_ was made from it
     u32* clut_pixels_ = nullptr;
     SceGxmTexture clut_texture_{};
@@ -847,6 +1011,10 @@ bool GxmGsRenderer::Init(std::string* error) {
             cpu_memory_ = true;
         }
     }
+    if (std::getenv("PS2HOST_GXM_CPU_DECODE")) gpu_decode_ok_ = 0;     // textures decoded on the CPU, as before
+    if (std::getenv("PS2HOST_GXM_DEPTH_CPU")) depth_reload_cpu_ = true;   // depth buffers back from memory on the CPU
+    if (std::getenv("PS2HOST_GXM_DEPTH_BITS")) depth_f32_ok_ = false;     // ...as their floats' bytes, if they check
+    if (!cpu_memory_) SelfCheck();
     // The display's scene comes after what is drawn here.
     device_->SetSceneCloser([this] {
         Flush();
@@ -1013,6 +1181,11 @@ bool GxmGsRenderer::MakeDepth(Depth& d, u32 width, u32 height, bool kept) {
         sceGxmColorSurfaceInit(&c.surface, SCE_GXM_COLOR_FORMAT_F32_R, SCE_GXM_COLOR_SURFACE_LINEAR,
                                SCE_GXM_COLOR_SURFACE_SCALE_NONE, SCE_GXM_OUTPUT_REGISTER_SIZE_32BIT, width, height,
                                d.stride, d.depth);
+        Target& b = d.as_bytes;
+        b = c;
+        sceGxmColorSurfaceInit(&b.surface, SCE_GXM_COLOR_FORMAT_A8B8G8R8, SCE_GXM_COLOR_SURFACE_LINEAR,
+                               SCE_GXM_COLOR_SURFACE_SCALE_NONE, SCE_GXM_OUTPUT_REGISTER_SIZE_32BIT, width, height,
+                               d.stride, d.depth);
     }
     return true;
 }
@@ -1050,6 +1223,15 @@ Depth* GxmGsRenderer::Dummy(u32 width, u32 height) {
     // fails without one): its contents never loaded or kept.
     auto found = dummies_.find({width, height});
     if (found != dummies_.end()) return &found->second;
+    // One as large or larger serves as well (it is never loaded or kept),
+    // the smallest of them: fewer stand-ins (decoded textures come in many
+    // sizes, each a scene of its own).
+    Depth* best = nullptr;
+    for (auto& [size, d] : dummies_)
+        if (size.first >= width && size.second >= height &&
+            (!best || u64(d.width) * d.height < u64(best->width) * best->height))
+            best = &d;
+    if (best) return best;
     Depth d;
     if (!MakeDepth(d, width, height, false)) return nullptr;
     return &(dummies_[{width, height}] = d);
@@ -1062,6 +1244,7 @@ void GxmGsRenderer::OpenScene(Target* target, Depth* depth) {
     SceGxmRenderTarget* rt = RenderTarget(target->width, target->height);
     if (!depth || !rt) return;
     const u64 from = WaitClock();
+    const Activity step(HostLane::kGs, "GXM: sceGxmBeginScene");
     const int r = sceGxmBeginScene(device_->context(), 0, rt, nullptr, nullptr, nullptr, &target->surface,
                                    &depth->surface);
     g_memory_stats.begin_ns += WaitClock() - from;
@@ -1084,6 +1267,7 @@ void GxmGsRenderer::OpenScene(Target* target, Depth* depth) {
 void GxmGsRenderer::CloseScene() {
     if (!scene_open_) return;
     const u64 from = WaitClock();
+    const Activity step(HostLane::kGs, "GXM: sceGxmEndScene");
     sceGxmEndScene(device_->context(), nullptr, nullptr);
     g_memory_stats.end_ns += WaitClock() - from;
     scene_open_ = false;
@@ -1095,6 +1279,7 @@ void GxmGsRenderer::Idle() {
     Flush();
     CloseScene();
     const u64 from = WaitClock();
+    const Activity step(HostLane::kGs, "GXM: waiting for the GPU to finish (sceGxmFinish)");
     SetGxmActivity("the renderer waiting for the GPU to finish");
     sceGxmFinish(device_->context());
     SetGxmActivity(nullptr);
@@ -1188,6 +1373,7 @@ void GxmGsRenderer::Pass(Variant variant, const SceGxmBlendInfo& blend, const Gs
 
 void GxmGsRenderer::Flush() {
     if (pending_.empty()) return;
+    const Activity step(HostLane::kGs, "GXM: draws recorded");
     const GsDrawState& s = state_;
     std::vector<GsVertex> batch;
     batch.swap(pending_);
@@ -1362,6 +1548,7 @@ void GxmGsRenderer::Kick() {
 void GxmGsRenderer::UploadTexture(u64 key, const u32* pixels, u32 width, u32 height) {
     if (!width || !height) return;
     Flush();
+    const Activity step(HostLane::kGs, "a texture copied to the GPU");
     Texture& t = textures_[key];
     // New memory each time: what is recorded may still read the old.
     if (t.pixels) Release(t.pixels);
@@ -1395,6 +1582,7 @@ void GxmGsRenderer::UploadTexture(u64 key, const u32* pixels, u32 width, u32 hei
     for (u32 y = 0; y < t.height; ++y)
         std::memcpy(t.pixels + std::size_t(y) * t.stride, pixels + std::size_t(y) * width, t.width * 4);
     sceGxmTextureInitLinear(&t.texture, t.pixels, SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR, t.width, t.height, 0);
+    t.on_gpu = false;
 }
 
 void GxmGsRenderer::ReleaseTexture(u64 key) {
@@ -1408,6 +1596,7 @@ void GxmGsRenderer::ReleaseTexture(u64 key) {
 bool GxmGsRenderer::ReadTexture(u64 key, std::vector<u32>* pixels, u32* width, u32* height) {
     auto found = textures_.find(key);
     if (found == textures_.end()) return false;
+    if (found->second.on_gpu) Idle();       // its pass, finished
     const Texture& t = found->second;
     pixels->resize(std::size_t(t.width) * t.height);
     for (u32 y = 0; y < t.height; ++y)
@@ -1514,8 +1703,6 @@ bool GxmGsRenderer::StartMemory(std::string* error) {
         {kToMemory | kMemDepth | kMem16, all, false}, {kToMemory | kMemDepth | kMem16 | (1u << kHalfShift), low, false},
         {kToMemory | kMemDepth | kMem16 | (2u << kHalfShift), high, false},
         {kFromMemory, all, false}, {kFromMemory | kMem24, all, false}, {kFromMemory | kMem16, all, false},
-        {kFromMemory | kMemDepth, all, true}, {kFromMemory | kMemDepth | kMem24, all, true},
-        {kFromMemory | kMemDepth | kMem16, all, true},
     };
     // Depth's own programs, if they cannot be had, leave depth buffers alone
     // to the CPU (after a finish, through the CPU's copy), colour on the GPU.
@@ -1532,6 +1719,23 @@ bool GxmGsRenderer::StartMemory(std::string* error) {
         }
         *error = text;
         return false;
+    }
+    // A depth buffer back from memory: into its F32 surface, or as its
+    // floats' bytes (kMemBits) - whichever can be had, and the start's
+    // SelfCheck finds right, else on the CPU.
+    if (!depth_on_cpu_) {
+        depth_f32_ok_ = depth_bits_ok_ = true;
+        for (const MemoryVariant v : {kFromMemory | kMemDepth, kFromMemory | kMemDepth | kMem24,
+                                      kFromMemory | kMemDepth | kMem16}) {
+            MemoryParams* params = nullptr;
+            if (!MemoryProgram(v, all, true, &params)) depth_f32_ok_ = false;
+            if (!MemoryProgram(v | kMemBits, all, false, &params)) depth_bits_ok_ = false;
+        }
+        if (!depth_f32_ok_ && !depth_bits_ok_) {
+            std::fprintf(stderr, "[gxm] no program for depth buffers from GS memory: on the CPU\n");
+            depth_reload_cpu_ = true;
+        }
+        depth_bits_ = !depth_f32_ok_;
     }
     // Local memory itself: CDRAM, as a target is.
     Target& m = memory_target_;
@@ -1594,6 +1798,40 @@ bool GxmGsRenderer::StartMemory(std::string* error) {
         sceGxmTextureSetMinFilter(t, SCE_GXM_TEXTURE_FILTER_POINT);
         sceGxmTextureSetMagFilter(t, SCE_GXM_TEXTURE_FILTER_POINT);
     }
+    // Textures decoded on the GPU (DecodeOnGpu): T8's and T4's pages too -
+    // each pixel's word in the page, and its byte (T8) or nibble (T4, 0-7)
+    // in the word. Without them, or a format's program, the CPU decodes.
+    u32* t8 = static_cast<u32*>(TakeGpu(128 * 64 * 4));
+    u32* t4 = static_cast<u32*>(TakeGpu(128 * 128 * 4));
+    if (t8 && t4) {
+        for (u32 y = 0; y < 128; ++y)
+            for (u32 x = 0; x < 128; ++x) {
+                u32 nibble = 0;
+                if (y < 64) {
+                    const u32 a = ps2host::gs::Memory::Address(0, 2, x, y, 0x13, &nibble), word = a / 4;
+                    t8[y * 128 + x] = (word & 0xFF) | ((word >> 8) << 8) | ((a % 4) << 16);
+                }
+                const u32 a = ps2host::gs::Memory::Address(0, 2, x, y, 0x14, &nibble), word = a / 4;
+                t4[y * 128 + x] = (word & 0xFF) | ((word >> 8) << 8) | (((a % 4) * 2 + nibble) << 16);
+            }
+        sceGxmTextureInitLinear(&forward_t8_, t8, SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR, 128, 64, 0);
+        sceGxmTextureInitLinear(&forward_t4_, t4, SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR, 128, 128, 0);
+        for (SceGxmTexture* t : {&forward_t8_, &forward_t4_}) {
+            sceGxmTextureSetMinFilter(t, SCE_GXM_TEXTURE_FILTER_POINT);
+            sceGxmTextureSetMagFilter(t, SCE_GXM_TEXTURE_FILTER_POINT);
+        }
+        for (int f = 0; f < kDecodeFormats; ++f) {
+            MemoryParams* params = nullptr;
+            if (MemoryProgram(kDecode | (u32(f) << 2), SCE_GXM_COLOR_MASK_ALL, false, &params))
+                gpu_decode_ok_ |= u8(1u << f);
+            else
+                std::fprintf(stderr, "[gxm] %s textures' decode program could not be had: decoded on the CPU\n",
+                             kDecodeFormatNames[f]);
+        }
+    } else {
+        GiveGpu(t8);
+        GiveGpu(t4);
+    }
     return true;
 }
 
@@ -1623,10 +1861,13 @@ SceGxmFragmentProgram* GxmGsRenderer::MemoryProgram(MemoryVariant variant, u8 ma
     auto found = memory_programs_.find(key);
     if (found != memory_programs_.end()) return found->second;
     SceGxmFragmentProgram* program = nullptr;
+    // A float out (a depth buffer's F32 surface, one channel) with no blend
+    // information at all: its colour mask was of four 8-bit channels, and
+    // the sixteenth run's depth reloads all came out wrong.
     const int r = sceGxmShaderPatcherCreateFragmentProgram(
         device_->patcher(), std::get<1>(gxp->second),
         float_out ? SCE_GXM_OUTPUT_REGISTER_FORMAT_FLOAT : SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4,
-        SCE_GXM_MULTISAMPLE_NONE, &blend, vertex_gxp_, &program);
+        SCE_GXM_MULTISAMPLE_NONE, float_out ? nullptr : &blend, vertex_gxp_, &program);
     if (r < 0) {
         std::fprintf(stderr, "[gxm] memory program %02X: sceGxmShaderPatcherCreateFragmentProgram %s\n",
                      unsigned(variant), Hex(r).c_str());
@@ -1637,10 +1878,11 @@ SceGxmFragmentProgram* GxmGsRenderer::MemoryProgram(MemoryVariant variant, u8 ma
 
 void GxmGsRenderer::MemoryPass(Target* into, MemoryVariant variant, u8 mask, bool float_out, const SceGxmTexture* t0,
                                const SceGxmTexture* t1, const float a[4], const float b[4], const float c[4],
-                               const PassRect* rects, int count) {
+                               const PassRect* rects, int count, const SceGxmTexture* t2) {
     MemoryParams* params = nullptr;
     SceGxmFragmentProgram* program = MemoryProgram(variant, mask, float_out, &params);
     if (!program || count <= 0) return;
+    const Activity step(HostLane::kGs, "GXM: a GS memory pass recorded");
     if (vertex_used_ + u32(count) * 6 * sizeof(GxmVertex) > kVertexRing) Idle();
     OpenScene(into, nullptr);
     if (!scene_open_) return;
@@ -1671,6 +1913,7 @@ void GxmGsRenderer::MemoryPass(Target* into, MemoryVariant variant, u8 mask, boo
     }
     if (t0) sceGxmSetFragmentTexture(ctx, 0, t0);
     if (t1) sceGxmSetFragmentTexture(ctx, 1, t1);
+    if (t2) sceGxmSetFragmentTexture(ctx, 2, t2);
     sceGxmSetVertexStream(ctx, 0, v);
     const int r = sceGxmDraw(ctx, SCE_GXM_PRIMITIVE_TRIANGLES, SCE_GXM_INDEX_FORMAT_U16, indices_, u32(count) * 6);
     if (r < 0) {
@@ -1740,10 +1983,11 @@ void GxmGsRenderer::FromMemory(Target* into, bool depth, u32 psm, u32 base, u32 
     Touch(first_page, pages, false);
     const float a[4] = {float(base % 512), float(bw), float(page_rows), 0.0f};
     const PassRect rect{0, float(first_row), float(width), float(end_row), 0, 0};
-    const MemoryVariant v =
-        kFromMemory | (depth ? kMemDepth : 0u) | (sixteen ? kMem16 : 0u) | (twenty_four ? kMem24 : 0u);
-    MemoryPass(into, v, SCE_GXM_COLOR_MASK_ALL, depth, &memory_target_.texture, &forward_[LayoutOf(psm)], a, a, a,
-               &rect, 1);
+    const bool bits = depth && depth_bits_;
+    const MemoryVariant v = kFromMemory | (depth ? kMemDepth : 0u) | (sixteen ? kMem16 : 0u) |
+                            (twenty_four ? kMem24 : 0u) | (bits ? kMemBits : 0u);
+    MemoryPass(into, v, SCE_GXM_COLOR_MASK_ALL, depth && !bits, &memory_target_.texture, &forward_[LayoutOf(psm)],
+               a, a, a, &rect, 1);
     ++g_memory_stats.from_memory;
 }
 
@@ -1756,6 +2000,7 @@ void GxmGsRenderer::SyncCopy(u32 begin, u32 end) {
             wait |= touched_[i] != 0;
         }
     if (!behind) return;
+    const Activity step(HostLane::kGs, "GS memory: read back from the GPU's copy");
     const u64 from = WaitClock();
     if (wait) {
         Idle();
@@ -1815,6 +2060,7 @@ void GxmGsRenderer::Staged(u32 begin, u32 end, const u8* bytes) {
 void GxmGsRenderer::MemoryWrite(u32 begin, u32 end, const u8* bytes) {
     end = std::min(end, 16384u);
     if (end <= begin) return;
+    const Activity step(HostLane::kGs, "GS memory: sent to the GPU's copy");
     // The CPU's copy; the blocks are the CPU's now, whatever the GPU wrote.
     std::memcpy(memory_.data() + std::size_t(begin) * 256, bytes, std::size_t(end - begin) * 256);
     if (cpu_memory_) return;
@@ -1970,7 +2216,7 @@ bool GxmGsRenderer::DepthToMemory(u32 zbp, u32 width, u32 height, u32 fbw, u32 z
 }
 
 void GxmGsRenderer::DepthRowsFromMemory(u32 zbp, u32 width, u32 height, u32 fbw, u32 zpsm, u32 first_row, u32 rows) {
-    if (!cpu_memory_ && !depth_on_cpu_) {
+    if (!cpu_memory_ && !depth_on_cpu_ && !depth_reload_cpu_) {
         Flush();
         Depth* d = DepthFor(zbp, width, height);
         if (!d) return;
@@ -1978,9 +2224,12 @@ void GxmGsRenderer::DepthRowsFromMemory(u32 zbp, u32 width, u32 height, u32 fbw,
         if (first_row >= last) return;
         // A scene of its own (ending the one it is in: the store at that
         // one's end comes first), the next draw's loading what it wrote.
-        FromMemory(&d->as_colour, true, zpsm, zbp, fbw, d->width, first_row, last);
+        FromMemory(DepthTarget(d), true, zpsm, zbp, fbw, d->width, first_row, last);
+        ++g_memory_stats.depth_gpu;
         return;
     }
+    const Activity step(HostLane::kGs, "a depth buffer from GS memory on the CPU");
+    const u64 cpu_from = WaitClock();
     Idle();
     Depth* d = DepthFor(zbp, width, height);
     if (!d) return;
@@ -2000,6 +2249,8 @@ void GxmGsRenderer::DepthRowsFromMemory(u32 zbp, u32 width, u32 height, u32 fbw,
             out[x] = float(double(z) / 4294967296.0);
         }
     }
+    ++g_memory_stats.depth_cpu;
+    g_memory_stats.depth_cpu_ns += WaitClock() - cpu_from;
 }
 
 void GxmGsRenderer::DepthFromMemory(u32 zbp, u32 width, u32 height, u32 fbw, u32 zpsm) {
@@ -2008,50 +2259,16 @@ void GxmGsRenderer::DepthFromMemory(u32 zbp, u32 width, u32 height, u32 fbw, u32
 
 // ---------------------------------------------------------------- textures and CLUTs from memory
 
-int Wrap(int i, u32 size, u32 mode, u32 lo, u32 hi) {
-    if (mode == 0) return int(u32(i) & (size - 1));
-    if (mode == 1) return std::clamp(i, 0, int(size) - 1);
-    if (mode == 2) return std::clamp(i, int(lo), int(hi));
-    return int((u32(i) & lo) | hi);
-}
-
-/* A texel as the host's software GS reads one (TexelAt): wrapped by CLAMP's
-   mode, read in its format, expanded by TEXA or the CLUT. */
-u32 GxmGsRenderer::TexelAt(const GsTextureDecode& d, int iu, int iv, int n) const {
-    using namespace ps2host::gs;
-    u32 raw;
-    if (n == 0) {
-        const int u = Wrap(iu, d.tw, d.wms, d.minu, d.maxu), v = Wrap(iv, d.th, d.wmt, d.minv, d.maxv);
-        raw = memory_.Read(d.tbp, d.tbw, u32(u) & 2047, u32(v) & 2047, d.psm);
-    } else {
-        const u32 w = std::max(1u, d.tw >> n), h = std::max(1u, d.th >> n);
-        const int u = std::clamp(Wrap(iu, w, d.wms, d.minu >> n, d.maxu >> n), 0, int(w) - 1);
-        const int v = std::clamp(Wrap(iv, h, d.wmt, d.minv >> n, d.maxv >> n), 0, int(h) - 1);
-        raw = memory_.Read(d.level_tbp[n], std::max(1u, d.level_tbw[n]), u32(u), u32(v), d.psm);
-    }
-    const u32 ta0 = d.texa_lo & 0xFF;
-    const bool aem = (d.texa_lo & 0x8000u) != 0;
-    const u32* clut = d.clut ? d.clut : clut_;
-    switch (d.psm) {
-        case PSMCT32: case PSMZ32: return raw;
-        case PSMCT24: case PSMZ24: {
-            const u32 rgb = raw & 0xFFFFFF;
-            return rgb | ((aem && !rgb) ? 0u : ta0) << 24;
-        }
-        case PSMCT16: case PSMCT16S: case PSMZ16: case PSMZ16S: {
-            const u32 a = (raw & 0x8000u) ? d.ta1 : ((aem && !(raw & 0x7FFFu)) ? 0u : ta0);
-            return ((raw & 31u) << 3) | (((raw >> 5) & 31u) << 11) | (((raw >> 10) & 31u) << 19) | (a << 24);
-        }
-        case PSMT8: case PSMT8H: return clut[raw & 0xFF];
-        case PSMT4: case PSMT4HL: case PSMT4HH: return clut[(d.csa * 16 + (raw & 15)) & 0xFF];
-        default: return raw;
-    }
-}
-
 void GxmGsRenderer::TextureFromMemory(u64 key, const GsTextureDecode& d) {
     // Mipmap levels below level 0 at the image's left edge, as the GPU's
     // decode lays them out (TW wide, as tall as all of them).
     const u32 levels = std::max(1u, std::min(d.levels, 7u));
+    // On the GPU, from its copy of memory, where it can: no wait for it, and
+    // nothing read back (the race's glow and crash textures, decoded every
+    // picture from what the GPU drew, were most of the GS thread's time).
+    if (!cpu_memory_ && DecodeOnGpu(key, d, levels)) return;
+    const Activity step(HostLane::kGs, "a texture decoded from GS memory on the CPU");
+    const u64 cpu_from = WaitClock();
     // Decoded by the CPU from its copy: the blocks each level reads (to its
     // last page, the region modes' reach included) brought up to date first.
     if (!cpu_memory_)
@@ -2070,17 +2287,235 @@ void GxmGsRenderer::TextureFromMemory(u64 key, const GsTextureDecode& d) {
             // (Address wraps at 4 MB: a level past the end reads from 0 on.)
             SyncCopyWrapped(tbp, last >= tbp ? last + 32 : last + 32 + 16384);
         }
+    // A row at a time (gs::DecodeTexture): texel by texel it was most of the
+    // GS thread's time in a race on the Vita.
+    ps2host::gs::TextureView view;
+    view.tbp = d.tbp, view.tbw = d.tbw, view.psm = d.psm, view.tw = d.tw, view.th = d.th;
+    view.wms = d.wms, view.wmt = d.wmt, view.minu = d.minu, view.maxu = d.maxu, view.minv = d.minv, view.maxv = d.maxv;
+    view.texa_lo = d.texa_lo, view.ta1 = d.ta1, view.csa = d.csa, view.levels = levels;
+    for (u32 n = 0; n < 7; ++n) view.level_tbp[n] = d.level_tbp[n], view.level_tbw[n] = d.level_tbw[n];
+    const u32 height = ps2host::gs::DecodedHeight(view);
+    decoded_.assign(std::size_t(d.tw) * height, 0);
+    ps2host::gs::DecodeTexture(memory_, view, d.clut ? d.clut : clut_, decoded_.data());
+    UploadTexture(key, decoded_.data(), d.tw, height);
+    ++g_memory_stats.cpu_decodes;
+    g_memory_stats.cpu_decode_ns += WaitClock() - cpu_from;
+}
+
+u32 RoundUpPow2(u32 n) {
+    u32 p = 1;
+    while (p < n) p <<= 1;
+    return p;
+}
+
+bool GxmGsRenderer::DecodeOnGpu(u64 key, const GsTextureDecode& d, u32 levels) {
+    const int f = DecodeFormat(d.psm);
+    if (f < 0 || !((gpu_decode_ok_ >> f) & 1) || d.clut) return false;
+    // REGION_CLAMP and REGION_REPEAT: the CPU's (their reach is its own).
+    if (d.wms > 1 || d.wmt > 1 || d.tw > 1024 || d.th > 1024) return false;
     u32 height = 0;
     for (u32 n = 0; n < levels; ++n) height += std::max(1u, d.th >> n);
-    std::vector<u32> pixels(std::size_t(d.tw) * height, 0);
+    if (height > kMaxSide) return false;
+    const bool palettized = f >= 3;
+    if (palettized) {
+        UseClut();
+        if (!clut_pixels_) return false;
+    }
+    const Activity step(HostLane::kGs, "a texture decoded from GS memory on the GPU (recorded)");
+    Flush();
+    Texture& t = textures_[key];
+    if (t.pixels) Release(t.pixels);
+    t.width = d.tw;
+    t.height = height;
+    t.stride = (d.tw + 7) & ~7u;
+    t.pixels = static_cast<u32*>(TakeGpu(t.stride * t.height * 4));
+    if (!t.pixels) {
+        Idle();
+        t.pixels = static_cast<u32*>(TakeGpu(t.stride * t.height * 4));
+        if (!t.pixels) {
+            textures_.erase(key);
+            return false;
+        }
+    }
+    sceGxmTextureInitLinear(&t.texture, t.pixels, SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR, t.width, t.height, 0);
+    t.on_gpu = true;
+    // The texture's memory as a target, for its scene alone (ended below:
+    // this target lives no longer than the call), with a stand-in depth
+    // buffer of a size many share.
+    Target into;
+    into.fbp = ~0u;
+    into.width = t.width;
+    into.height = t.height;
+    into.stride = t.stride;
+    into.pixels = t.pixels;
+    sceGxmColorSurfaceInit(&into.surface, SCE_GXM_COLOR_FORMAT_A8B8G8R8, SCE_GXM_COLOR_SURFACE_LINEAR,
+                           SCE_GXM_COLOR_SURFACE_SCALE_NONE, SCE_GXM_OUTPUT_REGISTER_SIZE_32BIT, t.width, t.height,
+                           t.stride, t.pixels);
+    OpenScene(&into, Dummy(RoundUpPow2(std::max(t.width, 64u)), RoundUpPow2(std::max(t.height, 64u))));
+    if (!scene_open_) {
+        textures_.erase(key);           // (its memory goes back at the next finish)
+        Release(t.pixels);
+        return false;
+    }
+    const bool t8_t4 = f == 3 || f == 4;
+    const SceGxmTexture* layout = f == 3 ? &forward_t8_ : f == 4 ? &forward_t4_
+                                         : &forward_[LayoutOf(f >= 5 ? 0x00u : d.psm)];
+    const float page_rows = f == 2 || f == 3 ? 64.0f : f == 4 ? 128.0f : 32.0f;
+    const float page_cols = t8_t4 ? 128.0f : 64.0f;
     u32 row = 0;
     for (u32 n = 0; n < levels; ++n) {
         const u32 w = std::max(1u, d.tw >> n), h = std::max(1u, d.th >> n);
-        for (u32 v = 0; v < h; ++v)
-            for (u32 u = 0; u < w; ++u) pixels[std::size_t(row + v) * d.tw + u] = TexelAt(d, int(u), int(v), int(n));
+        const u32 tbp = n ? d.level_tbp[n] : d.tbp, tbw = n ? std::max(1u, d.level_tbw[n]) : d.tbw;
+        const u32 per_row = std::max(1u, t8_t4 ? tbw / 2 : tbw);
+        const float a[4] = {float(tbp * 64), float(per_row), page_rows, page_cols};
+        const float b[4] = {float(row), float(d.csa * 16), float(d.texa_lo & 0xFF), float(d.ta1)};
+        const float c[4] = {float((d.texa_lo >> 15) & 1), 0.0f, 0.0f, 0.0f};
+        const PassRect rect{0, float(row), float(w), float(row + h), 0, 0};
+        MemoryPass(&into, kDecode | (u32(f) << 2), SCE_GXM_COLOR_MASK_ALL, false, &memory_target_.texture, layout, a,
+                   b, c, &rect, 1, palettized ? &clut_texture_ : nullptr);
+        // The pages it reads, for the CPU's writes there to come after it.
+        u32 nibble = 0;
+        const u32 last = ps2host::gs::Memory::Address(tbp, n ? tbw : std::max(1u, tbw), w - 1, h - 1, d.psm, &nibble) / 256;
+        const u32 first_page = tbp / 32, last_page = (last >= tbp ? last : last + 16384) / 32;
+        Touch(first_page, last_page - first_page + 1, false);
         row += h;
     }
-    UploadTexture(key, pixels.data(), d.tw, height);
+    CloseScene();
+    ++g_memory_stats.gpu_decodes;
+    return true;
+}
+
+void GxmGsRenderer::SelfCheck() {
+    // Patterns in pages 0-127 of both copies (nothing is recorded yet), and
+    // a CLUT of its own.
+    const u32 bytes = 128u * 8192u;
+    u32 seed = 0x5EED;
+    auto next = [&] { return seed = seed * 1664525u + 1013904223u; };
+    for (u32 i = 0; i < bytes; i += 4) {
+        const u32 v = next();
+        std::memcpy(memory_.data() + i, &v, 4);
+    }
+    std::memcpy(memory_target_.pixels, memory_.data(), bytes);
+    for (u32& c : clut_) c = next();
+    clut_changed_ = true;
+    static const u32 kPsms[kDecodeFormats] = {0x00, 0x01, 0x0A, 0x13, 0x14, 0x1B, 0x24, 0x2C};
+    GsTextureDecode views[kDecodeFormats];
+    for (int f = 0; f < kDecodeFormats; ++f) {
+        GsTextureDecode& d = views[f];
+        d.psm = kPsms[f];
+        d.tbp = 37 + u32(f) * 211;          // not on a page: the GS adds a page's offsets to any block
+        d.tbw = 2;
+        d.tw = 64;
+        d.th = 32;
+        d.levels = 2;
+        d.level_tbp[1] = d.tbp + 1500;
+        d.level_tbw[1] = 1;
+        d.texa_lo = 0x8040;                 // AEM, TA0 0x40
+        d.ta1 = 0x7F;
+        d.csa = 19;                         // past the first 256 entries' rows: wraps
+        if ((gpu_decode_ok_ >> f) & 1) DecodeOnGpu(~0ull - u64(f), d, 2);
+    }
+    Idle();
+    std::string report;
+    for (int f = 0; f < kDecodeFormats; ++f) {
+        if (!((gpu_decode_ok_ >> f) & 1)) continue;
+        const GsTextureDecode& d = views[f];
+        ps2host::gs::TextureView view;
+        view.tbp = d.tbp, view.tbw = d.tbw, view.psm = d.psm, view.tw = d.tw, view.th = d.th;
+        view.texa_lo = d.texa_lo, view.ta1 = d.ta1, view.csa = d.csa, view.levels = d.levels;
+        for (u32 n = 0; n < 7; ++n) view.level_tbp[n] = d.level_tbp[n], view.level_tbw[n] = d.level_tbw[n];
+        std::vector<u32> want(std::size_t(d.tw) * ps2host::gs::DecodedHeight(view), 0);
+        ps2host::gs::DecodeTexture(memory_, view, clut_, want.data());
+        u32 wrong = 0, first_got = 0, first_want = 0;
+        auto found = textures_.find(~0ull - u64(f));
+        if (found == textures_.end() || !found->second.on_gpu) {
+            wrong = ~0u;
+        } else {
+            const Texture& t = found->second;
+            u32 row = 0;
+            for (u32 n = 0; n < d.levels; ++n) {
+                const u32 w = std::max(1u, d.tw >> n), h = std::max(1u, d.th >> n);
+                for (u32 y = row; y < row + h; ++y)
+                    for (u32 x = 0; x < w; ++x) {
+                        const u32 got = t.pixels[std::size_t(y) * t.stride + x], is = want[std::size_t(y) * d.tw + x];
+                        if (got != is && wrong++ == 0) first_got = got, first_want = is;
+                    }
+                row += h;
+            }
+            ReleaseTexture(found->first);
+        }
+        char text[128];
+        if (wrong) {
+            gpu_decode_ok_ &= u8(~(1u << f));
+            if (wrong == ~0u) std::snprintf(text, sizeof text, "%s not made", kDecodeFormatNames[f]);
+            else
+                std::snprintf(text, sizeof text, "%s %u texels wrong (%08X for %08X): on the CPU", kDecodeFormatNames[f],
+                              unsigned(wrong), unsigned(first_got), unsigned(first_want));
+        } else {
+            std::snprintf(text, sizeof text, "%s ok", kDecodeFormatNames[f]);
+        }
+        report += (report.empty() ? "" : ", ") + std::string(text);
+    }
+    std::fprintf(stderr, "[gxm] textures decoded on the GPU, checked: %s\n", report.empty() ? "none" : report.c_str());
+    // A depth buffer reloaded from memory (Z32, Z24, Z16) against the CPU's
+    // reading of the same words, exactly (the CPU's float of Z / 2^32): the
+    // F32 surface's way first, then the bytes' (kMemBits), else the CPU's.
+    if (!depth_on_cpu_ && !depth_reload_cpu_) {
+        static const u32 kZ[3] = {0x30, 0x31, 0x32};
+        std::string depth_report;
+        bool good = false;
+        for (int way = 0; way < 2 && !good; ++way) {
+            if (way == 0 && !depth_f32_ok_) continue;
+            if (way == 1 && !depth_bits_ok_) continue;
+            depth_bits_ = way == 1;
+            good = true;
+            for (u32 z : kZ) {
+                const u32 zbp = 0x40;               // pages 64-65: in the pattern
+                Depth* dd = DepthFor(zbp, 64, 32);
+                if (!dd) {
+                    good = false;
+                    break;
+                }
+                std::memset(dd->depth, 0xFF, std::size_t(dd->stride) * 32 * 4);    // (NaNs: what is not written shows)
+                FromMemory(DepthTarget(dd), true, z, zbp, 1, 64, 0, 32);
+                Idle();
+                u32 wrong = 0;
+                float first_got = 0, first_want = 0;
+                for (u32 y = 0; y < 32; ++y)
+                    for (u32 x = 0; x < 64; ++x) {
+                        u32 raw = memory_.Read(zbp * 32, 1, x, y, z);
+                        if (z == 0x31) raw &= 0xFFFFFFu;
+                        const float want = float(double(raw) / 4294967296.0), got = dd->depth[std::size_t(y) * dd->stride + x];
+                        if (std::memcmp(&got, &want, 4) != 0 && wrong++ == 0) first_got = got, first_want = want;
+                    }
+                char text[160];
+                const char* name = z == 0x30 ? "32" : z == 0x31 ? "24" : "16";
+                if (wrong)
+                    std::snprintf(text, sizeof text, "%s Z%s %u of 2048 wrong (%.9g for %.9g)", way ? "bytes" : "F32",
+                                  name, unsigned(wrong), double(first_got), double(first_want));
+                else
+                    std::snprintf(text, sizeof text, "%s Z%s ok", way ? "bytes" : "F32", name);
+                depth_report += (depth_report.empty() ? "" : ", ") + std::string(text);
+                if (wrong) good = false;
+            }
+            auto found = depths_.find(0x40);
+            if (found != depths_.end()) {
+                GiveGpu(found->second.depth);
+                GiveGpu(found->second.stencil);
+                depths_.erase(found);
+            }
+        }
+        if (!good) depth_reload_cpu_ = true;
+        std::fprintf(stderr, "[gxm] depth reloaded on the GPU, checked: %s%s\n", depth_report.c_str(),
+                     depth_reload_cpu_ ? " - depth buffers from memory on the CPU"
+                     : depth_bits_ ? " - as its floats' bytes" : " - into its F32 surface");
+    }
+    // Memory and the CLUT as they were.
+    std::memset(memory_.data(), 0, bytes);
+    std::memset(memory_target_.pixels, 0, bytes);
+    std::fill(gpu_wrote_.begin(), gpu_wrote_.end(), u8(0));
+    for (u32& c : clut_) c = 0;
+    clut_changed_ = true;
 }
 
 void GxmGsRenderer::ClutFromMemory(const GsClutLoad& load) {
@@ -2090,6 +2525,7 @@ void GxmGsRenderer::ClutFromMemory(const GsClutLoad& load) {
     const u32 count = load.eight ? 256 : 16;
     const u32 ta0 = load.texa_lo & 0xFF;
     const bool aem = (load.texa_lo & 0x8000u) != 0;
+    const Activity step(HostLane::kGs, "a CLUT from GS memory on the CPU");
     if (!cpu_memory_) SyncCopyWrapped(load.cbp, load.cbp + 8);       // (the bridge's reach for a CLUT)
     for (u32 i = 0; i < count; ++i) {
         u32 x, y;
@@ -2144,18 +2580,21 @@ void SetGpuWaitObserver(GpuWaitObserver observer) { g_wait_observer = observer; 
 std::uint64_t GpuBusyNanoseconds() { return 0; }
 std::string GpuProfileReport() { return ""; }
 std::string RendererCounters() {
-    char text[640];
+    char text[1024];
     const GxmMemoryStats& m = g_memory_stats;
     std::snprintf(text, sizeof text,
                   "%llu draws, %llu scenes, %llu waits for the GPU; GS memory: %llu passes, %llu images in, %llu out, "
                   "blocks from the CPU %llu straight, %llu through the ring, to the CPU %llu (%.1f ms, %llu waits), "
-                  "%llu patches; ms in BeginScene %.1f, EndScene %.1f, Finish %.1f",
+                  "%llu patches; ms in BeginScene %.1f, EndScene %.1f, Finish %.1f; textures from memory %llu on the "
+                  "GPU, %llu on the CPU (%.1f ms); depth buffers from memory %llu on the GPU, %llu on the CPU (%.1f ms)",
                   (unsigned long long)g_draws, (unsigned long long)g_scenes, (unsigned long long)g_waits,
                   (unsigned long long)m.passes, (unsigned long long)m.to_memory, (unsigned long long)m.from_memory,
                   (unsigned long long)m.direct_blocks, (unsigned long long)m.staged_blocks,
                   (unsigned long long)m.read_blocks, double(m.read_ns) / 1e6, (unsigned long long)m.waits,
                   (unsigned long long)m.patches, double(m.begin_ns) / 1e6, double(m.end_ns) / 1e6,
-                  double(m.finish_ns) / 1e6);
+                  double(m.finish_ns) / 1e6, (unsigned long long)m.gpu_decodes, (unsigned long long)m.cpu_decodes,
+                  double(m.cpu_decode_ns) / 1e6, (unsigned long long)m.depth_gpu, (unsigned long long)m.depth_cpu,
+                  double(m.depth_cpu_ns) / 1e6);
     g_draws = g_scenes = g_waits = 0;
     g_memory_stats = GxmMemoryStats{};
     return text;

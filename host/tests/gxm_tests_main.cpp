@@ -299,6 +299,67 @@ int GpuMemoryTests(ps2gpu::GsRenderer& renderer) {
         check(!back.empty() && wrong == 0, "...and one loaded after it has the new bytes");
         check(differ() == 0, "GS memory as the CPU wrote it, after the ring");
     }
+    // Textures decoded from memory (TextureFromMemory: on the GPU where it
+    // can, else the CPU) as the GS reads them: every format, pages not
+    // aligned, mipmap levels, CSA past the first 256 entries, TEXA's alpha;
+    // REGION_CLAMP and REGION_REPEAT on the CPU's way.
+    {
+        const u32 from = 0x2000, blocks = 4096;         // a megabyte of new bytes
+        for (u32 i = from * 256; i < (from + blocks) * 256; ++i) reference.data()[i] = u8(next() >> 24);
+        renderer.MemoryWrite(from, from + blocks, reference.data() + from * 256);
+        std::vector<u32> clut(256);
+        for (u32& c : clut) c = next();
+        renderer.ClutRows(clut.data(), 0xFFFF);
+        struct Shape { u32 tw, th, tbw, levels, wms; const char* name; };
+        const Shape shapes[] = {{64, 64, 2, 1, 0, "64x64"}, {256, 128, 4, 3, 1, "256x128, 3 levels"},
+                                {32, 16, 1, 2, 0, "32x16, 2 levels"}, {128, 64, 2, 1, 2, "128x64, REGION_CLAMP"}};
+        const u32 psms[] = {PSMCT32, PSMCT24, PSMCT16, PSMCT16S, PSMT8, PSMT4, PSMT8H, PSMT4HL, PSMT4HH,
+                            PSMZ32, PSMZ24, PSMZ16, PSMZ16S};
+        u64 key = 0x7E57000000000000ull;
+        for (const Shape& shape : shapes)
+            for (u32 psm : psms) {
+                ps2gpu::GsTextureDecode d;
+                d.tbp = from + 5 + (next() >> 20) % 1500;
+                d.tbw = shape.tbw;
+                d.psm = psm;
+                d.tw = shape.tw;
+                d.th = shape.th;
+                d.wms = d.wmt = shape.wms;
+                d.minu = 3, d.maxu = 40, d.minv = 2, d.maxv = 30;
+                d.texa_lo = 0x8030;
+                d.ta1 = 0x70;
+                d.csa = (next() >> 8) % 32;
+                d.levels = shape.levels;
+                for (u32 n = 1; n < 7; ++n) d.level_tbp[n] = from + 100 + (next() >> 20) % 2000, d.level_tbw[n] = 1;
+                renderer.TextureFromMemory(++key, d);
+                std::vector<u32> got;
+                u32 gw = 0, gh = 0;
+                const bool read = renderer.ReadTexture(key, &got, &gw, &gh);
+                ps2host::gs::TextureView view;
+                view.tbp = d.tbp, view.tbw = d.tbw, view.psm = d.psm, view.tw = d.tw, view.th = d.th;
+                view.wms = d.wms, view.wmt = d.wmt, view.minu = d.minu, view.maxu = d.maxu;
+                view.minv = d.minv, view.maxv = d.maxv;
+                view.texa_lo = d.texa_lo, view.ta1 = d.ta1, view.csa = d.csa, view.levels = d.levels;
+                for (u32 n = 0; n < 7; ++n) view.level_tbp[n] = d.level_tbp[n], view.level_tbw[n] = d.level_tbw[n];
+                const u32 height = ps2host::gs::DecodedHeight(view);
+                std::vector<u32> want(std::size_t(d.tw) * height, 0);
+                ps2host::gs::DecodeTexture(reference, view, clut.data(), want.data());
+                u32 wrong = 0, row = 0;
+                for (u32 n = 0; n < d.levels && read && gw == d.tw && gh == height; ++n) {
+                    const u32 w = std::max(1u, d.tw >> n), h = std::max(1u, d.th >> n);
+                    for (u32 y = row; y < row + h; ++y)
+                        for (u32 x = 0; x < w; ++x) wrong += got[std::size_t(y) * gw + x] != want[std::size_t(y) * d.tw + x];
+                    row += h;
+                }
+                char what[160];
+                std::snprintf(what, sizeof what, "texture %02X %s decoded from memory as the GS reads it (%u texels wrong%s)",
+                              unsigned(psm), shape.name, unsigned(wrong), read ? "" : ", not made");
+                check(read && gw == d.tw && gh == height && wrong == 0, what);
+                renderer.ReleaseTexture(key);
+            }
+        renderer.Kick();
+        std::printf("textures: %s\n", ps2gpu::RendererCounters().c_str());
+    }
     // What it costs: a 640 x 448 target into memory and back, a hundred
     // times, the GPU finishing at the end; and 1 MB back to the CPU.
     {

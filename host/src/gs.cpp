@@ -12,6 +12,7 @@
 
 #include "ps2host/gs.h"
 #include "ps2host/profile.h"
+#include "ps2host/run.h"
 #include "ps2host/dma.h"
 
 #include <algorithm>
@@ -361,6 +362,7 @@ void Gs::Transfer(u64 low, u64 high) {
 
 void Gs::TransferBlock(const u8* data, u32 qwords) {
     if (!trx_active_) return;
+    const Activity step(HostLane::kGs, "GS memory: an image transfer");
     Finish();                                   // the draws before it land first
     uploads_ += qwords;
     const u32 dbp = Bits(bitbltbuf_, 32, 14), dbw = Bits(bitbltbuf_, 48, 6), psm = Bits(bitbltbuf_, 56, 6);
@@ -420,6 +422,7 @@ void Gs::TransferBlock(const u8* data, u32 qwords) {
 void Gs::LocalToLocal() {
     Finish();
     Timed timed(Section::GsUpload);
+    const Activity step(HostLane::kGs, "GS memory: a local-to-local copy");
     ++uploads_;
     const u32 sbp = Bits(bitbltbuf_, 0, 14), sbw = Bits(bitbltbuf_, 16, 6), spsm = Bits(bitbltbuf_, 24, 6);
     const u32 dbp = Bits(bitbltbuf_, 32, 14), dbw = Bits(bitbltbuf_, 48, 6), dpsm = Bits(bitbltbuf_, 56, 6);
@@ -455,6 +458,7 @@ void Gs::LoadClut(u64 tex0) {
     if (cld == 2 || cld == 4) cbp0_ = cbp;
     if (cld == 3 || cld == 5) cbp1_ = cbp;
     if (!load) return;
+    const Activity step(HostLane::kGs, "GS memory: a CLUT load");
     Finish();                                   // the CLUT may have been drawn
     ++clut_loads_;
     if (on_clut_load && on_clut_load(tex0, texa_)) return;

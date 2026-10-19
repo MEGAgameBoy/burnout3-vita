@@ -65,6 +65,29 @@ private:
     std::vector<u8> bytes_;
 };
 
+/* A texture as the GS samples it, for decoding whole (the GXM renderer's
+   textures): TEX0's TBP, TBW, PSM, TW and TH, CLAMP's modes and region, TEXA
+   (TA0, and AEM at bit 15 of texa_lo; TA1), CSA, and the mipmap levels -
+   level n from level_tbp[n] and level_tbw[n]. */
+struct TextureView {
+    u32 tbp = 0, tbw = 1, psm = 0, tw = 1, th = 1;
+    u32 wms = 0, wmt = 0, minu = 0, maxu = 0, minv = 0, maxv = 0;
+    u32 texa_lo = 0, ta1 = 0, csa = 0;
+    u32 levels = 1;
+    u32 level_tbp[7] = {}, level_tbw[7] = {};
+};
+/* Texel (u, v) of level n, RGBA with the GS's alpha: wrapped by CLAMP's
+   modes, read in its format, expanded by TEXA or the 256-entry CLUT. One at
+   a time - the reference DecodeTexture is checked against. */
+u32 DecodeTexel(const Memory& memory, const TextureView& view, const u32* clut, int u, int v, int n);
+/* The rows a whole decode takes: every level's (up to 7), one below the
+   other at the image's left edge, TW wide. */
+u32 DecodedHeight(const TextureView& view);
+/* Every level into `pixels` (TW by DecodedHeight; what lies right of a
+   smaller level is left as it was), as DecodeTexel each but a row at a time:
+   the wrap of each column worked out once a level, the page once a row. */
+void DecodeTexture(const Memory& memory, const TextureView& view, const u32* clut, u32* pixels);
+
 struct Vertex {
     float x = 0, y = 0;         // pixels, after XYOFFSET
     u32 z = 0;

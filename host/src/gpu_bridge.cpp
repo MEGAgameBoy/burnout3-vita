@@ -383,7 +383,9 @@ void MarkStale(Owned& o, int why, u32 b0 = 0, u32 b1 = ~0u, const Pages* pages =
 struct TimelineStep {
     const char* name;
     u64 from;
-    explicit TimelineStep(const char* what) : name(what), from(timeline::On() ? timeline::Now() : 0) {}
+    Activity lane;              // the GS thread's step, for the sampler (the frame line's "GS thread's time")
+    explicit TimelineStep(const char* what)
+        : name(what), from(timeline::On() ? timeline::Now() : 0), lane(HostLane::kGs, what) {}
     ~TimelineStep() {
         if (from) timeline::Span(name, from, timeline::Now());
     }
@@ -970,10 +972,16 @@ u64 CachedTexture(Bridge& b, const gs::Context& c, u64 texa, u32 tw, u32 th) {
                 ++dumped;
             }
         }
-        if (std::getenv("PS2HOST_GPU_COUNT")) {
-            char key[96];
-            std::snprintf(key, sizeof key, "psm %02X tbp %04X tbw %u %ux%u clutrows %d", unsigned(psm), unsigned(tbp),
-                          unsigned(tbw), unsigned(tw), unsigned(th), int((clut_rows & ~b.clut_cpu) != 0));
+#ifdef __vita__
+        static const bool count_kinds = true;       // (the Vita's frame line: what its CPU decodes)
+#else
+        static const bool count_kinds = std::getenv("PS2HOST_GPU_COUNT") != nullptr;
+#endif
+        if (count_kinds) {
+            char key[112];
+            std::snprintf(key, sizeof key, "psm %02X tbp %04X tbw %u %ux%u%s%s", unsigned(psm), unsigned(tbp),
+                          unsigned(tbw), unsigned(tw), unsigned(th), gpu_holds_now ? " (GPU-drawn)" : "",
+                          (clut_rows & ~b.clut_cpu) ? " (the GPU's CLUT)" : "");
             ++g_decode_kinds[key];
         }
         t.decoded_serial = b.serial;
@@ -1241,6 +1249,7 @@ void OnDraw(const gs::Gs::DrawCall& call) {
     }
     fast.valid = false;
     timed.emplace(Section::GpuBridge);
+    const Activity bookkeeping(HostLane::kGs, "the bridge: a draw's state worked out");
     if (s.primary && s.Dumping()) {
         const auto key = std::make_tuple(state.fbp, state.fbw, state.psm);
         if (key != s.last_target) {
@@ -1743,6 +1752,7 @@ void GpuShadowFrame(u64 frame, const std::string& dump_dir) {
         // rather than when something next waits on the GPU.
         {
             Timed timed(Section::GpuRender);
+            const Activity kick(HostLane::kGs, "the renderer: a frame's end");
             s.renderer->Kick();
         }
         if (frame % 100 == 0) {
@@ -1755,8 +1765,16 @@ void GpuShadowFrame(u64 frame, const std::string& dump_dir) {
                          static_cast<unsigned long long>(s.owned.size()), static_cast<unsigned long long>(s.textures.size()));
 #ifdef __vita__
             // The GXM renderer's own (scenes, waits for the GPU, GS memory's
-            // passes), for these 100 frames.
+            // passes), for these 100 frames; and the textures it decoded most.
             std::fprintf(stderr, "[gpu]   GXM: %s\n", ps2gpu::RendererCounters().c_str());
+            std::vector<std::pair<u64, std::string>> kinds;
+            for (const auto& [k, n] : g_decode_kinds) kinds.emplace_back(n, k);
+            std::sort(kinds.rbegin(), kinds.rend());
+            std::string decoded;
+            for (std::size_t i = 0; i < kinds.size() && i < 6; ++i)
+                decoded += (i ? "; " : "") + std::to_string(kinds[i].first) + "x " + kinds[i].second;
+            if (!decoded.empty()) std::fprintf(stderr, "[gpu]   decoded most: %s\n", decoded.c_str());
+            g_decode_kinds.clear();
 #endif
         }
         if (frame % 300 == 0 && std::getenv("PS2HOST_GPU_PROFILE"))
