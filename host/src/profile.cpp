@@ -513,6 +513,8 @@ void InstallCrashReport() { SetUnhandledExceptionFilter(CrashFilter); }
 
 std::string SampleWindow(int) { return ""; }
 
+std::string SampleGsWindow(int) { return ""; }
+
 #else
 
 void InstallCrashReport() {}
@@ -527,11 +529,12 @@ struct Published {
     std::thread thread;
     std::mutex mutex;
     struct Key {
-        int kind;                   // 0 a section, 1 an activity, 2 a guest function
+        int kind;                   // 0 a section, 1 an activity, 2 a guest function, 3 the GS thread's activity
         std::uintptr_t value;
         bool operator<(const Key& o) const { return kind != o.kind ? kind < o.kind : value < o.value; }
     };
     std::map<Key, std::uint64_t> window, total;
+    std::map<Key, std::uint64_t> gs_window;     // the GS thread's, beside
 };
 
 Published& ThePublished() {
@@ -541,6 +544,8 @@ Published& ThePublished() {
 
 std::string Label(const Published::Key& key) {
     if (key.kind == 0) return kSectionNames[key.value];
+    if (key.kind == 3)              // the GS thread's: whole (its steps say "sync: ..."), or none set
+        return key.value ? reinterpret_cast<const char*>(key.value) : "the GS thread, outside its named steps";
     if (key.kind == 1) {
         // The activity's head: "idle: every guest thread waits ..." is "idle".
         std::string text = reinterpret_cast<const char*>(key.value);
@@ -592,9 +597,11 @@ void StartSampler() {
             if (section >= 0) key = {0, std::uintptr_t(section)};
             else if (activity) key = {1, reinterpret_cast<std::uintptr_t>(activity)};
             else key = {2, g_sampled_function.load(std::memory_order_relaxed)};
+            const Published::Key gs{3, reinterpret_cast<std::uintptr_t>(LaneActivity(HostLane::kGs))};
             std::lock_guard<std::mutex> hold(p.mutex);
             ++p.window[key];
             ++p.total[key];
+            ++p.gs_window[gs];
         }
     });
 }
@@ -606,6 +613,17 @@ std::string SampleWindow(int top) {
     {
         std::lock_guard<std::mutex> hold(p.mutex);
         window.swap(p.window);
+    }
+    return Shares(window, top, ", ");
+}
+
+std::string SampleGsWindow(int top) {
+    Published& p = ThePublished();
+    if (!p.thread.joinable()) return "";
+    std::map<Published::Key, std::uint64_t> window;
+    {
+        std::lock_guard<std::mutex> hold(p.mutex);
+        window.swap(p.gs_window);
     }
     return Shares(window, top, ", ");
 }

@@ -390,7 +390,7 @@ void FrameTimes(u64 frame) {
     const u64 gs_us = GsBusyMicroseconds();
     const Clock::time_point now = Clock::now();
     const double seconds = std::chrono::duration<double>(now - last).count();
-    char job_text[3072] = "";
+    char job_text[4096] = "";
     if (seconds > 0)
         std::snprintf(job_text, sizeof job_text, "%s, GS thread busy %d%%",
                       worker_us != last_worker_us
@@ -545,6 +545,13 @@ void FrameTimes(u64 frame) {
         if (!sampled.empty()) {
             const std::size_t used = std::strlen(job_text);
             std::snprintf(job_text + used, sizeof job_text - used, "; EE's time: %s", sampled.c_str());
+        }
+        // ...and the GS thread's, by its named steps (the bridge's syncs, the
+        // renderer's GPU calls, waiting for work).
+        const std::string gs_sampled = SampleGsWindow(10);
+        if (!gs_sampled.empty()) {
+            const std::size_t used = std::strlen(job_text);
+            std::snprintf(job_text + used, sizeof job_text - used, "; GS thread's time: %s", gs_sampled.c_str());
         }
     }
     // Frames here are vertical blanks; a game that cannot keep up draws a

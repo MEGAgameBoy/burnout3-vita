@@ -50,6 +50,11 @@ inline std::atomic<std::uint32_t> g_sampled_function{0};
 /* The published sampler's counts since the last call, the largest `top`
    ("SPU2 31%, 0x00107718 12%, idle 9%"); empty without it. */
 std::string SampleWindow(int top);
+/* With the EE's (elsewhere than Windows), the GS thread's activity sampled
+   too (run.h's HostLane::kGs: the bridge's syncs, the renderer's GPU calls,
+   waiting for work): SampleWindow's shares for it - the frame line's "GS
+   thread's time". Empty on Windows or without --sample. */
+std::string SampleGsWindow(int top);
 /* --sample-gs: the sampler on the GS thread instead (gs_thread.cpp starts it
    there), where the GS model and the GPU bridge run. */
 void SetSampleGsThread(bool on);
