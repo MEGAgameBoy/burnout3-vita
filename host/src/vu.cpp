@@ -918,6 +918,19 @@ struct VuRounding {
     VuRounding() { _mm_setcsr((saved & ~0x6000u) | 0x6000u | 0x8000u | 0x0040u); }
     ~VuRounding() { _mm_setcsr(saved); }
 };
+
+/* A program's key for the frame line (TakeProgramPairs): its address and an
+   FNV-1a hash of its first four pairs' words, as vudis.py --list prints it. */
+Vu::u64 ProgramKey(const Vu::Span& micro, Vu::u32 pc) {
+    Vu::u32 hash = 2166136261u;
+    for (Vu::u32 i = 0; i < 32; ++i) hash = (hash ^ micro.data()[(pc + i) & Vu::u32(micro.size() - 1)]) * 16777619u;
+    return Vu::u64(hash) << 32 | pc;
+}
+/* The pairs a VU1 run's compiled programs ran, each under its own key: a
+   run starts at a two-pair stub that jumps (JR) to a dispatcher, which jumps
+   to the routine doing the work, and the frame line names where the pairs
+   went, not only where the run began (Run gives the rest to that). */
+thread_local std::vector<std::pair<Vu::u64, Vu::u64>> t_compiled_programs;
 }  // namespace
 
 Vu::u64 Vu::Run(u32 pc, u64 limit) {
@@ -931,9 +944,8 @@ Vu::u64 Vu::Run(u32 pc, u64 limit) {
     // The program, for the frame line's shares and --vu-sample-runs: its
     // address and an FNV-1a hash of its first four pairs' words (as
     // engine/tools/vudis.py --list prints it).
-    u32 code_hash = 2166136261u;
-    for (u32 i = 0; i < 32; ++i) code_hash = (code_hash ^ micro.data()[(pc + i) & u32(micro.size() - 1)]) * 16777619u;
-    const u64 program = u64(code_hash) << 32 | pc;
+    const u64 program = ProgramKey(micro, pc);
+    t_compiled_programs.clear();
     if (unit == 1 && g_samples) {
         u64 runs;
         {
@@ -964,7 +976,12 @@ Vu::u64 Vu::Run(u32 pc, u64 limit) {
     pairs_ += state.count;
     if (unit == 1) {
         std::lock_guard<std::mutex> hold(program_lock_);
-        program_pairs_[program] += state.count;
+        u64 attributed = 0;
+        for (const auto& [key, pairs] : t_compiled_programs) {
+            program_pairs_[key] += pairs;
+            attributed += pairs;
+        }
+        program_pairs_[program] += state.count - std::min(attributed, state.count);
     }
     return state.count;
 }
@@ -1008,6 +1025,7 @@ bool Vu::RunCompiled(VuRunState& state, u64 limit) {
             if (state.count == at) break;   // it would not start here: the interpreter goes on
         }
         compiled_pairs_ += state.count - before;
+        if (unit == 1 && state.count != before) t_compiled_programs.push_back({ProgramKey(micro, started), state.count - before});
         ran = true;
         if (state.pc == started && state.count == before) break;     // nothing taken
     }
