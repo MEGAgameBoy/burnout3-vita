@@ -282,7 +282,9 @@ def check(pairs: dict, work: str, cases: int = CASES) -> dict:
     for number, text in enumerate([driver] + bodies):
         path = os.path.join(work, "equivalence_%03d.cpp" % number)
         with open(path, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(text)
+            # (GCC's exports, not MSVC's: on Linux the driver did not build,
+            # and every check was skipped.)
+            handle.write(cppcheck.gcc_text(text) if cppcheck.toolchain() == "gcc" else text)
         paths.append(path)
     import time
 
