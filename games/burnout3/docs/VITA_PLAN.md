@@ -492,13 +492,19 @@ some twenty cycles a pair). The race's VU1 time is in a few routines:
 the stubs it starts at 0x1318, 0x14E0, 0x1548 and 0x1910 jump (JR VI15)
 to a dispatcher at 0x0020 (156133C7) that picks among relocated copies of
 one 435-pair routine (439AEC5A: transforms, clip codes, a backface test
-on the cross product, the GIF packets) and its smaller relatives at
-0x0680/0x02B8, and the 587-pair program at 0x0000. Those are to be
-written as native code, NEON where rounding allows - the vertex work done
-the Vita's way - each checked against the interpreter on the player's
-recorded runs (vu_runs.bin: the same packets kicked and the same memory,
-allowing a last bit where NEON rounds to nearest), the compiled code
-kept for everything else.
+on the cross product, a clipper, the GIF packets) and its smaller
+relatives at 0x0680/0x02B8, and the 587-pair program at 0x0000 (the
+seventeenth run's frame line names the routines themselves). Two steps:
+* a relaxed compiled form for VU1 (PCSX2's microVU is the model): the
+  four lanes in NEON, rounding to nearest, registers held in NEON
+  registers through a block, no Clean, no cycle count at run time - the
+  timing code can see (Q and P landing late, the flags four cycles
+  after) settled when the program is compiled. Not exact, so checked
+  against the interpreter on the player's recorded runs (vu_runs.bin),
+  the GIF packets kicked and the memory left, a last bit of a float
+  allowed;
+* if that is still not enough, the hot routines above by hand, native
+  code doing what they do, checked the same way.
 
 ## How it will be measured
 
