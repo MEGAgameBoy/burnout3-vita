@@ -10,6 +10,7 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -102,6 +103,10 @@ struct Vm {
     u32 command_buffer = 0;                      // where arriving packets are put (the host's)
     u32 handler_table = 0;                       // sceSifSetCmdBuffer's, for its answer
     u64 instructions = 0;
+    /* Where the threads' quanta ended, weighted by the instructions each ran:
+       a coarse profile of the IOP's code (Activity's "hottest"), whose
+       busiest loops the frame line shows the words of. */
+    std::unordered_map<u32, u64> pc_samples;
     bool trace = false;
     std::map<u32, std::pair<u64, u32>> calls;    // with trace: target -> (count, a caller)
     u32 executing = 0;                           // the instruction being run, for messages

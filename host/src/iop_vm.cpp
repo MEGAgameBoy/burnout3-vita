@@ -425,6 +425,7 @@ u64 Run(u64 slice, u64 max_ns) {
         const Outcome outcome = Execute(vm, best->c, kReturnFromCall, kQuantum, &stopped);
         if (timed) threads_ns += u64(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count());
         best->executed += vm.instructions - before;
+        vm.pc_samples[best->c.pc] += vm.instructions - before;
         if (best->c.pc == kRpcReturn) {                      // a server function returned
             const RpcRequest& done = best->serving;
             Memory& ee = GuestMemory();
@@ -686,7 +687,7 @@ std::string Activity(double seconds) {
         if (ran > most) most = ran, busiest = id;
     }
     if (!total || seconds <= 0) return "";
-    char text[200];
+    char text[320];
     int used = std::snprintf(text, sizeof text, "IOP %.2fM instructions/s", double(total) / seconds / 1e6);
     if (busiest) {
         const Thread& t = vm.threads[busiest];
@@ -695,8 +696,37 @@ std::string Activity(double seconds) {
                               int(100.0 * double(most) / double(total) + 0.5));
     }
     if (total > by_threads)
-        std::snprintf(text + used, sizeof text - used, ", interrupts %d%%",
-                      int(100.0 * double(total - by_threads) / double(total) + 0.5));
+        used += std::snprintf(text + used, sizeof text - used, ", interrupts %d%%",
+                              int(100.0 * double(total - by_threads) / double(total) + 0.5));
+    // Where the threads were when their quanta ended, the most often: a loop
+    // the IOP spins in shows as one address. The words around each of them,
+    // once, to the log (what the IOP runs is the disc's modules, not here).
+    std::vector<std::pair<u64, u32>> hot;
+    u64 sampled = 0;
+    for (const auto& [pc, n] : vm.pc_samples) {
+        hot.push_back({n, pc});
+        sampled += n;
+    }
+    vm.pc_samples.clear();
+    std::sort(hot.rbegin(), hot.rend());
+    for (std::size_t i = 0; i < hot.size() && i < 3 && sampled; ++i) {
+        used += std::snprintf(text + used, sizeof text - used, "%s0x%05X %d%%", i ? " " : ", quanta ended at ",
+                              unsigned(hot[i].second), int(100.0 * double(hot[i].first) / double(sampled) + 0.5));
+        static std::set<u32> shown;
+        const u32 pc = hot[i].second;
+        if (shown.size() < 8 && pc >= 0x40 && pc + 0x40 < 0x200000 && shown.insert(pc & ~0x3Fu).second) {
+            std::string words;
+            for (u32 a = (pc & ~3u) - 0x30; a < (pc & ~3u) + 0x30; a += 4) {
+                u32 w;
+                std::memcpy(&w, vm.ram + a, 4);
+                char item[24];
+                std::snprintf(item, sizeof item, "%s%08X", a == (pc & ~3u) ? " >" : " ", w);
+                words += item;
+            }
+            std::fprintf(stderr, "[iop] code around 0x%05X (from 0x%05X):%s\n", unsigned(pc), unsigned((pc & ~3u) - 0x30),
+                         words.c_str());
+        }
+    }
     return text;
 }
 
