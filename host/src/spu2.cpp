@@ -83,15 +83,23 @@ void Spu2::DecodeBlock(const u8* block, s32 out[28], s32* older, s32* old) {
     u32 shift = block[0] & 15;
     if (shift > 12) shift = 9;                      // as the hardware treats 13-15
     const u32 filter = std::min<u32>((block[0] >> 4) & 7, 4);
-    for (u32 i = 0; i < kSamplesPerBlock; ++i) {
-        const u32 nibble = (block[2 + i / 2] >> ((i & 1) * 4)) & 15;
-        s32 s = s32(s16(u16(nibble << 12))) >> shift;
-        s += (*old * kF0[filter] + *older * kF1[filter] + 32) >> 6;
-        s = Clamp16(s);
-        *older = *old;
-        *old = s;
-        out[i] = s;
+    // The history in locals, a byte's two samples at a time (through the
+    // pointers, which may be `out`'s, they were loads and stores each sample).
+    const s32 f0 = kF0[filter], f1 = kF1[filter];
+    s32 s1 = *old, s2 = *older;
+    for (u32 i = 0; i < kSamplesPerBlock; i += 2) {
+        const u32 byte = block[2 + i / 2];
+        s32 a = (s32(s16(u16(byte << 12))) >> shift) + ((s1 * f0 + s2 * f1 + 32) >> 6);
+        a = Clamp16(a);
+        s32 b = (s32(s16(u16((byte >> 4) << 12))) >> shift) + ((a * f0 + s1 * f1 + 32) >> 6);
+        b = Clamp16(b);
+        out[i] = a;
+        out[i + 1] = b;
+        s2 = a;
+        s1 = b;
     }
+    *older = s2;
+    *old = s1;
 }
 
 void Spu2::SetInputVolume(u32 core, u32 percent) {
@@ -624,135 +632,283 @@ void Spu2::Advance(u64 now_us, const std::function<void(u32 core)>& irq) {
     // static is a barrier on ARM each time it is looked at).
     static const bool no_reverb_env = std::getenv("PS2HOST_SPU_NO_REVERB") != nullptr;
     const bool no_reverb = no_reverb_env;
-    for (u32 n = 0; n < count; ++n) {
-        s32 left = 0, right = 0;
-        const u32 capture_offset = u32((first_sample + n) & 511) * 2;
-        // A sample's two bytes at IRQA raise the interrupt (CheckIrq): looked
-        // at here first, some sixteen times a sample, without a call.
-        auto irq_at = [&](u32 address) {
-            return (cores_[0].irq_enabled && cores_[0].irqa - address < 2u) ||
-                   (cores_[1].irq_enabled && cores_[1].irqa - address < 2u);
-        };
-        auto capture = [&](u32 base, s32 sample) {
-            const u32 address = base + capture_offset;
-            const u16 value = u16(s16(Clamp16(sample)));
-            ram_[address] = u8(value);
-            ram_[address + 1] = u8(value >> 8);
+    // A sample's two bytes at IRQA raise the interrupt (CheckIrq): looked at
+    // here first, some sixteen times a sample, without a call.
+    auto irq_at = [&](u32 address) {
+        return (cores_[0].irq_enabled && cores_[0].irqa - address < 2u) ||
+               (cores_[1].irq_enabled && cores_[1].irqa - address < 2u);
+    };
+    auto capture = [&](u32 base, u32 n, s32 sample) {
+        const u32 address = base + u32((first_sample + n) & 511) * 2;
+        const u16 value = u16(s16(Clamp16(sample)));
+        ram_[address] = u8(value);
+        ram_[address + 1] = u8(value >> 8);
+        if (irq_at(address)) CheckIrq(0, address, address + 2, irq);
+    };
+    // A voice's sample n: its sweeps, its sample shaped by the envelope into
+    // the core's sums (dry and wet), voices 1 and 3 captured, its position on.
+    auto voice_sample = [&](Core& c, u32 core, u32 i, u32 n, s32& core_left, s32& core_right, s32& wet_left,
+                            s32& wet_right) {
+        Voice& v = c.voices[i];
+        if ((v.left.reg & 0x8000) && !v.left.settled) v.left.Step();     // a sweep (Step's own test, without the call)
+        if ((v.right.reg & 0x8000) && !v.right.settled) v.right.Step();
+        if (v.phase == Phase::Off) {
+            // Silent: no sample to make - only its address running on
+            // through its blocks (their flags, ENDX, the interrupt), which
+            // drivers time things by. Its decoder's samples and the one
+            // before are a key-on's to set afresh (Start): not kept up
+            // meanwhile, which was most of the SPU2's time at Burnout 3's
+            // boot (42 voices so, none heard).
+            if (i == 1) capture(core == 0 ? 0x0800 : 0x1800, n, 0);
+            if (i == 3) capture(core == 0 ? 0x0C00 : 0x1C00, n, 0);
+            if (!v.pitch) return;
+            ++work_.silent;
+            v.counter += v.pitch;
+            while (v.counter >= kBlockSpan) {
+                v.counter -= kBlockSpan;
+                NextBlock(c, i, irq);
+            }
+            return;
+        }
+        s32 shaped = 0;
+        if (v.pitch && v.phase != Phase::Off) {
+            ++work_.heard;
+            const u32 index = v.counter >> 12;
+            const s32 current = v.samples[index];
+            const s32 sample = v.previous + ((current - v.previous) * s32(v.counter & 0xFFF) >> 12);
+            shaped = (sample * v.level) >> 15;
+            const s32 sent_left = (shaped * v.left.now) >> 15, sent_right = (shaped * v.right.now) >> 15;
+            if (c.switches[kVmixl] & (1u << i)) core_left += sent_left;
+            if (c.switches[kVmixr] & (1u << i)) core_right += sent_right;
+            if (c.switches[kVmixel] & (1u << i)) wet_left += sent_left;
+            if (c.switches[kVmixer] & (1u << i)) wet_right += sent_right;
+            Envelope(v);
+        }
+        if (i == 1) capture(core == 0 ? 0x0800 : 0x1800, n, shaped);
+        if (i == 3) capture(core == 0 ? 0x0C00 : 0x1C00, n, shaped);
+        if (!v.pitch) return;
+        const u32 before_index = v.counter >> 12;
+        s32 last = v.samples[before_index];
+        bool crossed = false;
+        v.counter += v.pitch;
+        while (v.counter >= kBlockSpan) {
+            v.counter -= kBlockSpan;
+            last = v.samples[kSamplesPerBlock - 1];
+            NextBlock(c, i, irq);
+            crossed = true;
+        }
+        const u32 index = v.counter >> 12;
+        if (crossed || index != before_index)
+            v.previous = index ? v.samples[index - 1] : last;
+    };
+    // A core's sample n from its voices' sums: captured, the inputs and the
+    // reverb mixed in, its main volume; `left` and `right` its output (core
+    // 1 takes core 0's in as its external input).
+    auto core_sample = [&](Core& c, u32 core, u32 n, s32 core_left, s32 core_right, s32 wet_left, s32 wet_right,
+                           s32& left, s32& right) {
+        const u32 mix_base = core == 0 ? 0x2000 : 0x3000;
+        capture(mix_base, n, core_left);
+        capture(mix_base + 0x400, n, core_right);
+        capture(mix_base + 0x800, n, wet_left);
+        capture(mix_base + 0xC00, n, wet_right);
+        auto pcm = [&](u32 base) {
+            const u32 address = base + u32((first_sample + n) & 511) * 2;
             if (irq_at(address)) CheckIrq(0, address, address + 2, irq);
+            return s32(s16(u16(ram_[address]) | u16(ram_[address + 1]) << 8));
         };
+        const u32 input_base = core == 0 ? 0x4000 : 0x4800;
+        if (c.input_gain_remaining) {
+            c.input_gain += (c.input_gain_target - c.input_gain) / s32(c.input_gain_remaining);
+            --c.input_gain_remaining;
+        }
+        s32 input_left = (pcm(input_base) * s32(s16(c.bvoll))) >> 15;
+        s32 input_right = (pcm(input_base + 0x400) * s32(s16(c.bvolr))) >> 15;
+        if (c.input_gain != 65536) {
+            input_left = s32((std::int64_t(input_left) * c.input_gain) >> 16);
+            input_right = s32((std::int64_t(input_right) * c.input_gain) >> 16);
+        }
+        const s32 external_left = core == 1 ? (Clamp16(left) * s32(s16(c.avoll))) >> 15 : 0;
+        const s32 external_right = core == 1 ? (Clamp16(right) * s32(s16(c.avolr))) >> 15 : 0;
+        core_left = (c.mmix & 0x800) ? Clamp16(core_left) : 0;
+        core_right = (c.mmix & 0x400) ? Clamp16(core_right) : 0;
+        wet_left = (c.mmix & 0x200) ? Clamp16(wet_left) : 0;
+        wet_right = (c.mmix & 0x100) ? Clamp16(wet_right) : 0;
+        if (c.mmix & 0x080) core_left += input_left;
+        if (c.mmix & 0x040) core_right += input_right;
+        if (c.mmix & 0x020) wet_left += input_left;
+        if (c.mmix & 0x010) wet_right += input_right;
+        if (c.mmix & 0x008) core_left += external_left;
+        if (c.mmix & 0x004) core_right += external_right;
+        if (c.mmix & 0x002) wet_left += external_left;
+        if (c.mmix & 0x001) wet_right += external_right;
+        // The reverb (SD_CORE_EFFECT_ENABLE, attr bit 2): a step every other
+        // sample, on the pair's first input; its output held for the pair.
+        if ((c.attr & 4) && !no_reverb) {
+            if ((whole_clock + n) & 1) Reverb(c, Clamp16(c.reverb_in_left), Clamp16(c.reverb_in_right));
+            else { c.reverb_in_left = wet_left; c.reverb_in_right = wet_right; }
+            core_left += (c.reverb_out_left * Volume(c.evoll)) >> 15;
+            core_right += (c.reverb_out_right * Volume(c.evolr)) >> 15;
+        }
+        c.main_left.Step();
+        c.main_right.Step();
+        const s32 out_left = (core_left * c.main_left.now) >> 15;
+        const s32 out_right = (core_right * c.main_right.now) >> 15;
+        if (core == 0) {
+            capture(0x1000, n, out_left);
+            capture(0x1400, n, out_right);
+        }
+        left = out_left;
+        right = out_right;
+    };
+    // A batch reads the voices' blocks earlier in its call than the cores'
+    // writes there: where a voice could reach the capture rings or a reverb's
+    // work area this call (where its address runs on to, or its loop start's
+    // - a silent voice walking through RAM reads their flags), a sample at a
+    // time, so that it reads what it always did.
+    bool batch = batch_voices_;
+    if (batch) {
+        u32 reverb_from[2] = {1, 1}, reverb_to[2] = {0, 0};
+        for (u32 core = 0; core < 2; ++core)
+            if ((cores_[core].attr & 4) && !no_reverb) {
+                reverb_from[core] = cores_[core].esa;
+                reverb_to[core] = EffectEnd(cores_[core]);
+            }
+        auto touches = [&](u32 from, u32 span) {
+            from &= kRamMask & ~15u;
+            const u32 to = from + span;                         // may pass the end of RAM: wraps to 0
+            if (from < 0x6000 || to > kRamMask) return true;
+            for (u32 core = 0; core < 2; ++core)
+                if (reverb_from[core] <= reverb_to[core] && from <= reverb_to[core] && reverb_from[core] <= to)
+                    return true;
+            return false;
+        };
+        for (u32 core = 0; core < 2 && batch; ++core)
+            for (u32 i = 0; i < 24 && batch; ++i) {
+                const Voice& v = cores_[core].voices[i];
+                if (!v.pitch) continue;
+                const u32 span = u32(((u64(count) * v.pitch >> 12) / kSamplesPerBlock + 2) * kBlockBytes);
+                if (touches(v.nax, span) || touches(v.lsax, span)) batch = false;
+            }
+    }
+    if (batch) {
+        // Each voice over the whole call (SetBatchVoices: the SPU2's own
+        // thread, whose interrupts are only raised, not run), its state in
+        // reach from one sample to the next; the cores after, a sample at a
+        // time. The sums are the same: only which of a call's interrupts
+        // was seen first changes, and they are raised together.
+        sums_.assign(std::size_t(count) * 8, 0);
         for (u32 core = 0; core < 2; ++core) {
             Core& c = cores_[core];
-            s32 core_left = 0, core_right = 0, wet_left = 0, wet_right = 0;
+            s32* sums = sums_.data() + std::size_t(core) * 4 * count;
             for (u32 i = 0; i < 24; ++i) {
                 Voice& v = c.voices[i];
-                if ((v.left.reg & 0x8000) && !v.left.settled) v.left.Step();     // a sweep (Step's own test, without the call)
-                if ((v.right.reg & 0x8000) && !v.right.settled) v.right.Step();
-                if (v.phase == Phase::Off) {
-                    // Silent: no sample to make - only its address running on
-                    // through its blocks (their flags, ENDX, the interrupt),
-                    // which drivers time things by. Its decoder's samples and
-                    // the one before are a key-on's to set afresh (Start): not
-                    // kept up meanwhile, which was most of the SPU2's time at
-                    // Burnout 3's boot (42 voices so, none heard).
-                    if (i == 1) capture(core == 0 ? 0x0800 : 0x1800, 0);
-                    if (i == 3) capture(core == 0 ? 0x0C00 : 0x1C00, 0);
-                    if (!v.pitch) continue;
-                    ++work_.silent;
-                    v.counter += v.pitch;
-                    while (v.counter >= kBlockSpan) {
-                        v.counter -= kBlockSpan;
-                        NextBlock(c, i, irq);
-                    }
+                auto general = [&](u32 n) {
+                    voice_sample(c, core, i, n, sums[n], sums[count + n], sums[2 * count + n], sums[3 * count + n]);
+                };
+                // Voices 1 and 3 (captured each sample), a sweeping volume,
+                // or a silent voice with nowhere to go: every sample the
+                // general way.
+                const bool sweeping = ((v.left.reg & 0x8000) && !v.left.settled) || ((v.right.reg & 0x8000) && !v.right.settled);
+                if (i == 1 || i == 3 || sweeping || !v.pitch) {
+                    for (u32 n = 0; n < count; ++n) general(n);
                     continue;
                 }
-                s32 shaped = 0;
-                if (v.pitch && v.phase != Phase::Off) {
-                    ++work_.heard;
-                    const u32 index = v.counter >> 12;
-                    const s32 current = v.samples[index];
-                    const s32 sample = v.previous + ((current - v.previous) * s32(v.counter & 0xFFF) >> 12);
-                    shaped = (sample * v.level) >> 15;
-                    const s32 sent_left = (shaped * v.left.now) >> 15, sent_right = (shaped * v.right.now) >> 15;
-                    if (c.switches[kVmixl] & (1u << i)) core_left += sent_left;
-                    if (c.switches[kVmixr] & (1u << i)) core_right += sent_right;
-                    if (c.switches[kVmixel] & (1u << i)) wet_left += sent_left;
-                    if (c.switches[kVmixer] & (1u << i)) wet_right += sent_right;
-                    Envelope(v);
+                // The rest a sample at a time in reach, the general way only
+                // for a sample where something happens: a block's end, the
+                // envelope's step, a phase's change.
+                const u32 bit = 1u << i;
+                const bool to_left = (c.switches[kVmixl] & bit) != 0, to_right = (c.switches[kVmixr] & bit) != 0;
+                const bool to_wet_left = (c.switches[kVmixel] & bit) != 0, to_wet_right = (c.switches[kVmixer] & bit) != 0;
+                const s32 left_now = v.left.now, right_now = v.right.now;
+                const u32 pitch = v.pitch;
+                for (u32 n = 0; n < count;) {
+                    if (v.phase == Phase::Off) {
+                        // Silent: only its address on through its blocks.
+                        const u32 key = u32(v.counter);
+                        if (key + pitch >= kBlockSpan) { general(n++); continue; }
+                        // Samples until it reaches the block's end, at most the rest.
+                        const u32 quiet = std::min<u32>(count - n, (kBlockSpan - 1 - key) / pitch);
+                        if (!quiet) { general(n++); continue; }
+                        v.counter += quiet * pitch;
+                        work_.silent += quiet;
+                        n += quiet;
+                        continue;
+                    }
+                    // The envelope's increment this sample, as Envelope works
+                    // it out; a sample where it steps (or changes phase, or
+                    // its rate is not yet worked out) goes the general way.
+                    const u64 key = u64(v.phase) | u64(v.adsr1 & 0xFFFF) << 8 | u64(v.adsr2 & 0xFFFF) << 24;
+                    const bool at_sustain = v.phase == Phase::Decay &&
+                                            v.level <= std::min(0x7FFF, s32(((v.adsr1 & 15) + 1) * 0x800));
+                    if (key != v.rate_key || at_sustain) { general(n++); continue; }
+                    u32 increment = v.rate_increment;
+                    if (v.rate_exponential && !v.rate_decreasing && v.level >= 0x6000) {
+                        if (v.rate_shift >= 11) increment >>= 2;
+                        else if (v.rate_shift >= 10) increment >>= 1;
+                    }
+                    const s32 level = v.level;
+                    u32 counter = v.counter, envelope = v.envelope_counter;
+                    s32 previous = v.previous;
+                    const s32* samples = v.samples;
+                    // How many samples go by before the envelope steps or the
+                    // block ends: worked out once (two divisions), not tested
+                    // each sample.
+                    u32 run = count - n;
+                    if (envelope + increment >= 0x8000 || counter + pitch >= kBlockSpan) run = 0;
+                    if (run && increment) run = std::min(run, (0x7FFFu - envelope) / increment + 1);
+                    if (run) run = std::min(run, (kBlockSpan - 1 - counter) / pitch + 1);
+                    // (Each bound counts the samples that stay below it: the
+                    // last of them is the sample before the one that steps.)
+                    if (run && (envelope + (run - 1) * increment + increment >= 0x8000 ||
+                                counter + (run - 1) * pitch + pitch >= kBlockSpan))
+                        --run;
+                    const u32 end = n + run;
+                    u32 m = n;
+                    for (; m < end; ++m) {
+                        const u32 index = counter >> 12;
+                        const s32 current = samples[index];
+                        const s32 sample = previous + ((current - previous) * s32(counter & 0xFFF) >> 12);
+                        const s32 shaped = (sample * level) >> 15;
+                        const s32 sent_left = (shaped * left_now) >> 15, sent_right = (shaped * right_now) >> 15;
+                        if (to_left) sums[m] += sent_left;
+                        if (to_right) sums[count + m] += sent_right;
+                        if (to_wet_left) sums[2 * count + m] += sent_left;
+                        if (to_wet_right) sums[3 * count + m] += sent_right;
+                        envelope += increment;
+                        counter += pitch;
+                        if ((counter >> 12) != index) previous = samples[(counter >> 12) - 1];
+                    }
+                    work_.heard += m - n;
+                    v.counter = counter;
+                    v.envelope_counter = envelope;
+                    v.previous = previous;
+                    n = m;
+                    if (n < count) general(n++);
                 }
-                if (i == 1) capture(core == 0 ? 0x0800 : 0x1800, shaped);
-                if (i == 3) capture(core == 0 ? 0x0C00 : 0x1C00, shaped);
-                if (!v.pitch) continue;
-                const u32 before_index = v.counter >> 12;
-                s32 last = v.samples[before_index];
-                bool crossed = false;
-                v.counter += v.pitch;
-                while (v.counter >= kBlockSpan) {
-                    v.counter -= kBlockSpan;
-                    last = v.samples[kSamplesPerBlock - 1];
-                    NextBlock(c, i, irq);
-                    crossed = true;
-                }
-                const u32 index = v.counter >> 12;
-                if (crossed || index != before_index)
-                    v.previous = index ? v.samples[index - 1] : last;
             }
-            const u32 mix_base = core == 0 ? 0x2000 : 0x3000;
-            capture(mix_base, core_left);
-            capture(mix_base + 0x400, core_right);
-            capture(mix_base + 0x800, wet_left);
-            capture(mix_base + 0xC00, wet_right);
-            auto pcm = [&](u32 base) {
-                const u32 address = base + capture_offset;
-                if (irq_at(address)) CheckIrq(0, address, address + 2, irq);
-                return s32(s16(u16(ram_[address]) | u16(ram_[address + 1]) << 8));
-            };
-            const u32 input_base = core == 0 ? 0x4000 : 0x4800;
-            if (c.input_gain_remaining) {
-                c.input_gain += (c.input_gain_target - c.input_gain) / s32(c.input_gain_remaining);
-                --c.input_gain_remaining;
-            }
-            s32 input_left = (pcm(input_base) * s32(s16(c.bvoll))) >> 15;
-            s32 input_right = (pcm(input_base + 0x400) * s32(s16(c.bvolr))) >> 15;
-            if (c.input_gain != 65536) {
-                input_left = s32((std::int64_t(input_left) * c.input_gain) >> 16);
-                input_right = s32((std::int64_t(input_right) * c.input_gain) >> 16);
-            }
-            const s32 external_left = core == 1 ? (Clamp16(left) * s32(s16(c.avoll))) >> 15 : 0;
-            const s32 external_right = core == 1 ? (Clamp16(right) * s32(s16(c.avolr))) >> 15 : 0;
-            core_left = (c.mmix & 0x800) ? Clamp16(core_left) : 0;
-            core_right = (c.mmix & 0x400) ? Clamp16(core_right) : 0;
-            wet_left = (c.mmix & 0x200) ? Clamp16(wet_left) : 0;
-            wet_right = (c.mmix & 0x100) ? Clamp16(wet_right) : 0;
-            if (c.mmix & 0x080) core_left += input_left;
-            if (c.mmix & 0x040) core_right += input_right;
-            if (c.mmix & 0x020) wet_left += input_left;
-            if (c.mmix & 0x010) wet_right += input_right;
-            if (c.mmix & 0x008) core_left += external_left;
-            if (c.mmix & 0x004) core_right += external_right;
-            if (c.mmix & 0x002) wet_left += external_left;
-            if (c.mmix & 0x001) wet_right += external_right;
-            // The reverb (SD_CORE_EFFECT_ENABLE, attr bit 2): a step every
-            // other sample, on the pair's first input; its output held for
-            // the pair.
-            if ((c.attr & 4) && !no_reverb) {
-                if ((whole_clock + n) & 1) Reverb(c, Clamp16(c.reverb_in_left), Clamp16(c.reverb_in_right));
-                else { c.reverb_in_left = wet_left; c.reverb_in_right = wet_right; }
-                core_left += (c.reverb_out_left * Volume(c.evoll)) >> 15;
-                core_right += (c.reverb_out_right * Volume(c.evolr)) >> 15;
-            }
-            c.main_left.Step();
-            c.main_right.Step();
-            const s32 out_left = (core_left * c.main_left.now) >> 15;
-            const s32 out_right = (core_right * c.main_right.now) >> 15;
-            if (core == 0) {
-                capture(0x1000, out_left);
-                capture(0x1400, out_right);
-            }
-            left = out_left;
-            right = out_right;
         }
-        mixed_[2 * n] = s16(Clamp16(left));
-        mixed_[2 * n + 1] = s16(Clamp16(right));
+        for (u32 n = 0; n < count; ++n) {
+            s32 left = 0, right = 0;
+            for (u32 core = 0; core < 2; ++core) {
+                const s32* sums = sums_.data() + std::size_t(core) * 4 * count;
+                core_sample(cores_[core], core, n, sums[n], sums[count + n], sums[2 * count + n], sums[3 * count + n],
+                            left, right);
+            }
+            mixed_[2 * n] = s16(Clamp16(left));
+            mixed_[2 * n + 1] = s16(Clamp16(right));
+        }
+    } else {
+        for (u32 n = 0; n < count; ++n) {
+            s32 left = 0, right = 0;
+            for (u32 core = 0; core < 2; ++core) {
+                Core& c = cores_[core];
+                s32 core_left = 0, core_right = 0, wet_left = 0, wet_right = 0;
+                for (u32 i = 0; i < 24; ++i) voice_sample(c, core, i, n, core_left, core_right, wet_left, wet_right);
+                core_sample(c, core, n, core_left, core_right, wet_left, wet_right, left, right);
+            }
+            mixed_[2 * n] = s16(Clamp16(left));
+            mixed_[2 * n + 1] = s16(Clamp16(right));
+        }
     }
     if (output_ && count) {
         const auto out = std::chrono::steady_clock::now();

@@ -1054,6 +1054,7 @@ void StartSoundThread() {
     Vm& vm = TheVm();                   // (made here, on the EE's thread)
     s.threaded = true;                  // before the thread: the EE's calls lock from now on
     s.stop = false;
+    s.spu.SetBatchVoices(true);         // its interrupts raised, not run: each voice a call at a time
     s.thread = std::thread([&s, &vm] {
         ps2plat::SetThreadRole(ps2plat::ThreadRole::kSound);
         while (!s.stop.load(std::memory_order_relaxed)) {
@@ -1074,6 +1075,7 @@ void StopSoundThread() {
     s.stop = true;
     s.thread.join();
     s.threaded = false;
+    s.spu.SetBatchVoices(false);
 }
 
 bool SoundThreaded() { return S().threaded; }

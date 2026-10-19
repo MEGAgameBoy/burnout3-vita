@@ -77,6 +77,10 @@ public:
 
     /* Advance playback to `now_us`; `irq(core)` for each interrupt raised. */
     void Advance(u64 now_us, const std::function<void(u32 core)>& irq);
+    /* Each voice mixed over a whole Advance at once, then the cores (the
+       SPU2's own thread, which only raises its interrupts): the same sound,
+       a call's interrupts raised in another order among themselves. */
+    void SetBatchVoices(bool on) { batch_voices_ = on; }
 
     /* Where the mixed output goes: interleaved 16-bit stereo at 48 kHz. */
     using Output = std::function<void(const s16* frames, u32 count)>;
@@ -170,6 +174,8 @@ private:
     double owed_ = 0;                // a fraction of a sample not yet produced
     Output output_;
     std::vector<s16> mixed_;
+    std::vector<s32> sums_;          // batched: each core's voices' dry and wet sums, a call's samples
+    bool batch_voices_ = false;
     Work work_;
 
     static u32 CoreOf(u32 entry) { return entry & 1; }
