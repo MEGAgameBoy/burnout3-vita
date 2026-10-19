@@ -337,6 +337,10 @@ public:
     Source to;                          // channel 4, while it runs
     bool to_running = false;
     bool from_running = false;
+    /* Channel 4's MADR, QWC and TADR (and CHCR's TAG) behind what the IPU
+       took: written back once a Pump, not once a quadword - the guest reads
+       them only between its accesses, each of which pumps. */
+    bool to_dirty = false;
     s32 dc_pred[3] = {128, 128, 128};
 
     /* A step that ran out of bitstream ran out where the buffer, the FIFO
@@ -448,6 +452,23 @@ public:
             return u32((window << skew) >> (64 - n));
         }
         void Skip(u32 n) { bit += n; }
+        /* `count` bytes of the stream in its order (as Get(8) each): whole
+           pieces of quadwords when on a byte. */
+        void Bytes(u8* out, u32 count) {
+            while (count) {
+                if (bit & 7) {
+                    *out++ = u8(Get(8));
+                    --count;
+                    continue;
+                }
+                const Qword& q = At(std::size_t(bit >> 7));
+                const u32 offset = u32(bit >> 3) & 15, n = std::min(16 - offset, count);
+                std::memcpy(out, reinterpret_cast<const u8*>(q.data()) + offset, n);
+                out += n;
+                count -= n;
+                bit += u64(n) * 8;
+            }
+        }
         u32 Get(u32 n) {
             const u32 v = Peek(n);
             bit += n;
@@ -475,7 +496,7 @@ public:
             Qword q;
             if (!to.Next(&q)) break;
             --quadwords;
-            SyncToRegisters();
+            to_dirty = true;
         }
         Fill();
     }
@@ -494,7 +515,7 @@ public:
                 break;
             }
             fifo.push_back(q);
-            SyncToRegisters();
+            to_dirty = true;
         }
     }
 
@@ -503,8 +524,10 @@ public:
         SetReg(kToIpu + kMadr, to.madr);
         SetReg(kToIpu + kQwc, to.qwc);
         SetReg(kToIpu + kTadr, to.tadr);
+        to_dirty = false;
     }
     void EndTo() {
+        if (to_dirty) SyncToRegisters();
         to_running = false;
         SetReg(kToIpu + kChcr, Reg(kToIpu + kChcr) & ~0x100u);
         DmaChannelEnded(4);
@@ -535,9 +558,26 @@ public:
 
     /* Channel 3: the output FIFO to memory, while QWC lasts. */
     void Drain() {
-        if (!from_running) return;
+        if (!from_running || out.empty()) {
+            if (from_running && (Reg(kFromIpu + kQwc) & 0xFFFF) == 0) {
+                from_running = false;
+                SetReg(kFromIpu + kChcr, Reg(kFromIpu + kChcr) & ~0x100u);
+                DmaChannelEnded(3);
+            }
+            return;
+        }
         u32 madr = Reg(kFromIpu + kMadr), qwc = Reg(kFromIpu + kQwc) & 0xFFFF;
         Memory& m = GuestMemory();
+        // A run at once where the memory is one piece (main memory, the
+        // scratchpad within its 16 KB), a quadword at a time otherwise.
+        const std::size_t run = std::min<std::size_t>(qwc, out.size());
+        if (u8* bytes = m.Translate(Physical(madr), u32(run * 16));
+            bytes && Physical(madr) + run * 16 - 16 == Physical(madr + u32(run * 16) - 16)) {
+            for (std::size_t i = 0; i < run; ++i) std::memcpy(bytes + i * 16, out[i].data(), 16);
+            out.erase(out.begin(), out.begin() + std::ptrdiff_t(run));
+            madr += u32(run * 16);
+            qwc -= u32(run);
+        }
         while (qwc && !out.empty()) {
             const Qword& q = out.front();
             u8* bytes = m.Translate(Physical(madr), 16);
@@ -832,7 +872,24 @@ public:
     }
 
     void Emit(const u8* bytes, std::size_t count) {
-        for (std::size_t i = 0; i < count; i += 16) {
+        std::size_t i = 0;
+        if (out.empty() && from_running) {
+            // Straight into channel 3's memory, as Drain would move it after
+            // the step - all but the channel's last quadword, which Drain
+            // still moves (ending the channel after the step, as before).
+            u32 madr = Reg(kFromIpu + kMadr), qwc = Reg(kFromIpu + kQwc) & 0xFFFF;
+            const std::size_t n = std::min<std::size_t>(qwc ? qwc - 1 : 0, count / 16);
+            if (n) {
+                u8* to_bytes = GuestMemory().Translate(Physical(madr), u32(n * 16));
+                if (to_bytes && Physical(madr) + n * 16 - 16 == Physical(madr + u32(n * 16) - 16)) {
+                    std::memcpy(to_bytes, bytes, n * 16);
+                    i = n * 16;
+                    SetReg(kFromIpu + kMadr, madr + u32(n * 16));
+                    SetReg(kFromIpu + kQwc, qwc - u32(n));
+                }
+            }
+        }
+        for (; i < count; i += 16) {
             Qword q;
             std::memcpy(q.data(), bytes + i, 16);
             out.push_back(q);
@@ -849,13 +906,7 @@ public:
     void Csc(Reader& r) {
         if (left == 0) { busy = false; return; }
         u8 raw[384];
-        for (int i = 0; i < 384; i += 4) {             // four bytes a read, the first the highest
-            const u32 v = r.Get(32);
-            raw[i] = u8(v >> 24);
-            raw[i + 1] = u8(v >> 16);
-            raw[i + 2] = u8(v >> 8);
-            raw[i + 3] = u8(v);
-        }
+        r.Bytes(raw, 384);
         const bool rgb16 = (command >> 27) & 1, dither = (command >> 26) & 1;
         static const int kDither[4][4] = {{-4, 0, -3, 1}, {2, -2, 3, -1}, {-3, 1, -4, 0}, {3, -1, 2, -2}};
         u32 rgba[256];
@@ -981,6 +1032,7 @@ public:
         }
         Fill();
         Drain();
+        if (to_dirty) SyncToRegisters();
     }
 
     u64 Top() {
